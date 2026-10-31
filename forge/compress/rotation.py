@@ -33,7 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pydantic import BaseModel, ConfigDict, Field
 
-from forge.compress.modelutil import find_blocks, is_dense_linear
+from forge.compress.modelutil import find_blocks, is_dense_linear, require_attention_only
 from forge.compress.packed import apply_block_hadamard, hadamard_matrix
 from forge.compress.serialize import register_module_kind
 from forge.core.errors import ConfigError
@@ -149,6 +149,7 @@ def _need(obj: Any, path: str) -> Any:
 
 
 def _roles(model: nn.Module) -> dict[str, Any]:
+    require_attention_only(model, "rotation (QuaRot/SpinQuant)")
     prefix, blocks = find_blocks(model)
     return {"prefix": prefix, "blocks": blocks, "embed": _need(model, "embed_tokens"), "norm": _need(model, "norm"), "head": _need(model, "lm_head")}
 

@@ -32,7 +32,8 @@ torch = ["torch>=2.3"]
 gpu = ["triton>=2.2"]
 serve = ["python-multipart>=0.0.9", "sse-starlette>=1.8"]
 parquet = ["pyarrow>=14"]
-dev = ["pytest>=7.4", "pytest-timeout>=2.2", "ruff>=0.4", "pyarrow>=14", "python-multipart>=0.0.9"]
+hf = ["datasets>=2.19"]
+dev = ["pytest>=7.4", "pytest-timeout>=2.2", "ruff>=0.4", "pyarrow>=14", "python-multipart>=0.0.9", "datasets>=2.19"]
 
 [project.scripts]
 forge = "forge.cli:main"

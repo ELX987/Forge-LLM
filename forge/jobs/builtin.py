@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from forge.core.errors import Cancelled, ConfigError, ForgeError, NotFound
 from forge.core.jsonschema import ui
@@ -210,7 +210,7 @@ def run_recipe_job(cfg: RecipeJobConfig, ctx: Any) -> dict[str, Any]:
 class ModelDownloadConfig(_Cfg):
     """Download a Hugging Face repository snapshot into the models directory and register it."""
 
-    repo_id: str = Field(min_length=3, description="Hugging Face repo id, e.g. `meta-llama/Llama-3.1-8B`.", json_schema_extra=ui(group="Source"))
+    repo_id: str = Field(min_length=3, description="Hugging Face repo id as `org/name`, e.g. `google/gemma-4-E4B` (a bare name like `gemma-4-E4B` is not a repo).", json_schema_extra=ui(group="Source", placeholder="google/gemma-4-E4B"))
     revision: str | None = Field(default=None, description="Branch, tag or commit hash (default: main).", json_schema_extra=ui(group="Source"))
     allow_patterns: list[str] | None = Field(default=None, description="Only download files matching these glob patterns.", json_schema_extra=ui(group="Filter", advanced=True))
     ignore_patterns: list[str] = Field(default_factory=lambda: ["*.msgpack", "*.h5", "*.ot", "original/*", "*.onnx"], description="Skip files matching these glob patterns.", json_schema_extra=ui(group="Filter", advanced=True))
@@ -222,10 +222,67 @@ class ModelDownloadConfig(_Cfg):
     licence: str | None = Field(default=None, description="Licence override recorded with the model (default: from the repo card).", json_schema_extra=ui(group="Target", advanced=True))
     model_id: str | None = Field(default=None, description="Existing models-table id to update instead of creating a new row.", json_schema_extra=ui(group="Target", advanced=True))
 
+    @field_validator("repo_id")
+    @classmethod
+    def _check_repo_id(cls, v: str) -> str:
+        from forge.core.modelref import validate_repo_id
+
+        return validate_repo_id(v)
+
+
+_SOURCE_MARKER = ".forge_source.json"
+_WEIGHT_GLOBS = ("*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf")
+
+
+def validate_download(d: Path, expected: list[tuple[str, int]] | None = None, expected_bytes: int = 0) -> None:
+    """Raise :class:`ConfigError` unless ``d`` holds a complete-looking model: config.json, weights, every index shard."""
+    import json as _json
+
+    if not (d / "config.json").is_file():
+        raise ConfigError(f"download finished but {d} has no config.json (wrong repo, or the repo is not a transformers model)")
+    if not any(next(d.glob(g), None) is not None for g in _WEIGHT_GLOBS):
+        raise ConfigError(f"download finished but {d} has no weight files (*.safetensors / *.bin / *.gguf)")
+    idx = d / "model.safetensors.index.json"
+    if idx.is_file():
+        try:
+            shards = sorted(set(_json.loads(idx.read_text(encoding="utf-8")).get("weight_map", {}).values()))
+        except (ValueError, OSError, AttributeError):
+            shards = []
+        gone = [s for s in shards if not (d / s).is_file()]
+        if gone:
+            raise ConfigError(f"incomplete download: missing weight shards {gone[:5]}")
+    if expected:
+        missing = [n for n, _ in expected if not (d / n).is_file()]
+        if missing:
+            raise ConfigError(f"incomplete download: {len(missing)} expected files missing, e.g. {missing[:5]}")
+    if expected_bytes and _dir_bytes(d) < 0.9 * expected_bytes:
+        raise ConfigError(f"incomplete download: {_dir_bytes(d)} of {expected_bytes} bytes present")
+
+
+def _hub_error(e: BaseException, repo_id: str, token: str | None) -> ConfigError | None:
+    """Translate definitive Hub failures (404 / gated / auth / bad revision) into actionable errors; None for transient ones."""
+    names = {c.__name__ for c in type(e).__mro__}
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if "GatedRepoError" in names:
+        return ConfigError(f"{repo_id} is gated: accept its licence at https://huggingface.co/{repo_id} and set HF_TOKEN (token {'provided' if token else 'NOT set'})")
+    if "RevisionNotFoundError" in names:
+        return ConfigError(f"revision not found for {repo_id}: {e}")
+    if "RepositoryNotFoundError" in names or status == 404:
+        from forge.core.modelref import suggest_repo_ids
+
+        hits = suggest_repo_ids(repo_id, token)
+        return ConfigError(
+            f"Hugging Face repo {repo_id!r} not found or private (check the 'org/name' spelling; private/gated repos need HF_TOKEN)"
+            + ("; did you mean: " + ", ".join(hits) if hits else ""), details={"suggestions": hits})
+    if status in (401, 403):
+        return ConfigError(f"Hugging Face rejected the request for {repo_id} (HTTP {status}); HF token {'was rejected' if token else 'is not set - export HF_TOKEN'}")
+    return None
+
 
 def _dir_bytes(p: Path) -> int:
     total = 0
     for root, _dirs, files in os.walk(p):
+        _dirs[:] = [d for d in _dirs if d != ".cache"]  # huggingface_hub bookkeeping (incomplete blobs, lock files), not model payload
         for f in files:
             try:
                 total += os.path.getsize(os.path.join(root, f))
@@ -243,19 +300,53 @@ def run_model_download(cfg: ModelDownloadConfig, ctx: Any) -> dict[str, Any]:
         from huggingface_hub import HfApi, snapshot_download
     except ImportError as e:
         raise UnavailableModule("huggingface_hub is not installed (`pip install huggingface_hub`)") from e
+    from forge.core.modelref import get_hf_token, validate_repo_id
     from forge.core.paths import models_dir
-    from forge.core.settings import get_settings
 
-    token = get_settings().hf_token if cfg.use_token else None
+    validate_repo_id(cfg.repo_id)
+    token = get_hf_token() if cfg.use_token else None
+    ctx.log("HF token: " + ("provided" if token else "none (gated/private repos will fail)"))
     name = cfg.local_name or cfg.repo_id.split("/")[-1]
     target = models_dir() / safe_dirname(name, "local_name")
     if not _inside(target, models_dir()):
         raise ConfigError(f"refusing to download outside the models directory: {target}")
+    try:
+        return _download_into(cfg, ctx, name, target, token, HfApi, snapshot_download)
+    except BaseException as e:
+        if cfg.model_id and not isinstance(e, Cancelled):
+            try:
+                from forge.jobs.repo import ModelsRepo
+
+                repo = ModelsRepo()
+                row = repo.get(cfg.model_id)
+                if row and row.get("status") != "ready":  # a failed re-download must not demote a usable model
+                    repo.update(cfg.model_id, status="failed", info={**(row.get("info") or {}), "error": str(e)[:500]})
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+
+
+def _download_into(cfg: ModelDownloadConfig, ctx: Any, name: str, target: Path, token: str | None, HfApi: Any, snapshot_download: Any) -> dict[str, Any]:
+    import json as _json
+
+    marker = target / _SOURCE_MARKER
+    if target.is_dir():  # also for registered rows (model_id): a foreign non-empty directory is never adopted
+        stale = [c for c in target.iterdir() if c.name not in (".cache", _SOURCE_MARKER)]
+        same = False
+        if marker.is_file():
+            try:
+                same = _json.loads(marker.read_text(encoding="utf-8")).get("repo_id") == cfg.repo_id
+            except (ValueError, OSError):
+                same = False
+        if stale and not same:
+            raise ConfigError(f"{target} already exists and is not a download of {cfg.repo_id}; pick a different local_name or remove it")
     target.mkdir(parents=True, exist_ok=True)
+    marker.write_text(_json.dumps({"repo_id": cfg.repo_id, "revision": cfg.revision}), encoding="utf-8")
     ctx.log(f"downloading {cfg.repo_id}@{cfg.revision or 'main'} -> {target}")
 
     ignore = list(cfg.ignore_patterns)
     total_bytes = 0
+    keep: list[tuple[str, int]] = []
     licence = cfg.licence
     try:
         info = HfApi().model_info(cfg.repo_id, revision=cfg.revision, files_metadata=True, token=token)
@@ -279,6 +370,9 @@ def run_model_download(cfg: ModelDownloadConfig, ctx: Any) -> dict[str, Any]:
                         lic = str(tg).split(":", 1)[1]
             licence = str(lic) if lic else None
     except Exception as e:
+        fatal = _hub_error(e, cfg.repo_id, token)
+        if fatal is not None:
+            raise fatal from e
         ctx.log(f"could not query repo metadata ({type(e).__name__}: {e}); progress will be indeterminate", "warning")
 
     err: list[BaseException] = []
@@ -322,7 +416,9 @@ def run_model_download(cfg: ModelDownloadConfig, ctx: Any) -> dict[str, Any]:
             ctx.log(f"downloaded {cur / 2**30:.2f} GiB")
         last = cur
     if err:
-        raise err[0]
+        raise _hub_error(err[0], cfg.repo_id, token) or err[0]
+    # snapshot_download returns a non-empty local_dir silently when the Hub is unreachable, so verify the files
+    validate_download(target, keep if keep else None, total_bytes)
     ctx.progress(1.0, "download complete")
     ctx.set_output("path", str(target))
     out: dict[str, Any] = {"path": str(target), "bytes": _dir_bytes(target)}

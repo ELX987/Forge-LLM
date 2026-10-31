@@ -590,3 +590,15 @@ def test_real_planner_and_claims_integration(client):
     assert isinstance(est.json(), dict) and est.json()
     pl = client.post(f"{API}/planner/plan", json={"hf_config": HF_CFG, "chip": "h100-sxm5-80g", "budget": {}})
     assert pl.status_code == 200, pl.text
+
+
+def test_source_preview_local_and_errors(client, home):
+    tmp_path = home / "datasets"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    f = tmp_path / "d.jsonl"
+    f.write_text("\n".join(json.dumps({"body": f"doc {i}"}) for i in range(5)) + "\n")
+    r = client.post(f"{API}/datasets/source-preview", json={"source": {"path": str(f), "text_field": "body"}, "n": 2})
+    assert r.status_code == 200, r.text
+    assert r.json()["local"] and r.json()["samples"] == ["doc 0", "doc 1"] and r.json()["columns"] == ["body"]
+    assert client.post(f"{API}/datasets/source-preview", json={"source": {"path": str(f), "bogus": 1}}).status_code == 400
+    assert client.post(f"{API}/datasets/source-preview", json={"source": {"path": str(tmp_path / "nope")}}).status_code == 404

@@ -48,6 +48,23 @@ def estimate_from_hf_config(hf: dict[str, Any]) -> dict[str, Any]:
     return {"params": int(total), "kv_bytes_per_token": kv, "estimated": True, "layers": L, "hidden": H, "heads": nh, "kv_heads": nkv, "head_dim": hd}
 
 
+def unsupported_architecture_message(hf: dict[str, Any], err: Exception | None = None) -> str:
+    """Human-readable 'Forge cannot run this architecture' text naming the top-level type, the HF class and what is supported."""
+    tc = hf.get("text_config") if isinstance(hf.get("text_config"), dict) else {}
+    top = hf.get("model_type")
+    inner = tc.get("model_type")
+    archs = ", ".join(hf.get("architectures") or []) or "unknown class"
+    name = f"{top} / {inner}" if inner and inner != top else str(top)
+    try:
+        from forge.models.config import SUPPORTED_ARCHS
+
+        sup = ", ".join(SUPPORTED_ARCHS)
+    except Exception:  # noqa: BLE001
+        sup = "see docs/ARCHITECTURE.md"
+    why = f" ({err})" if err is not None and not str(err).startswith("unsupported model_type") else ""
+    return f"architecture '{name}' ({archs}) is not supported by Forge's own model code{why}; supported: {sup}. Jobs that load it will fail."
+
+
 def _read_licence(p: Path) -> str | None:
     readme = p / "README.md"
     if readme.exists():
@@ -101,6 +118,7 @@ def inspect_model_dir(path: str | Path) -> dict[str, Any]:
         "has_tokenizer": any((p / n).exists() for n in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")),
         "licence": _read_licence(p),
         "forge_supported": False,
+        "unsupported_reason": None,
     }
     # --- preferred: forge.models.ModelConfig --------------------------------------------------
     try:
@@ -128,6 +146,9 @@ def inspect_model_dir(path: str | Path) -> dict[str, Any]:
             info["estimated"] = True
             reason = "forge.models not importable" if isinstance(e, ImportError) else f"forge.models rejected config ({e})"
             warnings.append(f"parameter count estimated from config.json: {reason}")
+            if not isinstance(e, ImportError):
+                info["unsupported_reason"] = unsupported_architecture_message(hf, e)
+                warnings.insert(0, info["unsupported_reason"])
         except ConfigError as e2:
             warnings.append(str(e2))
     if info.get("params"):

@@ -198,20 +198,53 @@ def test_manifest_stored_in_store(tmp_path):
     assert summary["manifest_hash"] and store.has(summary["manifest_hash"])
 
 
-def test_hf_source_via_datasets_module(tmp_path, monkeypatch):
+class _FakeDatasets:
+    """Stand-in for the `datasets` package: records load_dataset calls, no network."""
+
+    __version__ = "3.0.0"
+
+    def __init__(self, records=None, configs=("default",), splits=("train",), load_error=None):
+        self.records = records if records is not None else [{"text": "doc one"}, {"text": "doc two"}]
+        self.configs, self.splits, self.load_error = list(configs), list(splits), load_error
+        self.calls: list[dict] = []
+        self.config_calls: list[tuple] = []
+
+    def load_dataset(self, path, name=None, **kw):
+        self.calls.append({"path": path, "name": name, **kw})
+        if self.load_error and name is not None:
+            raise self.load_error
+        return iter(self.records)
+
+    def get_dataset_config_names(self, path, **kw):
+        self.config_calls.append((path, kw))
+        return self.configs
+
+    def get_dataset_split_names(self, path, config=None, **kw):
+        return self.splits
+
+
+def _settings(token=None):
+    return lambda *a, **k: token
+
+
+@pytest.fixture
+def fake_hf(monkeypatch):
     import sys
-    import types
 
-    calls = {}
+    def install(**kw):
+        fake = _FakeDatasets(**kw)
+        monkeypatch.setitem(sys.modules, "datasets", fake)
+        return fake
 
-    def load_dataset(path, name, split=None, streaming=True):
-        calls.update(path=path, name=name, split=split, streaming=streaming)
-        return iter([{"content": "doc one"}, {"content": "doc two"}, {"other": 1}])
+    monkeypatch.setattr("forge.train.data.get_hf_token", _settings())
+    return install
 
-    monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=load_dataset))
+
+def test_hf_source_via_datasets_module(tmp_path, fake_hf):
+    fake = fake_hf(records=[{"content": "doc one"}, {"content": "doc two"}, {"other": 1}], configs=["en", "de"], splits=["train", "validation"])
     summary, _ = _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "hf_config": "en", "split": "validation", "text_field": "content", "name": "hf"}])
     assert summary["report"]["kept"] == 2 and summary["report"]["bad_records"] == 1
-    assert calls == {"path": "org/ds", "name": "en", "split": "validation", "streaming": True}
+    assert fake.calls == [{"path": "org/ds", "name": "en", "split": "validation", "streaming": True}]
 
 
 def test_hf_source_without_datasets_package_is_a_clear_error(tmp_path, monkeypatch):
@@ -220,3 +253,104 @@ def test_hf_source_without_datasets_package_is_a_clear_error(tmp_path, monkeypat
     monkeypatch.setitem(sys.modules, "datasets", None)  # makes `import datasets` raise ImportError
     with pytest.raises(ConfigError, match="datasets"):
         _ingest(tmp_path, [{"kind": "hf", "path": "org/ds"}])
+
+
+def test_hf_kind_with_local_path_reads_files_and_ignores_config(tmp_path, fake_hf):
+    fake = fake_hf()
+    src = write_corpus(tmp_path)
+    summary, _ = _ingest(tmp_path, [{"kind": "hf", "path": str(src.parent), "hf_config": "wikitext-103-raw-v1"}])
+    assert summary["report"]["kept"] > 0
+    assert fake.calls == [] and fake.config_calls == []
+
+
+def test_auto_kind_falls_back_to_hf_id_but_not_for_missing_paths(tmp_path, fake_hf):
+    fake = fake_hf()
+    summary, _ = _ingest(tmp_path, [{"path": "org/ds"}])  # kind=auto, not on disk, looks like a Hub id
+    assert summary["report"]["kept"] == 2 and fake.calls[0]["path"] == "org/ds"
+    with pytest.raises(Exception, match="not found"):
+        _ingest(tmp_path, [{"path": str(tmp_path / "missing" / "dir")}])
+
+
+def test_hf_only_default_config_is_ignored(tmp_path, fake_hf):
+    fake = fake_hf(configs=["default"])
+    summary, _ = _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "hf_config": "wikitext-103-raw-v1"}])
+    assert summary["report"]["kept"] == 2 and fake.calls[0]["name"] is None
+
+
+def test_hf_load_error_about_default_config_retries_without_config(tmp_path, fake_hf):
+    err = ValueError("BuilderConfig 'x' not found. Available: ['default']")
+    fake = fake_hf(configs=["x", "default"], load_error=err)  # config listing says ok, loader disagrees
+    summary, _ = _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "hf_config": "x"}])
+    assert summary["report"]["kept"] == 2 and [c["name"] for c in fake.calls] == ["x", None]
+
+
+def test_hf_unknown_config_lists_valid_ones(tmp_path, fake_hf):
+    fake_hf(configs=["a-v1", "b-v1"])
+    with pytest.raises(ConfigError, match=r"a-v1.*b-v1"):
+        _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "hf_config": "nope"}])
+    with pytest.raises(ConfigError, match="needs `hf_config`"):
+        _ingest(tmp_path, [{"kind": "hf", "path": "org/ds"}])
+
+
+def test_hf_bad_split_lists_valid_and_single_split_fallback(tmp_path, fake_hf):
+    fake_hf(splits=["test", "validation"])
+    with pytest.raises(ConfigError, match=r"Valid splits.*validation"):
+        _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "split": "train"}])
+    fake = fake_hf(splits=["test"])
+    summary, _ = _ingest(tmp_path, [{"kind": "hf", "path": "org/ds"}])
+    assert summary["report"]["kept"] == 2 and fake.calls[0]["split"] == "test"
+
+
+def test_hf_legacy_id_is_redirected(tmp_path, fake_hf):
+    fake = fake_hf()
+    _ingest(tmp_path, [{"kind": "hf", "path": "wikitext"}])
+    assert fake.calls[0]["path"] == "Salesforce/wikitext"
+
+
+def test_hf_text_field_autodetect_and_mismatch_lists_columns(tmp_path, fake_hf):
+    fake_hf(records=[{"id": 1, "body": "hello world"}])
+    summary, _ = _ingest(tmp_path, [{"kind": "hf", "path": "org/ds"}])  # default 'text' absent -> first string column
+    assert summary["report"]["kept"] == 1
+    with pytest.raises(ConfigError, match=r"text_field 'wrong'.*\['id', 'body'\]"):
+        _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "text_field": "wrong"}])
+
+
+def test_hf_token_comes_from_settings_and_is_not_persisted(tmp_path, fake_hf, monkeypatch):
+    fake = fake_hf()
+    monkeypatch.setattr("forge.train.data.get_hf_token", _settings("hf_SECRET123"))
+    _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "revision": "main"}])
+    assert fake.calls[0]["token"] == "hf_SECRET123" and fake.calls[0]["revision"] == "main"
+    assert "hf_SECRET123" not in (tmp_path / "out" / "dataset_info.json").read_text()
+
+
+def test_hf_load_failure_message_hides_token(tmp_path, fake_hf, monkeypatch):
+    fake = fake_hf(configs=["a"])
+    monkeypatch.setattr("forge.train.data.get_hf_token", _settings("hf_SECRET123"))
+
+    def boom(*a, **k):
+        raise RuntimeError("boom with hf_SECRET123")
+
+    fake.load_dataset = boom
+    with pytest.raises(ConfigError) as ei:
+        _ingest(tmp_path, [{"kind": "hf", "path": "org/ds", "hf_config": "a"}])
+    assert "hf_SECRET123" not in str(ei.value) and "<token>" in str(ei.value)
+
+
+def test_csv_source_and_wrong_text_field_reports_columns(tmp_path):
+    f = tmp_path / "d.csv"
+    f.write_text("id,review\n1,hello there world\n2,second document here\n", encoding="utf-8")
+    summary, _ = _ingest(tmp_path, [{"path": str(f), "text_field": "review"}])
+    assert summary["report"]["kept"] == 2
+    with pytest.raises(ConfigError, match=r"columns seen.*review"):
+        _ingest(tmp_path, [{"path": str(f), "text_field": "nope"}])
+
+
+def test_describe_source_local_and_hf(tmp_path, fake_hf):
+    from forge.train.data import SourceSpec, describe_source
+
+    fake_hf(configs=["en", "de"], splits=["train"], records=[{"id": 1, "body": "alpha"}, {"id": 2, "body": "beta"}])
+    r = describe_source(SourceSpec(kind="hf", path="org/ds", hf_config="en"), n=1)
+    assert r["configs"] == ["en", "de"] and r["columns"] == ["id", "body"] and r["samples"] == ["alpha"] and r["text_field_used"] == "body"
+    src = write_corpus(tmp_path)
+    r = describe_source(SourceSpec(path=str(src)), n=2)
+    assert r["local"] and len(r["samples"]) == 2

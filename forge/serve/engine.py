@@ -112,12 +112,24 @@ class LLMEngine:
         self.adapter = ModelAdapter(model, model_cfg)
         d = self.adapter.dims
         self.dims = d
+        # hybrid (lfm2) models carry a per-sequence conv state that is not part of the KV blocks: nothing that reuses / rolls back /
+        # moves KV blocks (prefix cache, speculation, swap preemption) can reproduce it
+        self.hybrid = bool(d.conv_layers)
+        prefix_caching = cfg.prefix_caching
+        if self.hybrid:
+            if cfg.preemption_mode == "swap":
+                raise ConfigError("preemption_mode='swap' is not supported for hybrid (conv) models: the conv state is not swapped; use 'recompute'")
+            if cfg.speculation.mode != "off" or drafter is not None:
+                raise ConfigError("speculative decoding is not supported for hybrid (conv) models: the conv state cannot be rolled back")
+            if prefix_caching:
+                log.info("prefix caching disabled: hybrid (conv) models need the conv state at the cached-prefix boundary")
+                prefix_caching = False
         self.kv_name = normalize_kv_name(cfg.kv_dtype, self.compute_dtype)
         num_blocks = plan_num_blocks(dims=d, block_size=cfg.block_size, kv_name=self.kv_name, device=self.device,
                                      gpu_mem_util=cfg.gpu_mem_util, activation_reserve_gb=cfg.activation_reserve_gb,
                                      max_num_seqs=cfg.max_num_seqs, max_model_len=cfg.max_model_len,
                                      num_gpu_blocks=cfg.num_gpu_blocks)
-        self.pool = KVPool(num_blocks, cfg.block_size, d.num_layers, d.num_kv_heads, d.head_dim, self.compute_dtype,
+        self.pool = KVPool(num_blocks, cfg.block_size, d.num_kv_layers, d.num_kv_heads, d.head_dim, self.compute_dtype,
                            self.kv_name, self.device)
         bpb = self.pool.bytes_per_block
         host_blocks = int(cfg.host_kv_gb * 1e9 // bpb) if cfg.host_kv_gb > 0 else 0
@@ -126,7 +138,7 @@ class LLMEngine:
             swap_blocks = host_blocks // 2
             host_blocks -= swap_blocks
         nvme_blocks = int(cfg.nvme_kv_gb * 1e9 // bpb) if (cfg.nvme_kv_dir and cfg.nvme_kv_gb > 0) else 0
-        self.manager = KVBlockManager(num_blocks, cfg.block_size, enable_prefix_caching=cfg.prefix_caching,
+        self.manager = KVBlockManager(num_blocks, cfg.block_size, enable_prefix_caching=prefix_caching,
                                       host_blocks=host_blocks, nvme_dir=cfg.nvme_kv_dir if nvme_blocks else None,
                                       nvme_blocks=nvme_blocks, swap_blocks=swap_blocks, bytes_per_block=bpb, storage=self.pool)
         self.runner = ModelRunner(model, self.pool, model_cfg=model_cfg, max_model_len=cfg.max_model_len,
@@ -135,7 +147,7 @@ class LLMEngine:
         self.scheduler = Scheduler(self.manager, max_num_seqs=cfg.max_num_seqs, max_num_batched_tokens=cfg.max_num_batched_tokens,
                                    max_model_len=cfg.max_model_len, chunked_prefill=cfg.chunked_prefill, policy=cfg.policy,
                                    priority_aging_s=cfg.priority_aging_s, preemption_mode=cfg.preemption_mode,
-                                   prefix_caching=cfg.prefix_caching, clock=clock)
+                                   prefix_caching=prefix_caching, clock=clock)
         # eos
         eos: set[int] = set(cfg.eos_token_ids or [])
         if not eos:
@@ -227,6 +239,8 @@ class LLMEngine:
 
     def attach_eagle_head(self, head: Any) -> None:
         """Install an EAGLE head object at runtime (tests / online-trained heads) and switch speculation on."""
+        if self.hybrid:
+            raise ConfigError("speculative decoding is not supported for hybrid (conv) models: the conv state cannot be rolled back")
         self.drafter = EagleDrafter(head.to(self.device), self.adapter.embed, self.adapter.logits)
         self._need_hidden = True
         self.controller = self._build_controller()
@@ -330,6 +344,8 @@ class LLMEngine:
         else:
             self.last_step_info = {}  # idle step (e.g. waiting for KV memory): lets the serving loop back off
         outs = self._collect(acc)
+        if self.hybrid:
+            self.runner.prune_state(self._reqs)  # drop conv states of finished / aborted requests
         if sched.scheduled:
             dt = (self.clock() - t_start) * 1000.0
             self.step_ms.append(dt)
@@ -437,7 +453,7 @@ class LLMEngine:
             else:
                 toks = r.tokens[r.num_computed: r.num_computed + s.num_tokens]
                 lf = -1 if s.will_sample else len(toks)
-            inputs.append(SeqInput(toks, r.num_computed, self.manager.block_table(r.request_id), lf))
+            inputs.append(SeqInput(toks, r.num_computed, self.manager.block_table(r.request_id), lf, state_key=r.request_id))
 
         t0 = self.clock()
         with torch.no_grad():

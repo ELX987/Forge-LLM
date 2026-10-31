@@ -535,6 +535,8 @@ export class SchemaForm {
     }
     input = h('input', { type: schema.format === 'password' ? 'password' : 'text', 'aria-label': 'value', autocomplete: 'off', spellcheck: 'false' });
     input.value = typeof cur === 'string' ? cur : '';
+    const ph = schema['x-placeholder'] || (schema.examples && schema.examples.length ? String(schema.examples[0]) : '');
+    if (ph) input.setAttribute('placeholder', ph);
     if (schema.examples && schema.examples.length) {
       const id = uid('dl'); input.setAttribute('list', id);
       input.addEventListener('input', () => commit(input.value));

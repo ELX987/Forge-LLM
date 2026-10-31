@@ -5,6 +5,11 @@ The runner drives a decoder-only model *module by module* (``embed_tokens -> [in
 transparently - they are just called as modules on ``[tokens, hidden]`` activations. Both ``forge.models.ForgeLM``
 (HF-style naming) and any HF-llama-like module tree are supported; MoE ``mlp`` modules may return ``(out, aux)``.
 
+Hybrid models (lfm2: ``layers.<i>.conv`` instead of ``self_attn``): the KV pool only has layers for the attention layers (compact
+index ``ModelDims.attn_layers.index(i)``); every conv layer keeps a per-sequence ``[H, K-1]`` state in the runner
+(``SeqInput.state_key``; a chunk with ``start_pos == 0`` starts from zeros, so recompute-preemption needs no special handling).
+That state is not a function of KV blocks, hence the engine disables prefix caching and refuses speculation / swap preemption.
+
 Pool layout follows the kernel contract (``forge/kernels/ref/attn_kv.py``): per layer ``[num_blocks+1, Hkv, block_size, D]``
 (head-major pages); the extra last block is a scratch block used for padding rows (CUDA graphs) and never allocated.
 
@@ -198,6 +203,32 @@ def _cfg_get(cfg: Any, names: tuple[str, ...], default: Any = None) -> Any:
     return default
 
 
+def check_servable(cfg: Any) -> None:
+    """Refuse configs whose block structure the paged runner does not implement (it would crash or silently misbehave)."""
+    bad: list[str] = []
+    arch = _cfg_get(cfg, ("arch", "model_type"), None)
+    if isinstance(arch, str) and arch.startswith("gemma4"):
+        bad.append(f"arch {arch}")
+    if _cfg_get(cfg, ("sandwich_norm",), False):
+        bad.append("sandwich_norm")
+    if int(_cfg_get(cfg, ("per_layer_input_size", "hidden_size_per_layer_input"), 0) or 0):
+        bad.append("per_layer_input_size")
+    if int(_cfg_get(cfg, ("num_kv_shared_layers",), 0) or 0):
+        bad.append("num_kv_shared_layers")
+    ldim = getattr(cfg, "layer_head_dim", None)
+    n = _cfg_get(cfg, ("num_layers", "num_hidden_layers"), 0)
+    if callable(ldim) and n:
+        try:
+            if len({int(ldim(i)) for i in range(int(n))}) > 1:
+                bad.append("non-uniform per-layer head_dim")
+        except Exception:  # noqa: BLE001
+            pass
+    if bad:
+        raise ConfigError("serving Gemma 4 style models is not supported yet (" + ", ".join(bad) + "); training, finetuning and "
+                          "compress-free inspection work, but the paged runner lacks sandwich norms, PLE, layer_scalar, "
+                          "KV sharing, per-layer head_dim/rope and is unsafe for them")
+
+
 @dataclass
 class ModelDims:
     hidden_size: int
@@ -212,6 +243,18 @@ class ModelDims:
     sliding_window: int | None = None
     rotary_dim: int | None = None
     scale_embeddings: bool = False
+    conv_layers: tuple[int, ...] = ()  # lfm2 gated-conv layers (no KV cache, per-sequence recurrent state)
+    conv_kernel: int = 3
+
+    @property
+    def attn_layers(self) -> list[int]:
+        """Absolute indices of the layers that own a KV cache; their position in this list is the KV-pool layer index."""
+        c = set(self.conv_layers)
+        return [i for i in range(self.num_layers) if i not in c]
+
+    @property
+    def num_kv_layers(self) -> int:
+        return self.num_layers - len(self.conv_layers)
 
     @classmethod
     def from_config(cls, cfg: Any, model: Any = None) -> ModelDims:
@@ -219,7 +262,18 @@ class ModelDims:
         nh = int(_cfg_get(cfg, ("num_heads", "num_attention_heads")))
         nkv = int(_cfg_get(cfg, ("num_kv_heads", "num_key_value_heads"), nh))
         hd = _cfg_get(cfg, ("head_dim",), None)
+        n_layers = int(_cfg_get(cfg, ("num_layers", "num_hidden_layers")))
+        lt = _cfg_get(cfg, ("layer_types",), None)
+        fa = _cfg_get(cfg, ("full_attn_idxs",), None)
+        if isinstance(lt, (list, tuple)):
+            conv = tuple(i for i, t in enumerate(lt) if t == "conv")
+        elif fa is not None:
+            conv = tuple(i for i in range(n_layers) if i not in {int(x) for x in fa})
+        else:
+            conv = ()
         return cls(
+            conv_layers=conv,
+            conv_kernel=int(_cfg_get(cfg, ("conv_kernel", "conv_L_cache"), 3)),
             hidden_size=h,
             num_layers=int(_cfg_get(cfg, ("num_layers", "num_hidden_layers"))),
             num_heads=nh, num_kv_heads=nkv, head_dim=int(hd) if hd else h // nh,
@@ -240,8 +294,10 @@ class ModelAdapter:
         cfg = cfg if cfg is not None else getattr(model, "config", None)
         if cfg is None:
             raise ConfigError("model has no .config; pass model_cfg explicitly")
+        check_servable(cfg)
         self.dims = ModelDims.from_config(cfg, model)
         self.cfg = cfg
+        self.softcap = _cfg_get(cfg, ("final_logit_softcapping",), None)
         backbone = getattr(model, "model", None)
         if backbone is None or not hasattr(backbone, "layers"):
             backbone = model
@@ -257,15 +313,22 @@ class ModelAdapter:
         self.attn_names: list[dict[str, Any]] = []
         for i, layer in enumerate(self.layers):
             attn = _first_attr(layer, ("self_attn", "attn", "attention"))
-            ln1 = _first_attr(layer, ("input_layernorm", "attn_norm", "ln1", "attention_norm"))
+            ln1 = _first_attr(layer, ("input_layernorm", "attn_norm", "ln1", "attention_norm", "operator_norm"))
             ln2 = _first_attr(layer, ("post_attention_layernorm", "mlp_norm", "ln2", "ffn_norm"))
             mlp = _first_attr(layer, ("mlp", "feed_forward", "ffn", "block_sparse_moe"))
+            if i in self.dims.conv_layers:
+                conv = getattr(layer, "conv", None)
+                if conv is None or ln1 is None or ln2 is None or mlp is None or not hasattr(conv, "in_proj") or not hasattr(conv, "out_proj"):
+                    raise ConfigError(f"layer {i}: conv layer needs conv.{{in_proj, conv, out_proj}}, layernorms and mlp")
+                self.attn_names.append({"kind": "conv", "conv": conv, "ln1": ln1, "ln2": ln2, "mlp": mlp, "ci": self.dims.conv_layers.index(i)})
+                continue
             if attn is None or ln1 is None or ln2 is None or mlp is None:
                 raise ConfigError(f"layer {i}: could not find self_attn / layernorms / mlp")
             for need in ("q_proj", "k_proj", "v_proj", "o_proj"):
                 if not hasattr(attn, need):
                     raise ConfigError(f"layer {i}: attention lacks {need} (fused qkv is not supported by the paged runner)")
-            self.attn_names.append({"attn": attn, "ln1": ln1, "ln2": ln2, "mlp": mlp,
+            self.attn_names.append({"kind": "attn", "pi": self.dims.attn_layers.index(i),
+                                    "attn": attn, "ln1": ln1, "ln2": ln2, "mlp": mlp,
                                     "q_norm": getattr(attn, "q_norm", None), "k_norm": getattr(attn, "k_norm", None),
                                     "window": getattr(attn, "window", None) if hasattr(attn, "window") else self.dims.sliding_window,
                                     "scale": getattr(attn, "scale", None)})
@@ -281,7 +344,11 @@ class ModelAdapter:
             out = F.linear(h, self.embed.weight)
         if isinstance(out, tuple):
             out = out[0]
-        return out.to(torch.float32)
+        out = out.to(torch.float32)
+        cap = getattr(self, "softcap", None)
+        if cap:
+            out = torch.tanh(out / float(cap)) * float(cap)
+        return out
 
 
 # --------------------------------------------------------------------------------------------------
@@ -329,6 +396,7 @@ class SeqInput:
     start_pos: int
     block_table: list[int]
     logits_from: int = -1  # first chunk index (0-based) to return logits for; -1 = last token only; len(token_ids) = none
+    state_key: Any = None  # hybrid models: identity of the sequence's conv state (the request id); required when conv layers exist
 
 
 @dataclass
@@ -348,7 +416,7 @@ class ModelRunner:
         self.device = pool.device
         self.bs = pool.block_size
         d = self.dims
-        if pool.num_layers != d.num_layers or pool.num_kv_heads != d.num_kv_heads or pool.head_dim != d.head_dim:
+        if pool.num_layers != d.num_kv_layers or pool.num_kv_heads != d.num_kv_heads or pool.head_dim != d.head_dim:
             raise ConfigError("KV pool shape does not match the model")
         self.rope = RotaryTable(d, max(max_model_len, 8), self.device)
         self._kernel_mode = kernel_attention
@@ -358,7 +426,12 @@ class ModelRunner:
             and (kernel_attention == "on" or self.device.type == "cuda")
         )
         self._graphs: dict[int, Any] = {}
-        self._graph_ok = bool(cuda_graphs) and self.device.type == "cuda" and self._kernel_ok
+        self.hybrid = bool(d.conv_layers)
+        self._conv_state: dict[Any, Any] = {}  # state_key -> [n_conv_layers, H, K-1]
+        self._conv_step: list[tuple[int, int, Any, bool]] = []  # per sequence of the running step: (offset, n_tokens, key, fresh)
+        if cuda_graphs and self.hybrid:
+            log.warning("CUDA graph decode is disabled for hybrid (conv) models: the conv state lives outside the captured graph")
+        self._graph_ok = bool(cuda_graphs) and self.device.type == "cuda" and self._kernel_ok and not self.hybrid
         self._graph_max = int(cuda_graph_max_batch)
         self.stats = {"kernel_decode_steps": 0, "graph_replays": 0, "reference_steps": 0}
         self._torch = torch
@@ -373,8 +446,17 @@ class ModelRunner:
             x = x[0]
         if d.scale_embeddings:
             x = x * torch.tensor(d.hidden_size ** 0.5, dtype=x.dtype)
-        for li, parts in enumerate(ad.attn_names):
+        for parts in ad.attn_names:
             h = parts["ln1"](x)
+            if parts["kind"] == "conv":
+                x = x + self._conv_mix(parts, h)
+                h = parts["ln2"](x)
+                m = parts["mlp"](h)
+                if isinstance(m, tuple):
+                    m = m[0]
+                x = x + m
+                continue
+            li = parts["pi"]  # KV-pool layer index
             attn = parts["attn"]
             q = attn.q_proj(h).reshape(t, d.num_heads, d.head_dim)
             k = attn.k_proj(h).reshape(t, d.num_kv_heads, d.head_dim)
@@ -393,6 +475,58 @@ class ModelRunner:
                 m = m[0]
             x = x + m
         return ad.norm(x)
+
+    # ---- lfm2 gated short conv over ragged tokens ---------------------------------------------------
+    def _conv_mix(self, parts: dict, h: Any) -> Any:
+        """``out_proj(C * conv1d(B * x))`` for ``h [T, H]`` holding several sequences back to back; updates their conv states."""
+        torch = self._torch
+        import torch.nn.functional as F
+
+        conv, ci = parts["conv"], parts["ci"]
+        hid, k1 = self.dims.hidden_size, self.dims.conv_kernel - 1
+        w, bias = conv.conv.weight, conv.conv.bias  # [H,1,K]
+        bb, cc, xx = conv.in_proj(h).chunk(3, dim=-1)
+        u = bb * xx  # [T,H]
+
+        def prev_of(key: Any, fresh: bool) -> Any:
+            st = None if fresh else self._conv_state.get(key)
+            return u.new_zeros(hid, k1) if st is None else st[ci].to(u.dtype)
+
+        def store(key: Any, new: Any) -> None:
+            st = self._conv_state.get(key)
+            if st is None:
+                st = u.new_zeros(len(self.dims.conv_layers), hid, k1)
+                self._conv_state[key] = st
+            st[ci] = new.to(st.dtype)
+
+        step = self._conv_step
+        if k1 == 0:
+            y = F.conv1d(u.t().unsqueeze(0).to(w.dtype), w, bias, groups=hid)[0].t().to(u.dtype)
+        elif all(n == 1 for _, n, _, _ in step):  # pure decode: one tap window per sequence, no python-level conv1d
+            prev = torch.stack([prev_of(key, fresh) for _, _, key, fresh in step])  # [B,H,K-1]
+            win = torch.cat([prev, u.unsqueeze(-1)], dim=-1)  # [B,H,K]
+            y = (win.to(w.dtype) * w.squeeze(1)).sum(-1)
+            if bias is not None:
+                y = y + bias
+            y = y.to(u.dtype)
+            for bi, (_, _, key, _) in enumerate(step):
+                store(key, win[bi, :, 1:])
+        else:
+            y = torch.empty_like(u)
+            for off, n, key, fresh in step:
+                z = torch.cat([prev_of(key, fresh), u[off: off + n].t()], dim=-1)  # [H, K-1+n]
+                y[off: off + n] = F.conv1d(z.unsqueeze(0).to(w.dtype), w, bias, groups=hid)[0].t().to(u.dtype)
+                store(key, z[:, z.shape[-1] - k1:])
+        return conv.out_proj(cc * y)
+
+    def drop_state(self, key: Any) -> None:
+        self._conv_state.pop(key, None)
+
+    def prune_state(self, live: Any) -> None:
+        """Forget conv states of sequences that are no longer alive (finished / aborted requests)."""
+        live = set(live)
+        for k in [k for k in self._conv_state if k not in live]:
+            del self._conv_state[k]
 
     # ---- attention implementations ---------------------------------------------------------------
     def _ref_attention_fn(self, inputs: list[SeqInput], offsets: list[int]) -> Any:
@@ -473,6 +607,10 @@ class ModelRunner:
         blk_t = torch.tensor(slot_blk, dtype=torch.long, device=dev)
         off_t = torch.tensor(slot_off, dtype=torch.long, device=dev)
         decode_only = all(len(s.token_ids) == 1 for s in inputs)
+        if self.hybrid:
+            if any(s.state_key is None for s in inputs):
+                raise ConfigError("hybrid (conv) models need SeqInput.state_key (one per sequence) to carry the conv state")
+            self._conv_step = [(offsets[i], len(s.token_ids), s.state_key, s.start_pos == 0) for i, s in enumerate(inputs)]
 
         h = None
         if decode_only and self._kernel_ok:
@@ -508,6 +646,9 @@ class ModelRunner:
     # ---- kernel / graph decode ---------------------------------------------------------------------
     def _try_kernel_decode(self, inputs: list[SeqInput], ids_t: Any, pos_t: Any, blk_t: Any, off_t: Any) -> Any | None:
         torch = self._torch
+        # _body writes conv state in place before a failure can surface; snapshot so the reference fallback does not advance it twice
+        keys = [s.state_key for s in inputs if self.dims.conv_layers]
+        snap = {k: self._conv_state[k].clone() for k in keys if k in self._conv_state}
         try:
             b = len(inputs)
             max_blocks = max(len(s.block_table) for s in inputs)
@@ -528,6 +669,11 @@ class ModelRunner:
             log.warning("paged decode kernel path failed (%s: %s); falling back to the torch reference path", type(e).__name__, e)
             self._kernel_ok = False
             self._graph_ok = False
+            for k in keys:
+                if k in snap:
+                    self._conv_state[k] = snap[k]
+                else:
+                    self._conv_state.pop(k, None)
             return None
 
     def _graph_decode(self, b: int, ids_t: Any, pos_t: Any, blk_t: Any, off_t: Any, bt: Any, lens: Any) -> Any | None:
@@ -610,7 +756,7 @@ def plan_num_blocks(*, dims: ModelDims, block_size: int, kv_name: str, device: A
 
     if num_gpu_blocks:
         return int(num_gpu_blocks)
-    per = kv_bytes_per_block(dims.num_layers, dims.num_kv_heads, dims.head_dim, block_size, kv_name)
+    per = kv_bytes_per_block(dims.num_kv_layers, dims.num_kv_heads, dims.head_dim, block_size, kv_name)
     want = max_num_seqs * math.ceil(max_model_len / block_size)
     if device.type != "cuda":
         return max(8, min(want, cpu_cap_blocks))

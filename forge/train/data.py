@@ -17,9 +17,12 @@ Loading: :class:`ShardedTokenDataset` exposes ``batch_at(step, global_batch_size
 from __future__ import annotations
 
 import collections
+import contextvars
+import csv
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import logging
 import re
@@ -33,13 +36,27 @@ from typing import Any, Literal
 
 import numpy as np
 
-from forge.core.errors import ConfigError, NotFound
+from forge.core.errors import ConfigError, ForgeError, NotFound
 from forge.core.hashing import hash_file, hash_json
 from forge.core.schemas import DatasetManifest, ShardEntry
+from forge.core.modelref import get_hf_token
 from forge.train.config import FF, F, _Cfg
 from forge.train.tokenization import TokenizerAdapter, load_tokenizer_any
 
 log = logging.getLogger("forge.train.data")
+
+#: Where dataset-resolution warnings go besides ``log.warning`` (the running ingest job installs ``ctx.log`` here).
+_WARN_SINK: contextvars.ContextVar[Any] = contextvars.ContextVar("forge_dataset_warn_sink", default=None)
+
+
+def _emit_warning(msg: str) -> None:
+    log.warning("%s", msg)
+    sink = _WARN_SINK.get()
+    if sink is not None:
+        try:
+            sink(msg)
+        except Exception:  # noqa: BLE001 - a broken job log must not fail dataset resolution
+            pass
 
 __all__ = [
     "ContaminationConfig", "ContaminationScanner", "IngestConfig", "MinHashDeduper", "ShardedTokenDataset", "SourceSpec",
@@ -137,12 +154,15 @@ class StepPrefetcher:
 class SourceSpec(_Cfg):
     """One input source of an ingest job."""
 
-    kind: Literal["auto", "jsonl", "txt", "parquet", "hf", "dir"] = F("auto", "Source type. auto = from the path (file extension / directory).", "Source")
-    path: str = F("", "File or directory path, or a Hugging Face dataset id when kind=hf.", "Source")
+    kind: Literal["auto", "jsonl", "txt", "parquet", "csv", "hf", "dir"] = F("auto", "Source type. auto = an existing local path (by extension / directory), otherwise a Hugging Face dataset id (org/name). hf = force the Hub (a local path still reads local files).", "Source")
+    path: str = F("", "Local file/directory, or a Hugging Face dataset id such as 'Salesforce/wikitext'. Local paths are detected automatically, also when kind=hf.", "Source")
     name: str = F("", "Label of this source in the dataset mixture report (default: file/dir name).", "Source")
-    text_field: str = F("text", "Field (dotted path allowed) holding the document text in jsonl/parquet/HF records.", "Source")
-    split: str = F("train", "Hugging Face split.", "Source", True)
-    hf_config: str | None = F(None, "Hugging Face dataset configuration name.", "Source", True)
+    text_field: str = F("text", "Field (dotted path allowed) holding the document text in jsonl/csv/parquet/HF records. If it is the default 'text' and absent in HF data, the first string column is used; otherwise a mismatch lists the real columns.", "Source")
+    split: str = F("train", "Hugging Face split. A missing split is reported with the valid ones ('train' falls back to the only split).", "Source", True)
+    hf_config: str | None = F(None, "Hugging Face dataset configuration name. Leave empty for the default; an unknown name is reported with the valid list (ignored when the dataset only has 'default').", "Source", True)
+    revision: str | None = F(None, "Hugging Face revision (branch, tag or commit; e.g. 'refs/convert/parquet' for a parquet mirror of a script dataset).", "Source", True)
+    data_files: list[str] | None = F(None, "Files/globs inside the Hugging Face repo to load instead of the repo's default files.", "Source", True)
+    trust_remote_code: bool = F(False, "Allow dataset loading scripts (only honoured by datasets<4). The Hub token is never part of the config: it comes from Settings / the HF_TOKEN environment variable.", "Source", True)
     streaming: bool = F(True, "Stream Hugging Face datasets instead of downloading them whole.", "Source", True)
     txt_split: Literal["file", "blank_line", "line"] = F("file", "How .txt files are split into documents: whole file, blank-line separated paragraphs, or one per line.", "Source", True)
     max_docs: int | None = F(None, "Cap documents taken from this source.", "Source", ge=1)
@@ -222,6 +242,8 @@ def _guess_kind(p: Path) -> str:
         return "jsonl"
     if name.endswith(".parquet"):
         return "parquet"
+    if name.endswith((".csv", ".tsv")):
+        return "csv"
     return "txt"
 
 
@@ -233,6 +255,8 @@ def _iter_jsonl(path: Path, field: str, stats: dict) -> Iterator[str]:
             text = first + f.read()
             try:
                 for rec in json.loads(text):
+                    if isinstance(rec, dict):
+                        stats.setdefault("columns", list(rec.keys()))
                     v = _dotted(rec, field) if isinstance(rec, dict) else None
                     if isinstance(v, str):
                         yield v
@@ -242,6 +266,7 @@ def _iter_jsonl(path: Path, field: str, stats: dict) -> Iterator[str]:
                 stats["bad_records"] += 1
             return
         buf = first
+        seen_cols = False
         for line in f:
             line = (buf + line).strip()
             buf = ""
@@ -252,6 +277,9 @@ def _iter_jsonl(path: Path, field: str, stats: dict) -> Iterator[str]:
             except json.JSONDecodeError:
                 stats["bad_records"] += 1
                 continue
+            if not seen_cols and isinstance(rec, dict):
+                seen_cols = True
+                stats.setdefault("columns", list(rec.keys()))
             v = _dotted(rec, field) if isinstance(rec, dict) else (rec if isinstance(rec, str) else None)
             if isinstance(v, str):
                 yield v
@@ -281,6 +309,9 @@ def _iter_parquet(path: Path, field: str, stats: dict) -> Iterator[str]:
         raise ConfigError("reading parquet needs pyarrow (pip install pyarrow)") from e
     pf = pq.ParquetFile(str(path))
     top = field.split(".")[0]
+    stats.setdefault("columns", list(pf.schema_arrow.names))
+    if top not in pf.schema_arrow.names:
+        raise ConfigError(f"text_field {field!r} is not a column of {path.name}; columns: {list(pf.schema_arrow.names)}")
     for batch in pf.iter_batches(columns=[top]):
         for v in batch.column(0).to_pylist():
             if "." in field:
@@ -291,18 +322,248 @@ def _iter_parquet(path: Path, field: str, stats: dict) -> Iterator[str]:
                 stats["bad_records"] += 1
 
 
-def _iter_hf(spec: SourceSpec, stats: dict) -> Iterator[str]:
+def _iter_csv(path: Path, field: str, stats: dict) -> Iterator[str]:
+    csv.field_size_limit(min(1 << 30, 2**31 - 1))
+    delim = "\t" if path.name.lower().replace(".gz", "").replace(".zst", "").endswith(".tsv") else ","
+    with _open_text(path) as f:
+        reader = csv.DictReader(f, delimiter=delim)
+        if reader.fieldnames:
+            stats.setdefault("columns", list(reader.fieldnames))
+        for rec in reader:
+            v = _dotted(rec, field)
+            if isinstance(v, str):
+                yield v
+            else:
+                stats["bad_records"] += 1
+
+
+# Canonical Hub names of datasets that used to live un-namespaced (loading-script era). `datasets>=4` dropped scripts, so the
+# bare names often fail or resolve to nothing useful; the namespaced parquet-backed repos are the maintained copies.
+_LEGACY_IDS = {
+    "wikitext": "Salesforce/wikitext", "c4": "allenai/c4", "openwebtext": "Skylion007/openwebtext", "gsm8k": "openai/gsm8k",
+    "squad": "rajpurkar/squad", "squad_v2": "rajpurkar/squad_v2", "imdb": "stanfordnlp/imdb", "ag_news": "fancyzhx/ag_news",
+    "glue": "nyu-mll/glue", "super_glue": "aps/super_glue", "hellaswag": "Rowan/hellaswag", "ai2_arc": "allenai/ai2_arc",
+    "winogrande": "allenai/winogrande", "piqa": "ybisk/piqa", "boolq": "google/boolq", "cnn_dailymail": "abisee/cnn_dailymail",
+    "bookcorpus": "rojagtap/bookcorpus", "wikipedia": "wikimedia/wikipedia", "tiny_shakespeare": "karpathy/tiny_shakespeare",
+}
+_HF_ID = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def _looks_local(p: str) -> bool:
+    """True for an existing path or something spelled like a filesystem path (so it is never sent to the Hub)."""
+    p = p.strip()
+    if not p:
+        return False
+    if p.startswith(("/", "./", "../", "~", ".\\", "..\\", "\\")) or (len(p) > 1 and p[1] == ":") or "\\" in p:
+        return True
     try:
-        from datasets import load_dataset  # type: ignore
+        return Path(p).expanduser().exists()
+    except OSError:
+        return False
+
+
+def _is_hf_id(p: str) -> bool:
+    p = p.strip()
+    return p in _LEGACY_IDS or bool(_HF_ID.match(p))
+
+
+def _redact(text: str, token: str | None) -> str:
+    return text.replace(token, "<token>") if token and token in text else text
+
+
+def _http_status(e: BaseException) -> int | None:
+    """HTTP status carried by the exception (or its cause chain): ``e.status_code`` / ``e.response.status_code``."""
+    seen: set[int] = set()
+    cur: BaseException | None = e
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        for obj in (cur, getattr(cur, "response", None)):
+            sc = getattr(obj, "status_code", None)
+            if isinstance(sc, int):
+                return sc
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+def _hf_hint(repo: str, e: BaseException, token: str | None) -> str:
+    """Actionable one-liner for the usual Hub / `datasets` failures (never contains the token)."""
+    kind, msg = type(e).__name__, _redact(str(e), token)
+    low = msg.lower()
+    names = {c.__name__ for c in type(e).__mro__}
+    status = _http_status(e)
+    if "scripts are no longer supported" in low or "loading script" in low or "trust_remote_code" in low:  # no distinct exception class
+        return (f"HF dataset {repo!r} uses a loading script, which datasets>=4 no longer supports. Use a namespaced parquet "
+                "dataset, set `revision: refs/convert/parquet`, or install 'datasets<4' and set trust_remote_code. "
+                f"({kind}: {msg[:200]})")
+    if names & {"RepositoryNotFoundError", "DatasetNotFoundError", "GatedRepoError"} or status in (401, 403):
+        return (f"HF dataset {repo!r} was not found or needs authentication. Check the id (use the namespaced form 'org/name'), "
+                f"accept the licence on the Hub for gated datasets and set the Hugging Face token in Settings (or HF_TOKEN). ({kind})")
+    if "FileNotFoundError" in names or status == 404:
+        return f"HF dataset {repo!r} could not be found (not on the Hub and not a local path). Use 'org/name' or a path that exists. ({kind}: {msg[:200]})"
+    return f"could not load HF dataset {repo!r}: {kind}: {msg[:300]}"
+
+
+def _resolve_hf(spec: SourceSpec) -> dict[str, Any]:
+    """Resolve repo / config / split against the Hub (config + split names are checked before any download)."""
+    try:
+        import datasets  # type: ignore
     except Exception as e:  # noqa: BLE001
-        raise ConfigError("Hugging Face sources need the `datasets` package (pip install datasets)") from e
-    ds = load_dataset(spec.path, spec.hf_config, split=spec.split, streaming=spec.streaming)
+        raise ConfigError("Hugging Face sources need the `datasets` package (pip install 'datasets>=2.19')") from e
+    repo = spec.path.strip()
+    warnings: list[str] = []
+
+    def warn(msg: str) -> None:
+        warnings.append(msg)
+        _emit_warning(msg)
+
+    if "/" not in repo and repo in _LEGACY_IDS:
+        warn(f"dataset id {repo!r} is a legacy name; using {_LEGACY_IDS[repo]!r}")
+        repo = _LEGACY_IDS[repo]
+    token = get_hf_token()  # never stored in the spec / job config (it would land in dataset_info.json)
+    kw: dict[str, Any] = {"token": token, "revision": spec.revision}
+    major = str(getattr(datasets, "__version__", "0")).split(".")[0]
+    if spec.trust_remote_code and major.isdigit() and int(major) < 4:
+        kw["trust_remote_code"] = True
+    kw = {k: v for k, v in kw.items() if v is not None}
+    cfg, split = (spec.hf_config or None), spec.split
+
+    configs: list[str] | None = None
+    fn = getattr(datasets, "get_dataset_config_names", None)
+    if fn is not None:
+        try:
+            configs = list(fn(repo, **kw))
+        except Exception as e:  # noqa: BLE001
+            hint = _hf_hint(repo, e, token)
+            if not hint.startswith("could not load"):  # a recognised, fatal problem
+                raise ConfigError(hint) from e
+            warn(f"could not list configs of {repo!r} ({type(e).__name__}); trying to load directly")
+    if configs is not None:
+        if cfg and cfg not in configs:
+            if configs == ["default"]:
+                warn(f"{repo!r} only has the 'default' config; ignoring hf_config={cfg!r}")
+                cfg = None
+            else:
+                raise ConfigError(f"HF dataset {repo!r} has no config {cfg!r}. Valid configs: {configs}")
+        elif not cfg and len(configs) > 1:
+            raise ConfigError(f"HF dataset {repo!r} needs `hf_config`; choose one of {configs}")
+
+    splits: list[str] | None = None
+    fn = getattr(datasets, "get_dataset_split_names", None)
+    if fn is not None:
+        try:
+            splits = list(fn(repo, cfg, **kw))
+        except Exception:  # noqa: BLE001 - best effort; load_dataset reports real problems
+            splits = None
+    if splits and split not in splits:
+        if len(splits) == 1 and split == "train":
+            warn(f"split 'train' not found; using the only split {splits[0]!r}")
+            split = splits[0]
+        else:
+            raise ConfigError(f"HF dataset {repo!r} (config {cfg!r}) has no split {split!r}. Valid splits: {splits}")
+    return {"datasets": datasets, "repo": repo, "config": cfg, "split": split, "configs": configs, "splits": splits, "kw": kw,
+            "token": token, "warnings": warnings}
+
+
+def _open_hf(spec: SourceSpec, info: dict[str, Any]) -> Any:
+    ds_mod, repo, cfg, kw = info["datasets"], info["repo"], info["config"], dict(info["kw"])
+    if spec.data_files:
+        kw["data_files"] = list(spec.data_files)
+
+    def load(c: str | None) -> Any:
+        return ds_mod.load_dataset(repo, c, split=info["split"], streaming=spec.streaming, **kw)
+
+    try:
+        return load(cfg)
+    except ForgeError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if cfg and "BuilderConfig" in str(e) and "'default'" in str(e):  # packaged/data-files repo: only 'default' exists
+            info["warnings"].append(f"{repo!r} only has the 'default' config; retrying without hf_config={cfg!r}")
+            _emit_warning(info["warnings"][-1])
+            info["config"] = None
+            try:
+                return load(None)
+            except Exception as e2:  # noqa: BLE001
+                raise ConfigError(_hf_hint(repo, e2, info["token"])) from e2
+        raise ConfigError(_hf_hint(repo, e, info["token"])) from e
+
+
+def _pick_text_field(rec: Any, field: str, warnings: list[str]) -> str:
+    """Validate ``field`` against the first record; fall back to the first string column only for the default 'text'."""
+    if not isinstance(rec, dict) or _dotted(rec, field) is not None:
+        return field
+    cols = list(rec.keys())
+    alt = [k for k, v in rec.items() if isinstance(v, str)]
+    if field == "text" and alt:
+        warnings.append(f"text_field 'text' not in columns {cols}; using {alt[0]!r}")
+        _emit_warning(warnings[-1])
+        return alt[0]
+    raise ConfigError(f"text_field {field!r} not in the dataset's columns {cols}; string columns: {alt}. Set `text_field` to one of them.")
+
+
+def _iter_hf(spec: SourceSpec, stats: dict) -> Iterator[str]:
+    if _looks_local(spec.path):  # kind=hf with a filesystem path: read the files, never ask the Hub for a config of a folder
+        yield from iter_source_texts(spec.model_copy(update={"kind": "auto"}), stats)
+        return
+    info = _resolve_hf(spec)
+    ds = _open_hf(spec, info)
+    field, checked = spec.text_field, False
     for rec in ds:
-        v = _dotted(rec, spec.text_field)
+        if not checked:
+            checked = True
+            if isinstance(rec, dict):
+                stats.setdefault("columns", list(rec.keys()))
+            field = _pick_text_field(rec, field, info["warnings"])
+        v = _dotted(rec, field)
         if isinstance(v, str):
             yield v
         else:
             stats["bad_records"] += 1
+
+
+_DATA_EXTS = (".jsonl", ".json", ".ndjson", ".parquet", ".csv", ".tsv", ".txt", ".md")
+
+
+def _is_data_file(p: Path) -> bool:
+    name = p.name.lower()
+    for suf in (".gz", ".zst"):
+        if name.endswith(suf):
+            name = name[: -len(suf)]
+    return name.endswith(_DATA_EXTS)
+
+
+def describe_source(spec: SourceSpec, n: int = 5) -> dict[str, Any]:
+    """Resolve a source exactly like ingestion would and return its first ``n`` documents (backs POST /datasets/source-preview)."""
+    n = max(1, min(int(n), 50))
+    out: dict[str, Any] = {"kind": spec.kind, "path": spec.path, "warnings": []}
+    stats: dict[str, Any] = {"bad_records": 0}
+    local = _looks_local(spec.path) or spec.kind not in ("auto", "hf") or (spec.kind == "auto" and not _is_hf_id(spec.path))
+    out["local"] = local
+    if local:
+        lp = Path(spec.path).expanduser()
+        if lp.is_file() and not _is_data_file(lp):
+            raise ConfigError(f"source-preview only reads data files ({', '.join(_DATA_EXTS)}); got {lp.name!r}")
+    if not local:
+        info = _resolve_hf(spec)
+        ds = _open_hf(spec, info)
+        out.update(resolved={"repo": info["repo"], "config": info["config"], "split": info["split"], "streaming": spec.streaming},
+                   configs=info["configs"], splits=info["splits"], warnings=info["warnings"])
+        field, recs = spec.text_field, []
+        for rec in itertools.islice(iter(ds), n):
+            if not recs:
+                if isinstance(rec, dict):
+                    out["columns"] = list(rec.keys())
+                field = _pick_text_field(rec, field, info["warnings"])
+            recs.append(rec)
+        out["text_field_used"] = field
+        out["samples"] = [v[:600] for v in (_dotted(r, field) for r in recs) if isinstance(v, str)]
+        return out
+    out["samples"] = [t[:600] for t in itertools.islice(iter_source_texts(spec, stats), n)]
+    out["columns"] = stats.get("columns")
+    out["text_field_used"] = spec.text_field
+    if not out["samples"]:
+        out["warnings"].append(f"no documents read (bad_records={stats['bad_records']}); check text_field {spec.text_field!r}" + (f" against columns {stats['columns']}" if stats.get("columns") else ""))
+    return out
 
 
 def iter_source_texts(spec: SourceSpec, stats: dict | None = None) -> Iterator[str]:
@@ -313,13 +574,16 @@ def iter_source_texts(spec: SourceSpec, stats: dict | None = None) -> Iterator[s
     if kind == "hf":
         yield from _iter_hf(spec, stats)
         return
-    p = Path(spec.path)
+    p = Path(spec.path).expanduser()
     if not p.exists():
-        raise NotFound(f"source path not found: {spec.path}")
+        if kind == "auto" and not _looks_local(spec.path) and _is_hf_id(spec.path):  # not a local path: treat as a Hub dataset id
+            yield from _iter_hf(spec.model_copy(update={"kind": "hf"}), stats)
+            return
+        raise NotFound(f"source path not found: {spec.path} (not a local file/directory, and not a Hugging Face dataset id like 'org/name')")
     if kind == "auto":
         kind = _guess_kind(p)
     if kind == "dir":
-        exts = (".jsonl", ".json", ".ndjson", ".parquet", ".txt", ".md", ".gz", ".zst")
+        exts = (".jsonl", ".json", ".ndjson", ".parquet", ".csv", ".tsv", ".txt", ".md", ".gz", ".zst")
         for f in sorted(x for x in p.rglob("*") if x.is_file() and x.name.lower().endswith(exts)):
             sub = spec.model_copy(update={"kind": "auto", "path": str(f)})
             yield from iter_source_texts(sub, stats)
@@ -328,6 +592,8 @@ def iter_source_texts(spec: SourceSpec, stats: dict | None = None) -> Iterator[s
         yield from _iter_jsonl(p, spec.text_field, stats)
     elif kind == "parquet":
         yield from _iter_parquet(p, spec.text_field, stats)
+    elif kind == "csv":
+        yield from _iter_csv(p, spec.text_field, stats)
     else:
         yield from _iter_txt(p, spec.txt_split)
 
@@ -571,6 +837,14 @@ def _ctx_log(ctx: Any, msg: str, level: str = "info") -> None:
 
 def ingest_dataset(cfg: IngestConfig | dict, ctx: Any = None) -> dict[str, Any]:
     """Job entry point (``dataset_ingest``). Returns a summary dict (also stored via ``ctx.set_output``)."""
+    tok = _WARN_SINK.set((lambda m: ctx.log(m, "warning")) if ctx is not None else None)
+    try:
+        return _ingest_dataset(cfg, ctx)
+    finally:
+        _WARN_SINK.reset(tok)
+
+
+def _ingest_dataset(cfg: IngestConfig | dict, ctx: Any = None) -> dict[str, Any]:
     if not isinstance(cfg, IngestConfig):
         cfg = IngestConfig.model_validate(cfg)
     if not cfg.sources:
@@ -602,6 +876,7 @@ def ingest_dataset(cfg: IngestConfig | dict, ctx: Any = None) -> dict[str, Any]:
         "contaminated_hit_ngrams": 0, "kept": 0, "bad_records": 0, "truncated_docs": 0,
     }
     mixture: dict[str, Any] = {}
+    seen_columns: dict[str, Any] = {}
     total_tokens = 0
     done = False
     val_cut = int(cfg.val_fraction * 10000)
@@ -669,6 +944,8 @@ def ingest_dataset(cfg: IngestConfig | dict, ctx: Any = None) -> dict[str, Any]:
                 done = True
                 break
         rep["bad_records"] += stats["bad_records"]
+        if stats.get("columns"):
+            seen_columns[label] = stats["columns"]
         if done:
             break
 
@@ -677,7 +954,11 @@ def ingest_dataset(cfg: IngestConfig | dict, ctx: Any = None) -> dict[str, Any]:
         rep["truncated_docs"] += w.truncated_docs
     shards = writers["train"].entries + writers["val"].entries
     if not writers["train"].entries and not writers["val"].entries:
-        raise ConfigError("ingest produced no tokens (all documents filtered?)", details=rep)
+        hint = ""
+        if rep["bad_records"] and not rep["docs_in"]:
+            hint = " Every record lacked a string in `text_field` - set `text_field` to a real column" + (f" (columns seen: {seen_columns})" if seen_columns else "") + "."
+        raise ConfigError(f"ingest produced no tokens (all documents filtered?): docs_in={rep['docs_in']} bad_records={rep['bad_records']}.{hint}",
+                          details={**rep, "columns": seen_columns})
 
     manifest = DatasetManifest(
         name=cfg.name, tokenizer_hash=tok.hash, shards=shards, mixture=mixture, filtering_version=cfg.filtering_version,

@@ -3,6 +3,12 @@
 * Names: ForgeLM parameter names equal HF names without the ``model.`` prefix (``lm_head.weight`` unchanged); mixtral expert
   weights ``w1/w2/w3`` map to ``gate_proj/down_proj/up_proj`` (:func:`hf_to_forge_name` / :func:`forge_to_hf_name`).  Fused-expert
   tensors (``experts.gate_up_proj`` / ``experts.down_proj``, as in recent transformers) are split per expert on load.
+  gemma4 checkpoints are multimodal (``model.language_model.*`` text tensors next to ``model.vision_tower.*`` / ``audio_tower.*``):
+  the ``language_model.`` level is stripped, non-text towers are dropped, and the k/v tensors that ship for KV-shared layers (and
+  the v_proj of ``attention_k_eq_v`` global layers) are ignored because the Forge model has no such modules.
+  lfm2 / lfm2_moe use their own vocabulary of names (``operator_norm``, ``ffn_norm``, ``feed_forward.w1/w2/w3``, ``self_attn.out_proj``,
+  ``q_layernorm`` / ``k_layernorm``, final ``embedding_norm``); they are renamed by ``_LFM2_TO_FORGE`` (and back on export).  The
+  ``conv.{in_proj,conv,out_proj}`` tensors keep their names.
 * Loading never holds more than one extra tensor in memory: the model is created on the ``meta`` device, materialised with
   ``to_empty`` on the target device and tensors are streamed shard by shard from ``safe_open``.
 * ``config.json`` written by :func:`save_model` is HF-compatible and additionally carries a ``forge`` block with the exact
@@ -60,7 +66,43 @@ _MIXTRAL_EXPERT = re.compile(r"\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\."
 _MIXTRAL_TO_FORGE = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _FORGE_TO_MIXTRAL = {v: k for k, v in _MIXTRAL_TO_FORGE.items()}
 _FORGE_EXPERT = re.compile(r"\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.")
-_FUSED = re.compile(r"^layers\.(\d+)\.(mlp|block_sparse_moe)\.experts\.(gate_up_proj|down_proj)$")
+_FUSED = re.compile(r"^layers\.(\d+)\.(mlp|block_sparse_moe|feed_forward)\.experts\.(gate_up_proj|down_proj)$")
+_KV_TENSOR = re.compile(r"^layers\.(\d+)\.self_attn\.(k_proj|v_proj|k_norm|v_norm)\.")
+_TOP_PREFIXES = ("layers.", "embed_tokens", "norm.", "per_layer_model_projection", "per_layer_projection_norm")
+_LFM2_ARCHS = ("lfm2", "lfm2_moe")
+# (HF pattern, Forge replacement); order matters (experts before the dense w1/w2/w3, `feed_forward.gate.` before nothing else)
+_LFM2_TO_FORGE = [
+    (re.compile(r"^embedding_norm\."), "norm."),
+    (re.compile(r"\.operator_norm\."), ".input_layernorm."),
+    (re.compile(r"\.ffn_norm\."), ".post_attention_layernorm."),
+    (re.compile(r"\.self_attn\.out_proj\."), ".self_attn.o_proj."),
+    (re.compile(r"\.self_attn\.q_layernorm\."), ".self_attn.q_norm."),
+    (re.compile(r"\.self_attn\.k_layernorm\."), ".self_attn.k_norm."),
+    (re.compile(r"\.feed_forward\.experts\.(\d+)\.w1\."), r".mlp.experts.\1.gate_proj."),
+    (re.compile(r"\.feed_forward\.experts\.(\d+)\.w3\."), r".mlp.experts.\1.up_proj."),
+    (re.compile(r"\.feed_forward\.experts\.(\d+)\.w2\."), r".mlp.experts.\1.down_proj."),
+    (re.compile(r"\.feed_forward\.w1\."), ".mlp.gate_proj."),
+    (re.compile(r"\.feed_forward\.w3\."), ".mlp.up_proj."),
+    (re.compile(r"\.feed_forward\.w2\."), ".mlp.down_proj."),
+    (re.compile(r"\.feed_forward\.gate\."), ".mlp.gate."),
+    (re.compile(r"\.feed_forward\.expert_bias$"), ".mlp.expert_bias"),
+]
+_FORGE_TO_LFM2 = [
+    (re.compile(r"^norm\."), "embedding_norm."),
+    (re.compile(r"\.input_layernorm\."), ".operator_norm."),
+    (re.compile(r"\.post_attention_layernorm\."), ".ffn_norm."),
+    (re.compile(r"\.self_attn\.o_proj\."), ".self_attn.out_proj."),
+    (re.compile(r"\.self_attn\.q_norm\."), ".self_attn.q_layernorm."),
+    (re.compile(r"\.self_attn\.k_norm\."), ".self_attn.k_layernorm."),
+    (re.compile(r"\.mlp\.experts\.(\d+)\.gate_proj\."), r".feed_forward.experts.\1.w1."),
+    (re.compile(r"\.mlp\.experts\.(\d+)\.up_proj\."), r".feed_forward.experts.\1.w3."),
+    (re.compile(r"\.mlp\.experts\.(\d+)\.down_proj\."), r".feed_forward.experts.\1.w2."),
+    (re.compile(r"\.mlp\.gate_proj\."), ".feed_forward.w1."),
+    (re.compile(r"\.mlp\.up_proj\."), ".feed_forward.w3."),
+    (re.compile(r"\.mlp\.down_proj\."), ".feed_forward.w2."),
+    (re.compile(r"\.mlp\.gate\."), ".feed_forward.gate."),
+    (re.compile(r"\.mlp\.expert_bias$"), ".feed_forward.expert_bias"),
+]
 
 
 def hf_to_forge_name(name: str, cfg: ModelConfig | None = None) -> str | None:
@@ -69,9 +111,23 @@ def hf_to_forge_name(name: str, cfg: ModelConfig | None = None) -> str | None:
         return None
     if name == "lm_head.weight":
         return name
-    n = name[len("model.") :] if name.startswith("model.") else name
-    if not (n.startswith("layers.") or n.startswith("embed_tokens") or n.startswith("norm.")):
+    if name.startswith("model.language_model."):
+        n = name[len("model.language_model.") :]
+    else:
+        n = name[len("model.") :] if name.startswith("model.") else name
+    if cfg is not None and cfg.arch in _LFM2_ARCHS:  # `embedding_norm` is the FINAL norm; vision/projector towers of lfm2_vl are dropped
+        for pat, rep in _LFM2_TO_FORGE:
+            n = pat.sub(rep, n)
+    if not n.startswith(_TOP_PREFIXES):
         return None
+    if cfg is not None and cfg.arch == "gemma4":
+        m = _KV_TENSOR.match(n)
+        if m:
+            li, kind = int(m.group(1)), m.group(2)
+            if li >= cfg.num_layers or cfg.is_kv_shared_layer(li) or (kind == "v_proj" and not cfg.layer_has_v_proj(li)):
+                return None
+            if kind == "v_norm":  # scale-less in Forge (no parameter)
+                return None
     if cfg is None or cfg.arch == "mixtral":
         n = n.replace(".block_sparse_moe.gate.", ".mlp.gate.")
         n = _MIXTRAL_EXPERT.sub(lambda m: f".mlp.experts.{m.group(1)}.{_MIXTRAL_TO_FORGE[m.group(2)]}.", n)
@@ -83,6 +139,9 @@ def forge_to_hf_name(name: str, cfg: ModelConfig | None = None) -> str:
     if name == "lm_head.weight" or name.startswith("lm_head."):
         return name
     n = name
+    if cfg is not None and cfg.arch in _LFM2_ARCHS:
+        for pat, rep in _FORGE_TO_LFM2:
+            n = pat.sub(rep, n)
     if cfg is not None and cfg.arch == "mixtral":
         n = _FORGE_EXPERT.sub(lambda m: f".block_sparse_moe.experts.{m.group(1)}.{_FORGE_TO_MIXTRAL[m.group(2)]}.", n)
         n = n.replace(".mlp.gate.", ".block_sparse_moe.gate.")
@@ -91,7 +150,8 @@ def forge_to_hf_name(name: str, cfg: ModelConfig | None = None) -> str:
 
 def expand_hf_tensor(name: str, tensor: torch.Tensor, cfg: ModelConfig) -> list[tuple[str, torch.Tensor]]:
     """Map one checkpoint tensor to ``[(forge_name, tensor), ...]`` (splits fused expert tensors; empty list = skip)."""
-    n = name[len("model.") :] if name.startswith("model.") else name
+    n = name[len("model.language_model.") :] if name.startswith("model.language_model.") else name
+    n = n[len("model.") :] if n.startswith("model.") else n
     m = _FUSED.match(n)
     if m and cfg.moe is not None:
         layer, kind = int(m.group(1)), m.group(3)
@@ -132,13 +192,17 @@ def resolve_model_path(path_or_repo: str | os.PathLike, revision: str | None = N
     p = Path(path_or_repo)
     if p.exists():
         return p
-    if p.is_absolute() or str(path_or_repo).startswith((".", "~")):
-        raise NotFound(f"model path {path_or_repo!s} does not exist")
+    from forge.core.modelref import get_hf_token, resolve_model_ref
+
+    r = resolve_model_ref(path_or_repo)  # registered name/id, FORGE_HOME/models dir, or a validated org/name repo id
+    if r.path is not None:
+        return r.path
+    path_or_repo = r.repo_id  # type: ignore[assignment]
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
         raise NotFound(f"{path_or_repo!s} does not exist locally and huggingface_hub is not installed") from None
-    return Path(snapshot_download(str(path_or_repo), revision=revision, allow_patterns=allow_patterns or _PATTERNS, token=os.environ.get("HF_TOKEN") or None))
+    return Path(snapshot_download(str(path_or_repo), revision=revision, allow_patterns=allow_patterns or _PATTERNS, token=get_hf_token()))
 
 
 def checkpoint_files(path: Path) -> list[Path]:

@@ -49,6 +49,7 @@ from forge.compress.modelutil import (
     iter_dense_linears,
     model_device,
     model_dtype,
+    require_attention_only,
 )
 from forge.core.errors import ConfigError
 
@@ -139,6 +140,7 @@ def estimate_importance(
     depth: bool = True,
 ) -> Importance:
     """Importance of MLP channels / attention heads / hidden channels / blocks (see module docstring)."""
+    require_attention_only(model, "structured pruning")
     prefix, blocks = find_blocks(model)
     cfg = getattr(model, "config", None)
     dev = model_device(model)
@@ -292,6 +294,7 @@ def _round_keep(n: int, frac: float, mult: int) -> int:
 
 
 def plan_pruning(model: nn.Module, cfg: PruneConfig, imp: Importance | None, router_stats: dict[str, Any] | None = None) -> PrunePlan:
+    require_attention_only(model, "structured pruning")
     mc = model.config
     prefix, blocks = find_blocks(model)
     n_layers = len(blocks)
@@ -595,6 +598,7 @@ def prune_model(
         raise ConfigError("prune_model needs model.config (a ModelConfig)")
     if not cfg.any_structure():
         raise ConfigError("PruneConfig prunes nothing (all keep fractions are 1 and depth_remove is 0)")
+    require_attention_only(model, "structured pruning")
     prefix, blocks = find_blocks(model)
     need_data = cfg.importance != "magnitude" or cfg.depth_remove > 0 and cfg.depth_mode != "explicit" or cfg.hidden_keep < 1
     imp = importance

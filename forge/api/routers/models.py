@@ -63,8 +63,10 @@ def create(body: ModelCreate, svc: Services = Depends(get_services)) -> dict[str
         ))
     if body.source not in ("hf", "artifact"):
         raise ConfigError("source must be one of: hf, local, artifact")
-    if body.source == "hf" and "/" not in body.path_or_repo:
-        raise ConfigError("a Hugging Face repo id looks like `org/name`")
+    if body.source == "hf":
+        from forge.core.modelref import get_hf_token, validate_repo_id
+
+        validate_repo_id(body.path_or_repo, get_hf_token())  # org/name, with Hub suggestions for a bare name
     existing = svc.models.find_by_repo(body.path_or_repo, body.revision) if body.source == "hf" else None
     if existing:
         return _public(existing)
@@ -147,15 +149,21 @@ def inspect(
             from huggingface_hub import hf_hub_download
         except ImportError as e:
             raise ConfigError("huggingface_hub is not installed") from e
-        from forge.core.settings import get_settings
+        from forge.core.modelref import get_hf_token
 
         import tempfile
 
         with tempfile.TemporaryDirectory() as td:
-            hf_hub_download(row["path_or_repo"], "config.json", revision=row.get("revision"), local_dir=td, token=get_settings().hf_token)
+            hf_hub_download(row["path_or_repo"], "config.json", revision=row.get("revision"), local_dir=td, token=get_hf_token())
             info = inspect_model_dir_config_only(Path(td))
     else:
         raise ConfigError("model is not downloaded; download it first or pass ?remote=true to read config.json from the Hub")
+    try:
+        from forge.models.config import SUPPORTED_ARCHS
+
+        info["supported_archs"] = list(SUPPORTED_ARCHS)
+    except Exception:  # noqa: BLE001
+        pass
     info["licence_hint"] = licence_hint(row.get("licence") or info.get("licence"))
     info["model_id"] = model_id
     return info

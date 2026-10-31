@@ -120,7 +120,12 @@ def _as_n_new(n_new: torch.Tensor | int | None, b: int, t: int, device: torch.de
 
 # ------------------------------------------------------------------------------------------- dense cache
 class DenseKVCache:
-    """Pre-allocated dense KV cache ``[B, max_len, Hkv, D]`` per layer, optionally quantised."""
+    """Pre-allocated dense KV cache ``[B, max_len, Hkv, D]`` per layer, optionally quantised.
+
+    Layers may differ in ``(Hkv, D)`` (gemma4 sliding vs full layers); KV-shared layers (``cfg.is_kv_shared_layer``) get an empty
+    placeholder, they read the cache of ``cfg.kv_source_layer``.  lfm2 ``conv`` layers also get an empty placeholder and instead keep a
+    ``[B, H, conv_kernel-1]`` recurrent state (``get_conv`` / ``set_conv``) that cannot be rolled back (:meth:`truncate` refuses).
+    """
 
     def __init__(
         self,
@@ -144,19 +149,25 @@ class DenseKVCache:
         self.scale_dtype = scale_dtype
         self.residual_window = int(residual_window) if self.quantised else 0
         self.device = torch.device(device) if device is not None else torch.device("cpu")
-        h, d = cfg.kv_heads, int(cfg.head_dim)  # type: ignore[arg-type]
-        self.num_layers, self.kv_heads, self.head_dim = cfg.num_layers, h, d
+        self.num_layers, self.kv_heads, self.head_dim = cfg.num_layers, cfg.kv_heads, int(cfg.head_dim)  # type: ignore[arg-type]
         self.seq_lens = torch.zeros(batch, dtype=torch.long, device=self.device)
         self._S: int | None = None
-        shape = (batch, max_len, h, d)
         self.k: list[torch.Tensor] = []
         self.v: list[torch.Tensor] = []
         self.k_scale: list[torch.Tensor] = []
         self.v_scale: list[torch.Tensor] = []
         self.k_res: list[torch.Tensor] = []
         self.v_res: list[torch.Tensor] = []
-        g = d if not group_size or group_size > d else group_size
-        for _ in range(cfg.num_layers):
+        self.conv: dict[int, torch.Tensor] = {
+            li: torch.zeros((batch, cfg.hidden_size, cfg.conv_kernel - 1), dtype=dtype, device=self.device) for li in cfg.conv_layer_ids
+        }
+        for li in range(cfg.num_layers):
+            if not cfg.layer_owns_kv(li):  # shared / conv layer: keeps list indices aligned with layer ids; never written or read
+                self._placeholder(dtype)
+                continue
+            h, d = cfg.layer_kv_heads(li), cfg.layer_head_dim(li)
+            shape = (batch, max_len, h, d)
+            g = d if not group_size or group_size > d else group_size
             if not self.quantised:
                 st = _TORCH_DTYPES[self.kv_dtype]
                 self.k.append(torch.zeros(shape, dtype=st, device=self.device))
@@ -180,17 +191,45 @@ class DenseKVCache:
                     self.k_res.append(torch.zeros(rs, dtype=dtype, device=self.device))
                     self.v_res.append(torch.zeros(rs, dtype=dtype, device=self.device))
 
+    def _placeholder(self, dtype: torch.dtype) -> None:
+        z = torch.zeros((self.batch, 0, 1, 1), dtype=_TORCH_DTYPES.get(self.kv_dtype, torch.int8), device=self.device)
+        self.k.append(z)
+        self.v.append(z)
+        if self.quantised:
+            s = torch.zeros((self.batch, 0, 1, 1), dtype=self.scale_dtype, device=self.device)
+            self.k_scale.append(s)
+            self.v_scale.append(s)
+            if self.residual_window:
+                r = torch.zeros((self.batch, 0, 1, 1), dtype=dtype, device=self.device)
+                self.k_res.append(r)
+                self.v_res.append(r)
+
     # ---- bookkeeping
     def reset(self, batch_idx: torch.Tensor | list[int] | None = None) -> None:
         if batch_idx is None:
             self.seq_lens.zero_()
+            for s in self.conv.values():
+                s.zero_()
         else:
-            self.seq_lens[torch.as_tensor(batch_idx, device=self.device)] = 0
+            bi = torch.as_tensor(batch_idx, device=self.device)
+            self.seq_lens[bi] = 0
+            for s in self.conv.values():
+                s[bi] = 0
         self._S = None
+
+    def get_conv(self, layer: int, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Conv state ``[B, H, K-1]`` of an lfm2 conv layer before the current forward."""
+        s = self.conv[layer]
+        return s if dtype is None else s.to(dtype)
+
+    def set_conv(self, layer: int, state: torch.Tensor) -> None:
+        self.conv[layer] = state.detach().to(self.conv[layer].dtype)
 
     def truncate(self, new_lens: torch.Tensor | list[int]) -> None:
         """Roll sequences back to ``new_lens`` (speculative-decoding rollback). Never extends."""
         nl = torch.as_tensor(new_lens, dtype=torch.long, device=self.device)
+        if self.conv and bool((nl < self.seq_lens).any()):
+            raise ConfigError("hybrid (conv) models keep a recurrent state that cannot be rolled back; truncate() is unsupported")
         self.seq_lens = torch.minimum(self.seq_lens, nl)
         self._S = None
 
@@ -203,12 +242,12 @@ class DenseKVCache:
         return self.seq_lens + _as_n_new(n_new, self.batch, t, self.device)
 
     def nbytes(self) -> int:
-        ts = [*self.k, *self.v, *self.k_scale, *self.v_scale, *self.k_res, *self.v_res]
+        ts = [*self.k, *self.v, *self.k_scale, *self.v_scale, *self.k_res, *self.v_res, *self.conv.values()]
         return int(sum(x.numel() * x.element_size() for x in ts))
 
     def bytes_per_token(self) -> float:
-        """Allocated bytes per (sequence slot, token) over all layers (includes scales, excludes residual window)."""
-        total = self.nbytes() - sum(x.numel() * x.element_size() for x in [*self.k_res, *self.v_res])
+        """Allocated bytes per (sequence slot, token) over all layers (includes scales, excludes residual window and conv state)."""
+        total = self.nbytes() - sum(x.numel() * x.element_size() for x in [*self.k_res, *self.v_res, *self.conv.values()])
         return total / float(self.batch * self.max_len)
 
     # ---- core
@@ -286,27 +325,38 @@ class SimplePagedPool:
         kv_dtype: str | None = None,
         device: torch.device | str | None = None,
         group_size: int | None = None,
+        num_state_slots: int = 0,
     ):
         self.kv_dtype = kv_dtype_name(kv_dtype if kv_dtype is not None else dtype)
         if self.kv_dtype == "int4":
             raise ConfigError("SimplePagedPool does not support int4")
+        if cfg.is_hybrid and num_state_slots <= 0:
+            raise ConfigError("hybrid (conv) models need num_state_slots > 0: conv state is per sequence, not per KV block")
         self.block_size, self.num_blocks, self.dtype, self.group_size = block_size, num_blocks, dtype, group_size
         dev = torch.device(device) if device is not None else torch.device("cpu")
-        h, d = cfg.kv_heads, int(cfg.head_dim)  # type: ignore[arg-type]
-        shape = (num_blocks, block_size, h, d)
         st = _TORCH_DTYPES.get(self.kv_dtype) or (torch.int8 if self.kv_dtype == "int8" else torch.float8_e4m3fn)
-        self._k = [torch.zeros(shape, dtype=st, device=dev) for _ in range(cfg.num_layers)]
-        self._v = [torch.zeros(shape, dtype=st, device=dev) for _ in range(cfg.num_layers)]
-        g = d if not group_size or group_size > d else group_size
         q = is_quantised(self.kv_dtype)
-        self._ks = [torch.ones((num_blocks, block_size, h, d // g), dtype=torch.float16, device=dev) for _ in range(cfg.num_layers)] if q else None
-        self._vs = [torch.ones((num_blocks, block_size, h, d // g), dtype=torch.float16, device=dev) for _ in range(cfg.num_layers)] if q else None
+
+        def geom(li: int) -> tuple[int, int, int]:  # (Hkv, D, D/g); KV-shared / conv layers get an empty block axis
+            h, d = (1, 2) if not cfg.layer_owns_kv(li) else (cfg.layer_kv_heads(li), cfg.layer_head_dim(li))
+            return h, d, d // (d if not group_size or group_size > d else group_size)
+
+        nb = lambda li: num_blocks if cfg.layer_owns_kv(li) else 0  # noqa: E731
+        # lfm2 conv state, one row per sequence slot (PagedKVView.state_slots selects the rows)
+        self._conv = {li: torch.zeros((num_state_slots, cfg.hidden_size, cfg.conv_kernel - 1), dtype=dtype, device=dev) for li in cfg.conv_layer_ids}
+        self._k = [torch.zeros((nb(li), block_size, geom(li)[0], geom(li)[1]), dtype=st, device=dev) for li in range(cfg.num_layers)]
+        self._v = [torch.zeros((nb(li), block_size, geom(li)[0], geom(li)[1]), dtype=st, device=dev) for li in range(cfg.num_layers)]
+        self._ks = [torch.ones((nb(li), block_size, geom(li)[0], geom(li)[2]), dtype=torch.float16, device=dev) for li in range(cfg.num_layers)] if q else None
+        self._vs = [torch.ones((nb(li), block_size, geom(li)[0], geom(li)[2]), dtype=torch.float16, device=dev) for li in range(cfg.num_layers)] if q else None
 
     def k(self, layer: int) -> torch.Tensor:
         return self._k[layer]
 
     def v(self, layer: int) -> torch.Tensor:
         return self._v[layer]
+
+    def conv(self, layer: int) -> torch.Tensor:
+        return self._conv[layer]
 
     def k_scale(self, layer: int) -> torch.Tensor | None:
         return self._ks[layer] if self._ks is not None else None
@@ -323,7 +373,8 @@ class PagedKVView:
     (see :class:`SimplePagedPool`).  Only valid new tokens (``t < n_new``) are written, so padding never touches unallocated blocks.
     """
 
-    def __init__(self, block_tables: torch.Tensor, seq_lens: torch.Tensor, pool: Any):
+    def __init__(self, block_tables: torch.Tensor, seq_lens: torch.Tensor, pool: Any, state_slots: torch.Tensor | None = None):
+        self.state_slots = state_slots  # [B] rows of ``pool.conv(layer)`` owned by these sequences (hybrid models only)
         self.block_tables = block_tables
         self.seq_lens = seq_lens.to(block_tables.device, torch.long)
         self.pool = pool
@@ -335,6 +386,16 @@ class PagedKVView:
     def commit(self, n_new: torch.Tensor | int) -> None:
         self.seq_lens = self.seq_lens + _as_n_new(n_new, self.seq_lens.shape[0], 0, self.device)
         self._S = None
+
+    def get_conv(self, layer: int, dtype: torch.dtype | None = None) -> torch.Tensor:
+        if self.state_slots is None:
+            raise ConfigError("this PagedKVView has no state_slots; hybrid (conv) models need one conv-state slot per sequence")
+        s = self.pool.conv(layer)[self.state_slots.to(self.device, torch.long)]
+        return s if dtype is None else s.to(dtype)
+
+    def set_conv(self, layer: int, state: torch.Tensor) -> None:
+        pool_t = self.pool.conv(layer)
+        pool_t[self.state_slots.to(self.device, torch.long)] = state.detach().to(pool_t.dtype)  # type: ignore[union-attr]
 
     def end_lens(self, n_new: torch.Tensor | int | None, t: int) -> torch.Tensor:
         return self.seq_lens + _as_n_new(n_new, self.seq_lens.shape[0], t, self.device)

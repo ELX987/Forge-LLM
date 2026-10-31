@@ -4,7 +4,7 @@
 import { h, clear, listOf, deepClone, parseCsvList, fmtBytes, isNum, normGpus } from '../util.js';
 import { api, tryGet } from '../api.js';
 import { SchemaForm } from '../forms.js';
-import { toast, toastError, confirmDialog, notice, badge } from './ui.js';
+import { toast, toastError, confirmDialog, notice, badge, modal, objectView } from './ui.js';
 import { formDialog } from './dialogs.js';
 
 export class JobConfigurator {
@@ -39,10 +39,11 @@ export class JobConfigurator {
     this.saveBtn = h('button', { class: 'btn sm', type: 'button', onclick: () => this.saveConfig() }, 'Save config');
     this.delBtn = h('button', { class: 'btn sm danger', type: 'button', onclick: () => this.deleteSaved() }, 'Delete saved');
     this.delBtn.classList.add('hidden');
+    this.checkBtn = this.type === 'dataset_ingest' ? h('button', { class: 'btn sm', type: 'button', title: 'Resolve each source (local path or Hugging Face id), list configs/splits/columns and show a few documents', onclick: () => this.checkSources() }, 'Check source') : null;
     this.container.append(
       h('div', { class: 'card mb' },
         h('div', { class: 'toolbar', style: 'margin-bottom:6px' }, h('label', 'Name'), this.nameEl, h('label', 'Tags'), this.tagsEl),
-        h('div', { class: 'toolbar', style: 'margin-bottom:6px' }, this.templateSel, this.savedSel, this.saveBtn, this.delBtn, h('span', { class: 'muted small' }, 'Templates are read-only seeds; saved configs are yours.')),
+        h('div', { class: 'toolbar', style: 'margin-bottom:6px' }, this.templateSel, this.savedSel, this.saveBtn, this.delBtn, this.checkBtn, h('span', { class: 'muted small' }, 'Templates are read-only seeds; saved configs are yours.')),
         h('div', { class: 'row' }, h('span', { class: 'sf-label' }, 'GPUs'), this.gpuHost)),
       h('div', { class: 'card' }, this.formHost, this.statusEl));
     this.form = new SchemaForm(this.formHost, { schema: jt.schema, defaults: jt.defaults || {}, value: initial, onChange: (v, errs) => { this.errors = errs || []; this.paintStatus(); this.onChange(v, this.errors); } });
@@ -127,6 +128,20 @@ export class JobConfigurator {
     const id = this.savedSel.value; if (!id) return;
     if (!(await confirmDialog({ title: 'Delete saved config?', message: 'This cannot be undone.', confirmLabel: 'Delete', danger: true }))) return;
     try { await api.del(`/configs/${encodeURIComponent(id)}`); const opt = Array.from(this.savedSel.options).find((o) => o.value === id); if (opt) opt.remove(); this.savedSel.value = ''; this.delBtn.classList.add('hidden'); toast('Deleted', 'ok'); } catch (e) { toastError(e); }
+  }
+
+  /** dataset_ingest only: POST /datasets/source-preview for every source and show what the server resolved. */
+  async checkSources() {
+    const sources = (this.form.getValue() || {}).sources || [];
+    if (!sources.length) { toast('Add a source first.', 'warn'); return; }
+    const body = h('div', { class: 'stack' }, h('div', { class: 'loading' }, h('span', { class: 'spinner' }), 'Checking...'));
+    const dlg = modal({ title: 'Check source', wide: true, body });
+    const parts = [];
+    for (const [i, src] of sources.entries()) {
+      try { parts.push(h('div', { class: 'card', style: 'box-shadow:none' }, h('h3', `Source ${i + 1}: ${src.path || '(empty)'}`), objectView(await api.post('/datasets/source-preview', { source: src, n: 3 })))); }
+      catch (e) { parts.push(h('div', { class: 'notice error' }, `Source ${i + 1}: ${e.message}`)); }
+    }
+    dlg.setBody(h('div', { class: 'stack' }, parts));
   }
 
   getSpec() {

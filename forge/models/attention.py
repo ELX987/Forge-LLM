@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from forge.models.config import ModelConfig
 from forge.models.kvcache import PagedKVView, is_quantised
-from forge.models.layers import RMSNorm, apply_rotary
+from forge.models.layers import RMSNorm, apply_rotary, rotate_half
 from forge.models.linear import make_linear
 
 log = logging.getLogger("forge.models.attention")
@@ -54,6 +54,11 @@ class AttnContext:
     kv_lens: torch.Tensor | None = None  # [B] total valid keys after this call (cache only)
     impl: str = "auto"
     use_paged_kernel: bool | None = None
+    # gemma4: ``{layer_type: (cos, sin)}`` (overrides the cos/sin passed to a layer), PLE tensor ``[B,T,L,P]`` and the per-forward
+    # K/V hand-over between a layer and the KV-shared layers that read it ``{source_layer: (K, V)}``
+    rope: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
+    per_layer_inputs: torch.Tensor | None = None
+    shared_kv: dict[int, tuple[torch.Tensor | None, torch.Tensor | None]] = field(default_factory=dict)
 
 
 _GQA_NATIVE = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 5)
@@ -107,25 +112,37 @@ def build_mask(q_pos: torch.Tensor, s: int, kv_lens: torch.Tensor | None, window
 
 
 class Attention(nn.Module):
-    """Grouped-query attention with RoPE, optional qk-norm, biases and sliding window."""
+    """Grouped-query attention with RoPE, optional qk-norm, biases and sliding window.
+
+    gemma4 additions (all driven by ``ModelConfig``): per-layer head_dim / kv heads / window, softmax scale ``attn_scale``, scale-less
+    ``v_norm``, ``attention_k_eq_v`` (no v_proj) and KV sharing (a shared layer owns only q_proj / o_proj / q_norm and attends over the
+    K/V produced by ``cfg.kv_source_layer``).
+    """
 
     def __init__(self, cfg: ModelConfig, layer_idx: int, dtype=None, device=None):
         super().__init__()
         self.layer_idx = layer_idx
-        self.num_heads, self.num_kv_heads, self.head_dim = cfg.num_heads, cfg.kv_heads, int(cfg.head_dim)  # type: ignore[arg-type]
-        self.scale = self.head_dim**-0.5
-        self.window = cfg.sliding_window
+        self.num_heads, self.num_kv_heads, self.head_dim = cfg.num_heads, cfg.layer_kv_heads(layer_idx), cfg.layer_head_dim(layer_idx)
+        self.scale = cfg.attn_scale if cfg.attn_scale is not None else self.head_dim**-0.5
+        self.window = cfg.layer_window(layer_idx)
+        self.layer_type = cfg.layer_types[layer_idx] if cfg.layer_types is not None else None
+        self.kv_source = cfg.kv_source_layer(layer_idx)  # None = this layer computes its own K/V
+        self.is_kv_source = any(cfg.kv_source_layer(j) == layer_idx for j in range(layer_idx + 1, cfg.num_layers))
         h = cfg.hidden_size
         b = cfg.attention_bias
-        self.q_proj = make_linear(h, cfg.q_dim, b, dtype=dtype, device=device)
-        self.k_proj = make_linear(h, cfg.kv_dim, b, dtype=dtype, device=device)
-        self.v_proj = make_linear(h, cfg.kv_dim, b, dtype=dtype, device=device)
-        self.o_proj = make_linear(cfg.q_dim, h, cfg.o_proj_bias, dtype=dtype, device=device)
+        q_dim, kv_dim = cfg.layer_q_dim(layer_idx), cfg.layer_kv_dim(layer_idx)
+        fp32 = cfg.norm_fp32_scale
+        self.q_proj = make_linear(h, q_dim, b, dtype=dtype, device=device)
+        self.o_proj = make_linear(q_dim, h, cfg.o_proj_bias, dtype=dtype, device=device)
+        owns_kv = self.kv_source is None
+        self.k_proj = make_linear(h, kv_dim, b, dtype=dtype, device=device) if owns_kv else None
+        self.v_proj = make_linear(h, kv_dim, b, dtype=dtype, device=device) if (owns_kv and cfg.layer_has_v_proj(layer_idx)) else None
         if cfg.qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, dtype=dtype, device=device)
-            self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, dtype=dtype, device=device)
+            self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, dtype=dtype, device=device, fp32_scale=fp32)
+            self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, dtype=dtype, device=device, fp32_scale=fp32) if owns_kv else None
         else:
             self.q_norm = self.k_norm = None
+        self.v_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, with_scale=False) if (cfg.v_norm and owns_kv) else None
         self._paged_ok = True
 
     # ------------------------------------------------------------------ backends
@@ -196,26 +213,59 @@ class Attention(nn.Module):
             self._paged_ok = False
             return None
 
-    def _cached(self, q, k, v, ctx: AttnContext) -> torch.Tensor:
-        cache = ctx.cache
-        if isinstance(cache, PagedKVView) and q.shape[1] == 1:
-            o = self._paged_kernel(q, k, v, ctx, cache)
-            if o is not None:
-                return o
-        kf, vf = cache.update(self.layer_idx, k, v, ctx.positions, ctx.n_new)
+    def _attend_cached(self, q, kf, vf, ctx: AttnContext) -> torch.Tensor:
         mask = build_mask(ctx.positions, kf.shape[1], ctx.kv_lens, self.window)
         if ctx.impl == "eager":
             return eager_attention(q, kf, vf, mask, self.scale)
         return sdpa(q, kf, vf, mask, False, self.scale)
 
+    def _cached(self, q, k, v, ctx: AttnContext):
+        """Returns ``(o, K_all, V_all)``; the K/V pair is None when the paged decode kernel consumed the cache directly."""
+        cache = ctx.cache
+        if isinstance(cache, PagedKVView) and q.shape[1] == 1:
+            o = self._paged_kernel(q, k, v, ctx, cache)
+            if o is not None:
+                return o, None, None
+        kf, vf = cache.update(self.layer_idx, k, v, ctx.positions, ctx.n_new)
+        return self._attend_cached(q, kf, vf, ctx), kf, vf
+
+    def _shared_kv(self, ctx: AttnContext, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """K/V of the source layer for a KV-shared layer (stashed this forward, else read back from the cache)."""
+        kv = ctx.shared_kv.get(self.kv_source)  # type: ignore[arg-type]
+        if kv is not None and kv[0] is not None:
+            return kv  # type: ignore[return-value]
+        cache = ctx.cache
+        if cache is None or ctx.kv_lens is None:
+            raise RuntimeError(f"layer {self.layer_idx} reads the K/V of layer {self.kv_source}, which has not run in this forward")
+        return cache.read(self.kv_source, int(ctx.kv_lens.max().item()), like.dtype, ctx.kv_lens)
+
     # ------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, ctx: AttnContext) -> torch.Tensor:
         b, t, _ = x.shape
         q = self.q_proj(x).view(b, t, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(b, t, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(b, t, self.num_kv_heads, self.head_dim)
         if self.q_norm is not None:
-            q, k = self.q_norm(q), self.k_norm(k)
+            q = self.q_norm(q)
+        if self.kv_source is not None:  # KV-shared layer: own q only, K/V from the source layer (already normed + rotated)
+            cq, sq = cos.to(q.dtype).unsqueeze(2), sin.to(q.dtype).unsqueeze(2)
+            q = q * cq + rotate_half(q) * sq
+            kf, vf = self._shared_kv(ctx, q)
+            if ctx.cache is None:
+                o = self._no_cache(q, kf, vf, ctx)
+            else:
+                o = self._attend_cached(q, kf, vf, ctx)
+            return self.o_proj(o.reshape(b, t, self.num_heads * self.head_dim))
+        k = self.k_proj(x).view(b, t, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(b, t, self.num_kv_heads, self.head_dim) if self.v_proj is not None else k  # k_eq_v: V = pre-norm K
+        if self.k_norm is not None:
+            k = self.k_norm(k)
+        if self.v_norm is not None:
+            v = self.v_norm(v)
         q, k = apply_rotary(q, k, cos, sin)
-        o = self._no_cache(q, k, v, ctx) if ctx.cache is None else self._cached(q, k, v, ctx)
+        if ctx.cache is None:
+            o = self._no_cache(q, k, v, ctx)
+            kf, vf = k, v
+        else:
+            o, kf, vf = self._cached(q, k, v, ctx)
+        if self.is_kv_source:
+            ctx.shared_kv[self.layer_idx] = (kf, vf)
         return self.o_proj(o.reshape(b, t, self.num_heads * self.head_dim))

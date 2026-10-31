@@ -51,6 +51,7 @@ from forge.compress.modelutil import (
     capture_block_inputs,
     discover_input_groups,
     find_blocks,
+    gemma4_features,
     iter_dense_linears,
     model_device,
     model_dtype,
@@ -764,6 +765,12 @@ def quantize_model(
     dev = model_device(model)
     if cfg.method == "smoothquant":
         cfg = cfg.model_copy(update={"format": "int", "bits": 8})
+    g4 = gemma4_features(model)
+    if g4 and (cfg.uses_calibration() or cfg.mixed_precision):
+        raise ConfigError(
+            f"PTQ method {cfg.method!r} replays transformer blocks on calibration data, which is not supported for Gemma 4 style models "
+            f"({', '.join(g4)}: per-layer inputs, KV sharing, sandwich norms). Use method='rtn' (data-free weight-only) or fp8."
+        )
     if cfg.format == "fp8":
         return _quantize_fp8(model, cfg, report, ctx, t_start)
 

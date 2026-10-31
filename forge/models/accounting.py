@@ -21,7 +21,7 @@ def model_summary(cfg: ModelConfig, seq_len: int = 2048) -> dict[str, Any]:
         "params": cfg.param_count(),
         "active_params": cfg.active_param_count(),
         "params_b": cfg.param_count() / 1e9,
-        "embedding_params": cfg.vocab_size * cfg.hidden_size * (1 if cfg.tie_word_embeddings else 2),
+        "embedding_params": cfg.vocab_size * cfg.hidden_size * (1 if cfg.tie_word_embeddings else 2) + cfg.ple_table_params,
         "kv_bytes_per_token": {str(b): cfg.kv_bytes_per_token(b) for b in (16, 8, 4)},
         "weight_bytes": {str(b): cfg.weight_bytes(b) for b in (16, 8, 4)},
         "flops_per_token": {
@@ -32,6 +32,10 @@ def model_summary(cfg: ModelConfig, seq_len: int = 2048) -> dict[str, Any]:
         "num_layers": cfg.num_layers,
         "kv_heads": cfg.kv_heads,
         "head_dim": cfg.head_dim,
+        "global_head_dim": cfg.global_head_dim,
+        "kv_cache_layers": len(cfg.kv_layers),
+        "conv_layers": len(cfg.conv_layer_ids),
+        "recurrent_state_bytes_per_seq": cfg.recurrent_state_bytes_per_seq(),
         "moe_layers": cfg.num_moe_layers,
         "provenance": "derived",
     }

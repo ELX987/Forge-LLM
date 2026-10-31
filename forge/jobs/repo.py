@@ -248,6 +248,28 @@ class ModelsRepo(Table):
         row = self.db.query_one("SELECT * FROM models WHERE path_or_repo=? AND source!='hf' LIMIT 1", (path,))
         return self._decode(row)
 
+    def find_by_name(self, name: str) -> dict[str, Any] | None:
+        """Exact display-name match, falling back to case-insensitive. Among duplicates prefer a ``ready`` row whose files are
+        on disk, then any ``ready`` row, then the newest row."""
+        from pathlib import Path
+
+        for sql in ("SELECT * FROM models WHERE name=? ORDER BY created_at DESC", "SELECT * FROM models WHERE LOWER(name)=LOWER(?) ORDER BY created_at DESC"):
+            rows = [self._decode(r) for r in self.db.query(sql, (name,))]
+            if not rows:
+                continue
+
+            def usable(r: dict[str, Any]) -> bool:
+                info = r.get("info") or {}
+                lp = info.get("local_path") or (r.get("path_or_repo") if r.get("source") == "local" else None)
+                try:
+                    return bool(lp) and Path(lp).is_dir()
+                except OSError:
+                    return False
+
+            ready = [r for r in rows if r.get("status") == "ready"]
+            return next((r for r in ready if usable(r)), None) or (ready[0] if ready else rows[0])
+        return None
+
     def find_by_repo(self, repo: str, revision: str | None = None) -> dict[str, Any] | None:
         row = self.db.query_one(
             "SELECT * FROM models WHERE source='hf' AND path_or_repo=? AND COALESCE(revision,'')=? LIMIT 1",

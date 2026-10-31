@@ -134,6 +134,45 @@ def model_config(model: nn.Module) -> Any:
     return getattr(model, "config", None)
 
 
+def gemma4_features(model: nn.Module) -> list[str]:
+    """Names of the Gemma 4 style block features the model config enables (empty for every other model)."""
+    cfg = getattr(model, "config", None)
+    return [n for n, on in (
+        ("arch gemma4", getattr(cfg, "arch", None) == "gemma4"),
+        ("sandwich_norm", bool(getattr(cfg, "sandwich_norm", False))),
+        ("num_kv_shared_layers", bool(getattr(cfg, "num_kv_shared_layers", 0))),
+        ("per_layer_input_size", bool(getattr(cfg, "per_layer_input_size", 0))),
+        ("non-uniform layer head_dim", _non_uniform_head_dim(cfg)),
+    ) if on]
+
+
+def require_attention_only(model: nn.Module, what: str) -> None:
+    """Refuse hybrid (lfm2 conv + attention) models for algorithms that assume ``self_attn`` in every block (pruning, rotation)."""
+    cfg = getattr(model, "config", None)
+    if getattr(cfg, "is_hybrid", False):
+        raise ConfigError(
+            f"{what} is not supported for hybrid conv/attention models ({getattr(cfg, 'arch', 'lfm2')}): it assumes attention in every layer "
+            "and would have to slice the depthwise conv consistently. Quantisation (PTQ/GPTQ/AWQ) and LoRA work."
+        )
+    gemma4 = gemma4_features(model)
+    if gemma4:
+        raise ConfigError(
+            f"{what} is not supported for Gemma 4 style models ({', '.join(gemma4)}): it assumes uniform attention blocks and would "
+            "mishandle sandwich norms, per-layer embeddings, KV sharing and per-layer head dims. Weight-only quantisation (PTQ) and LoRA work."
+        )
+
+
+def _non_uniform_head_dim(cfg: Any) -> bool:
+    fn = getattr(cfg, "layer_head_dim", None)
+    n = getattr(cfg, "num_layers", 0)
+    if not callable(fn) or not n:
+        return False
+    try:
+        return len({int(fn(i)) for i in range(int(n))}) > 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass
 class BlockInputs:
     """Recorded inputs of the first transformer block for each calibration batch (see module docstring)."""

@@ -32,6 +32,22 @@ def route_topk(logits: torch.Tensor, top_k: int, norm_topk_prob: bool) -> tuple[
     return w, ids, probs
 
 
+def route_sigmoid(
+    logits: torch.Tensor, top_k: int, norm_topk_prob: bool, expert_bias: torch.Tensor | None = None, scaling: float = 1.0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """lfm2_moe router: sigmoid scores, top-k chosen on ``score + expert_bias`` but weighted by the UNBIASED score.
+
+    Returns ``(weights [N,k] fp32, ids [N,k], probs [N,E] fp32)``; ``probs`` is the score row normalised to sum 1 (aux-loss use only).
+    """
+    p = torch.sigmoid(logits.float())
+    sel = p if expert_bias is None else p + expert_bias.float()
+    ids = torch.topk(sel, top_k, dim=-1).indices
+    w = p.gather(-1, ids)
+    if norm_topk_prob:
+        w = w / (w.sum(dim=-1, keepdim=True) + 1e-6)
+    return w * scaling, ids, p / p.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+
+
 def load_balancing_loss(probs: torch.Tensor, ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     """Switch-Transformer auxiliary loss ``E * sum_e f_e * P_e`` (``f_e`` = fraction of routed slots to e, ``P_e`` = mean prob).
 
@@ -59,6 +75,11 @@ class MoEBlock(nn.Module):
             [MLP(cfg.hidden_size, m.moe_intermediate_size, cfg.hidden_act, dtype=dtype, device=device) for _ in range(m.num_experts)]
         )
         self.act = get_activation(cfg.hidden_act)
+        self.router_type = m.router_type
+        if m.use_expert_bias:  # aux-loss-free balancing bias shipped in the checkpoint; fp32 (see _apply), never trained
+            self.register_buffer("expert_bias", torch.zeros(m.num_experts, dtype=torch.float32, device=device))
+        else:
+            self.expert_bias = None
         if m.shared_size:
             self.shared_expert = MLP(cfg.hidden_size, m.shared_size, cfg.hidden_act, dtype=dtype, device=device)
             self.shared_expert_gate = make_linear(cfg.hidden_size, 1, False, dtype=dtype, device=device) if m.shared_expert_gate else None
@@ -68,6 +89,13 @@ class MoEBlock(nn.Module):
         self._stack_cache: tuple[tuple, dict[str, torch.Tensor]] | None = None
         self._grouped_ok = True
         self.last_expert_counts: torch.Tensor | None = None
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse)
+        b = self.expert_bias
+        if b is not None and b.is_floating_point() and b.dtype != torch.float32:  # model.to(bf16) must not round the selection bias
+            self.expert_bias = b.float()
+        return self
 
     # ---------------------------------------------------------------- compute paths
     def _loop(self, x2: torch.Tensor, ids: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -141,7 +169,10 @@ class MoEBlock(nn.Module):
         shp = x.shape
         x2 = x.reshape(-1, shp[-1])
         logits = self.gate(x2)
-        w, ids, probs = route_topk(logits, self.top_k, self.norm_topk)
+        if self.router_type == "sigmoid":
+            w, ids, probs = route_sigmoid(logits, self.top_k, self.norm_topk, self.expert_bias, self.cfg_moe.routed_scaling_factor)
+        else:
+            w, ids, probs = route_topk(logits, self.top_k, self.norm_topk)
         w = w.to(x2.dtype)
         out = self._grouped(x2, ids, w) if self._can_group(x2) else None
         if out is None:

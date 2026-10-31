@@ -65,8 +65,8 @@ export default async function render(ctx) {
     const dlg = modal({ title: `Preview ${d.name || d.id}`, wide: true, body: h('div', { class: 'loading' }, h('span', { class: 'spinner' }), 'Loading sample...') });
     try {
       const r = await api.get(`/datasets/${encodeURIComponent(d.id)}/preview`);
-      const rows = r.rows || r.samples || r.documents || [];
-      const extra = Object.fromEntries(Object.entries(r).filter(([k]) => !['rows', 'samples', 'documents', 'id'].includes(k)));
+      const rows = r.records || r.rows || r.samples || r.documents || [];
+      const extra = Object.fromEntries(Object.entries(r).filter(([k]) => !['records', 'rows', 'samples', 'documents', 'id'].includes(k)));
       dlg.setBody(h('div', { class: 'stack' }, Object.keys(extra).length ? kv(Object.entries(extra).map(([k, v]) => [k, objectView(v)])) : null,
         rows.length ? rows.map((t, i) => h('div', { class: 'card', style: 'box-shadow:none' }, h('div', { class: 'small muted' }, `sample ${i + 1}`), h('pre', { class: 'mono' }, typeof t === 'string' ? t : JSON.stringify(t, null, 2)))) : emptyState('No preview rows', 'The server returned no samples for this dataset.')));
     } catch (e) { dlg.setBody(h('div', { class: 'notice error' }, e.unavailable ? 'Preview is not available on this server.' : e.message)); }

@@ -289,7 +289,12 @@ def model_kv_report(
     hd = int(getattr(cfg, "head_dim", 0)) or None
     if not (hq and hkv and hd):
         raise ConfigError("model_kv_report needs model.config with num_heads / num_kv_heads / head_dim")
-    sel = list(range(len(blocks)))
+    # hybrid models: conv layers have no KV; gemma4 KV-shared layers own no k_proj (they reuse another layer's K/V)
+    sel = [i for i in range(len(blocks)) if getattr(getattr(blocks[i], "self_attn", None), "k_proj", None) is not None]
+    if not sel:
+        raise ConfigError("model_kv_report: no layer owns a k_proj")
+    lay_hd = getattr(cfg, "layer_head_dim", None)
+    lay_kv = getattr(cfg, "layer_kv_heads", None)
     if len(sel) > max_layers:
         step = len(sel) / max_layers
         sel = [sel[int(i * step)] for i in range(max_layers)]
@@ -298,6 +303,8 @@ def model_kv_report(
     for i in sel:
         attn = blocks[i].self_attn
         for key, mod in (("q", attn.q_proj), ("k", attn.k_proj), ("v", attn.v_proj)):
+            if mod is None:  # attention_k_eq_v: V is the (pre-norm) output of k_proj
+                continue
             handles.append(mod.register_forward_hook(lambda _m, _i, out, i=i, key=key: cap[i][key].append(out.detach().float())))
     was = model.training
     model.eval()
@@ -310,11 +317,15 @@ def model_kv_report(
         model.train(was)
     agg: dict[str, dict[str, float]] = {}
     for i in sel:
+        hd_i = int(lay_hd(i)) if callable(lay_hd) else hd
+        hkv_i = int(lay_kv(i)) if callable(lay_kv) else hkv
+
         def heads(xs: list[torch.Tensor], h: int) -> torch.Tensor:
             x = torch.cat(xs, 0)
-            return x.reshape(x.shape[0], x.shape[1], h, hd).permute(0, 2, 1, 3)
+            return x.reshape(x.shape[0], x.shape[1], h, hd_i).permute(0, 2, 1, 3)
 
-        rows = kv_accuracy_report(heads(cap[i]["k"], hkv), heads(cap[i]["v"], hkv), heads(cap[i]["q"], hq), configs)
+        vs = cap[i]["v"] or cap[i]["k"]
+        rows = kv_accuracy_report(heads(cap[i]["k"], hkv_i), heads(vs, hkv_i), heads(cap[i]["q"], hq), configs)
         for r in rows:
             a = agg.setdefault(r["scheme"], {})
             for kx, vx in r.items():

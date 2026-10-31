@@ -218,11 +218,16 @@ class LoraBackend:
     # -- apply -----------------------------------------------------------------------------------------
     def apply(self, model: nn.Module) -> list[str]:
         lc = self.lcfg
+        targets = list(lc.target_modules)
+        if getattr(getattr(model, "config", None), "is_hybrid", False) and "all-linear" not in targets:
+            # lfm2 conv blocks have no q/k/v/o: adapt their gated-conv projections whenever the attention projections are targeted
+            targets += [t for t in ("in_proj", "out_proj") if t not in targets] if "o_proj" in targets else []
+        self._targets = targets
         if self._forge is not None:
             try:
                 keep = tuple(lc.modules_to_save)
                 names = self._forge.add_lora(
-                    model, r=lc.r, alpha=lc.alpha, dropout=lc.dropout, target_modules=list(lc.target_modules),
+                    model, r=lc.r, alpha=lc.alpha, dropout=lc.dropout, target_modules=targets,
                     exclude=tuple(lc.exclude_modules), lora_dtype=torch.float32 if lc.adapter_dtype == "float32" else torch.bfloat16)
                 self.impl = "forge"
                 self._freeze(model, lambda n: (".lora_A." in n or ".lora_B." in n or n.endswith("lora_magnitude")) or any(k in n for k in keep))
@@ -232,7 +237,7 @@ class LoraBackend:
                 log.warning("forge.models.lora.add_lora failed (%r); using the built-in LoRA", e)
                 self._forge = None
         dtype = torch.float32 if lc.adapter_dtype == "float32" else torch.bfloat16
-        names = [n for n, m in model.named_modules() if isinstance(m, (nn.Linear, QuantizedLinear)) and not isinstance(m, LoRALinear) and _match(n, list(lc.target_modules), list(lc.exclude_modules))]
+        names = [n for n, m in model.named_modules() if isinstance(m, (nn.Linear, QuantizedLinear)) and not isinstance(m, LoRALinear) and _match(n, targets, list(lc.exclude_modules))]
         if not names:
             raise ConfigError("LoRA: no linear modules matched target_modules", details={"targets": list(lc.target_modules)})
         for n in names:
@@ -306,7 +311,7 @@ class LoraBackend:
             fmt = "pt"
         cfg = {
             "peft_type": "LORA", "impl": self.impl, "format": fmt, "r": self.lcfg.r, "lora_alpha": self.lcfg.alpha,
-            "lora_dropout": self.lcfg.dropout, "rslora": self.lcfg.rslora, "target_modules": list(self.lcfg.target_modules),
+            "lora_dropout": self.lcfg.dropout, "rslora": self.lcfg.rslora, "target_modules": list(getattr(self, "_targets", self.lcfg.target_modules)),
             "modules_to_save": list(self.lcfg.modules_to_save), "base_model_name_or_path": base_model,
             "scaling": {n: s for n, s in self.scalings.items()},
         }

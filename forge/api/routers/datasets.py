@@ -11,13 +11,14 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
 
 from forge.api.common import lazy_module
 from forge.api.deps import Services, get_services
 from forge.api.jobsvc import submit
 from forge.api.schemas import DatasetCreate, IngestRequest
 from forge.core.errors import ConfigError, ForgeError, NotFound
-from forge.core.paths import datasets_dir
+from forge.core.paths import datasets_dir, forge_home
 from forge.core.util import new_id, now
 from forge.jobs.registry import get_job_type
 
@@ -241,6 +242,44 @@ def delete(dataset_id: str, delete_files: bool = True, svc: Services = Depends(g
             shutil.rmtree(p, ignore_errors=True)
     svc.datasets.delete(dataset_id)
     return Response(status_code=204)
+
+
+def _check_preview_path(raw: str, svc: Services) -> None:
+    """Existing local paths may only be previewed from under the datasets dir, FORGE_HOME or a registered dataset's path."""
+    try:
+        p = Path(raw).expanduser().resolve()
+        exists = p.exists()
+    except (OSError, ValueError):
+        raise ConfigError(f"invalid source path: {raw!r}") from None
+    if not exists:
+        return  # nothing local to read: a Hub id, or a NotFound raised by the reader
+    roots = [datasets_dir().resolve(), forge_home().resolve()]
+    for r in svc.datasets.list(limit=10000):
+        if r.get("path"):
+            try:
+                roots.append(Path(r["path"]).expanduser().resolve())
+            except (OSError, ValueError):
+                pass
+    if not any(p == r or r in p.parents for r in roots):
+        raise ConfigError("source-preview only reads local paths under the datasets directory, FORGE_HOME or a registered dataset; "
+                          "register or upload the dataset first")
+
+
+class SourcePreviewRequest(BaseModel):
+    source: dict[str, Any]
+    n: int = 5
+
+
+@router.post("/source-preview", summary="Resolve an ingest source (local path or Hugging Face id) and return config/split/column info plus a few samples")
+def source_preview(body: SourcePreviewRequest, svc: Services = Depends(get_services)) -> dict[str, Any]:
+    from forge.train.data import SourceSpec, describe_source
+
+    try:
+        spec = SourceSpec.model_validate(body.source)
+    except ValidationError as e:
+        raise ConfigError("invalid source: " + "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())) from e
+    _check_preview_path(spec.path, svc)
+    return describe_source(spec, n=body.n)  # plain def: FastAPI runs it in the threadpool (it may touch the network)
 
 
 _PATH_FIELDS = ("input_path", "input_paths", "path", "paths", "source", "sources", "input", "inputs", "data_path", "data_files", "files", "dataset_path")

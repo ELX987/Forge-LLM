@@ -61,13 +61,19 @@ class ModelSpec:
     moe_experts: int = 0
     moe_top_k: int = 0
     expert_param_fraction: float = 0.0  # fraction of params living in routed experts
+    kv_layers: int | None = None        # layers that own a KV cache (hybrid / KV-shared models); None = num_layers
+    state_bytes_per_seq: float = 0.0    # context-independent per-sequence recurrent state (lfm2 conv layers)
+    kv_elems_per_token: float | None = None  # K+V elements per token summed over layers (per-layer geometry: gemma4 / hybrid); None = uniform
 
     @property
     def active(self) -> float:
         return self.params if self.active_params is None else self.active_params
 
     def kv_bytes_per_token(self, kv_dtype: str = "bf16", scale_overhead: float | None = None) -> float:
-        return kv_bytes_per_token(self.num_layers, self.num_kv_heads, self.head_dim, kv_dtype, scale_overhead)
+        if self.kv_elems_per_token is not None:
+            return kv_bytes_per_token(1, 1, self.kv_elems_per_token / 2.0, kv_dtype, scale_overhead)
+        n = self.num_layers if self.kv_layers is None else self.kv_layers
+        return kv_bytes_per_token(n, self.num_kv_heads, self.head_dim, kv_dtype, scale_overhead)
 
     @classmethod
     def from_any(cls, m: Any) -> ModelSpec:
@@ -94,9 +100,14 @@ class ModelSpec:
             denom = 1.0 - topk / experts
             routed = (params - active) / denom if denom > 0 else 0.0
             frac = max(0.0, min(1.0, routed / params))
+        kvl = getattr(m, "kv_layers", None)
+        kvb = getattr(m, "kv_bytes_per_token", None)
+        elems = float(kvb(16)) / 2.0 if callable(kvb) else None  # per-layer aware (gemma4 widths, KV sharing, conv layers)
+        state = getattr(m, "recurrent_state_bytes_per_seq", None)
         return cls(name=str(getattr(m, "arch", "model")), params=params, num_layers=layers, num_kv_heads=kvh, head_dim=hd,
                    active_params=active, hidden_size=getattr(m, "hidden_size", None), moe_experts=experts, moe_top_k=topk,
-                   expert_param_fraction=frac)
+                   expert_param_fraction=frac, kv_layers=len(kvl) if isinstance(kvl, (list, tuple)) else None,
+                   state_bytes_per_seq=float(state()) if callable(state) else 0.0, kv_elems_per_token=elems)
 
 
 @dataclass
@@ -328,6 +339,10 @@ def capacity_plan(model_cfg: Any, chip: Any, weight_bits: float = 16.0, kv_dtype
     fc = fleet_capacity(kv_tokens, cd.mean_ctx, cd.prefix_tokens, block_size)
     max_conc = fc["agents"] if cd.prefix_tokens > 0 else float(int(kv_tokens // (math.ceil(cd.mean_ctx / block_size) * block_size)))
     no_share = fc["agents_without_sharing"]
+    if model.state_bytes_per_seq > 0 and cd.prefix_tokens <= 0:  # hybrid: every sequence also pins a fixed conv state
+        per_seq = math.ceil(cd.mean_ctx / block_size) * block_size * kvb + model.state_bytes_per_seq
+        max_conc = float(int(max(free, 0.0) // per_seq))
+        notes.append(f"hybrid model: {model.state_bytes_per_seq / 1024:.1f} KiB of conv state per sequence is included in max concurrency")
 
     b1 = decode_step(model, cs, weight_bytes_total=w_bytes, kv_bpt=kvb, batch=1, ctx=0.0, compute=compute,
                      overhead_ms=0.0, num_gpus=num_gpus)

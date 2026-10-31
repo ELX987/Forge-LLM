@@ -4,6 +4,14 @@ Module tree mirrors Hugging Face naming minus the leading ``model.``::
 
     embed_tokens, layers.<i>.{input_layernorm, self_attn.{q,k,v,o}_proj[, q_norm, k_norm], post_attention_layernorm,
     mlp.{gate,up,down}_proj | mlp.{gate, experts.<j>.*, shared_expert.*, shared_expert_gate}}, norm, lm_head
+
+gemma4 (``arch="gemma4"``) adds ``layers.<i>.{pre,post}_feedforward_layernorm``, the ``layer_scalar`` buffer and, with per-layer
+embeddings, ``embed_tokens_per_layer``, ``per_layer_model_projection``, ``per_layer_projection_norm`` and
+``layers.<i>.{per_layer_input_gate, per_layer_projection, post_per_layer_input_norm}``.
+
+lfm2 (``arch="lfm2"`` / ``"lfm2_moe"``) is hybrid: a ``conv`` layer has ``layers.<i>.conv.{in_proj, conv, out_proj}`` instead of
+``self_attn`` (attention layers keep the standard names); the HF names (``operator_norm``, ``ffn_norm``, ``feed_forward.w1/w2/w3``,
+``self_attn.out_proj``, ``q_layernorm``, ``embedding_norm``) are mapped in ``forge.models.loader``.
 """
 from __future__ import annotations
 
@@ -19,8 +27,9 @@ from torch.utils.checkpoint import checkpoint
 from forge.core.errors import ConfigError
 from forge.models.attention import Attention, AttnContext, AttnMeta
 from forge.models.config import ModelConfig
+from forge.models.conv import ShortConv
 from forge.models.kvcache import DenseKVCache
-from forge.models.layers import MLP, RMSNorm, RotaryEmbedding
+from forge.models.layers import MLP, RMSNorm, RotaryEmbedding, get_activation
 from forge.models.linear import make_linear
 from forge.models.moe import MoEBlock
 
@@ -45,22 +54,63 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.is_moe = cfg.is_moe_layer(layer_idx)
-        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, cfg.norm_unit_offset, dtype=dtype, device=device)
-        self.self_attn = Attention(cfg, layer_idx, dtype=dtype, device=device)
-        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, cfg.norm_unit_offset, dtype=dtype, device=device)
+        self.layer_type = cfg.layer_types[layer_idx] if cfg.layer_types is not None else None
+        self.sandwich = cfg.sandwich_norm
+        kw: dict[str, Any] = dict(dtype=dtype, device=device, fp32_scale=cfg.norm_fp32_scale)
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, cfg.norm_unit_offset, **kw)
+        self.is_conv = cfg.is_conv_layer(layer_idx)
+        if self.is_conv:  # lfm2: gated short convolution instead of attention (HF `operator_norm` -> input_layernorm, `conv`)
+            self.conv: ShortConv | None = ShortConv(cfg, layer_idx, dtype=dtype, device=device)
+            self.self_attn = None
+        else:
+            self.conv = None
+            self.self_attn = Attention(cfg, layer_idx, dtype=dtype, device=device)
+        # llama-style: pre-MLP norm.  sandwich (gemma4): the same-named tensor normalises the attention OUTPUT, and the MLP gets
+        # its own pre/post norms.
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, cfg.norm_unit_offset, **kw)
+        if cfg.sandwich_norm:
+            self.pre_feedforward_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, cfg.norm_unit_offset, **kw)
+            self.post_feedforward_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, cfg.norm_unit_offset, **kw)
         if self.is_moe:
             self.mlp: nn.Module = MoEBlock(cfg, dtype=dtype, device=device)
         else:
-            self.mlp = MLP(cfg.hidden_size, cfg.intermediate_size, cfg.hidden_act, dtype=dtype, device=device)
+            self.mlp = MLP(cfg.hidden_size, cfg.layer_intermediate(layer_idx), cfg.hidden_act, dtype=dtype, device=device)
+        self.has_ple = cfg.per_layer_input_size > 0
+        if self.has_ple:
+            p = cfg.per_layer_input_size
+            self.per_layer_input_gate = make_linear(cfg.hidden_size, p, False, dtype=dtype, device=device)
+            self.per_layer_projection = make_linear(p, cfg.hidden_size, False, dtype=dtype, device=device)
+            self.post_per_layer_input_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, cfg.norm_unit_offset, **kw)
+            self.ple_act = get_activation(cfg.hidden_act)
+        if cfg.layer_scalar:
+            self.register_buffer("layer_scalar", torch.ones(1, dtype=dtype, device=device))
+        else:
+            self.layer_scalar = None
 
     def forward(self, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, ctx: AttnContext, want_aux: bool = False):
-        h = h + self.self_attn(self.input_layernorm(h), cos, sin, ctx)
-        x = self.post_attention_layernorm(h)
+        if ctx.rope is not None and self.layer_type is not None:  # gemma4: sliding / full layers use different rotary tables
+            cos, sin = ctx.rope[self.layer_type]
+        if self.is_conv:
+            a = self.conv(self.input_layernorm(h), ctx)  # type: ignore[misc]
+        else:
+            a = self.self_attn(self.input_layernorm(h), cos, sin, ctx)
+        if self.sandwich:
+            h = h + self.post_attention_layernorm(a)
+            x = self.pre_feedforward_layernorm(h)
+        else:
+            h = h + a
+            x = self.post_attention_layernorm(h)
         if self.is_moe:
             y, aux = self.mlp(x, want_aux)
         else:
             y, aux = self.mlp(x), h.new_zeros((), dtype=torch.float32)
-        return h + y, aux
+        h = h + (self.post_feedforward_layernorm(y) if self.sandwich else y)
+        if self.has_ple:
+            g = self.ple_act(self.per_layer_input_gate(h)) * ctx.per_layer_inputs[:, :, self.layer_idx]  # type: ignore[index]
+            h = h + self.post_per_layer_input_norm(self.per_layer_projection(g))
+        if self.layer_scalar is not None:
+            h = h * self.layer_scalar
+        return h, aux
 
 
 class ForgeLM(nn.Module):
@@ -71,10 +121,22 @@ class ForgeLM(nn.Module):
         self.config = config
         c = config
         self.embed_tokens = nn.Embedding(c.vocab_size, c.hidden_size, dtype=dtype, device=device)
+        if c.per_layer_input_size:  # gemma4 per-layer embeddings (PLE)
+            width = c.num_layers * c.per_layer_input_size
+            self.embed_tokens_per_layer = nn.Embedding(c.ple_vocab, width, dtype=dtype, device=device)
+            self.per_layer_model_projection = make_linear(c.hidden_size, width, False, dtype=dtype, device=device)
+            self.per_layer_projection_norm = RMSNorm(
+                c.per_layer_input_size, c.rms_norm_eps, c.norm_unit_offset, dtype=dtype, device=device, fp32_scale=c.norm_fp32_scale
+            )
         self.layers = nn.ModuleList([DecoderLayer(c, i, dtype=dtype, device=device) for i in range(c.num_layers)])
         self.norm = RMSNorm(c.hidden_size, c.rms_norm_eps, c.norm_unit_offset, dtype=dtype, device=device)
         self.lm_head = make_linear(c.hidden_size, c.vocab_size, False, dtype=dtype, device=device)
-        self.rotary = RotaryEmbedding(c)
+        if c.layer_types is None or c.arch != "gemma4":  # lfm2 layer_types only select the mixer; one rotary table
+            self.rotary = RotaryEmbedding(c)
+            self.rotary_full = None
+        else:  # one table per layer kind: sliding = plain RoPE at rope_local_theta, full = rope_theta + rope_scaling at global_head_dim
+            self.rotary = RotaryEmbedding(c, head_dim=c.head_dim, theta=c.rope_local_theta or c.rope_theta, scaling=None)
+            self.rotary_full = RotaryEmbedding(c, head_dim=c.global_head_dim or c.head_dim, theta=c.rope_theta)
         self.attn_impl = "auto"
         self.gradient_checkpointing = False
         self._gc_kwargs: dict[str, Any] = {"use_reentrant": False}
@@ -93,9 +155,19 @@ class ForgeLM(nn.Module):
                 nn.init.normal_(m.weight, mean=0.0, std=std)
                 if getattr(m, "bias", None) is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, RMSNorm) and not m.weight.is_meta:
+            elif isinstance(m, nn.Conv1d):  # lfm2 depthwise conv: torch default (uniform, fan_in = kernel size)
+                if m.weight.is_meta:
+                    continue
+                bound = float(m.kernel_size[0]) ** -0.5
+                nn.init.uniform_(m.weight, -bound, bound)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, RMSNorm) and m.with_scale and not m.weight.is_meta:
                 with torch.no_grad():
                     m.weight.fill_(0.0 if m.unit_offset else 1.0)
+            elif isinstance(m, DecoderLayer) and m.layer_scalar is not None and not m.layer_scalar.is_meta:
+                with torch.no_grad():
+                    m.layer_scalar.fill_(1.0)
 
     def tie_weights(self) -> None:
         if self.config.tie_word_embeddings:
@@ -152,7 +224,24 @@ class ForgeLM(nn.Module):
         return total / count
 
     def _ce_sum(self, h: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return F.cross_entropy(self.lm_head(h).float(), labels, ignore_index=-100, reduction="sum")
+        return F.cross_entropy(self._softcap(self.lm_head(h).float()), labels, ignore_index=-100, reduction="sum")
+
+    def _softcap(self, logits: torch.Tensor) -> torch.Tensor:
+        """``cap * tanh(logits / cap)`` (gemma4 ``final_logit_softcapping``); identity when unset."""
+        cap = self.config.final_logit_softcapping
+        if not cap:
+            return logits
+        return (torch.tanh(logits.float() / cap) * cap).to(logits.dtype)
+
+    def _per_layer_inputs(self, input_ids: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """gemma4 PLE: ``(rmsnorm(proj(h) / sqrt(H)) + embed_per_layer(ids) * sqrt(P)) / sqrt(2)`` as ``[B,T,L,P]`` (``h`` = scaled embeddings)."""
+        c = self.config
+        b, t = input_ids.shape
+        p = c.per_layer_input_size
+        tok = self.embed_tokens_per_layer(input_ids) * torch.tensor(p**0.5, dtype=h.dtype)
+        ctx_ = self.per_layer_model_projection(h) * (c.hidden_size**-0.5)
+        ctx_ = self.per_layer_projection_norm(ctx_.reshape(b, t, c.num_layers, p))
+        return (ctx_ + tok.reshape(b, t, c.num_layers, p)) * (2.0**-0.5)
 
     def forward(
         self,
@@ -198,9 +287,16 @@ class ForgeLM(nn.Module):
         if self.config.scale_embeddings:
             h = h * torch.tensor(self.config.hidden_size**0.5, dtype=h.dtype)
         cos, sin = self.rotary(positions)
+        if self.rotary_full is not None:
+            ctx.rope = {"sliding_attention": (cos, sin), "full_attention": self.rotary_full(positions)}
+        if self.config.per_layer_input_size:
+            ctx.per_layer_inputs = self._per_layer_inputs(input_ids, h)
         want_aux = labels is not None or self.training
         aux_total = None
-        use_gc = self.gradient_checkpointing and self.training and kv_cache is None and torch.is_grad_enabled()
+        # KV-shared layers read tensors produced inside another layer's graph; recomputing a single layer cannot rebuild them
+        use_gc = (
+            self.gradient_checkpointing and self.training and kv_cache is None and torch.is_grad_enabled() and not self.config.num_kv_shared_layers
+        )
         for layer in self.layers:
             if use_gc:
                 h, aux = checkpoint(layer, h, cos, sin, ctx, want_aux, **self._gc_kwargs)
@@ -231,7 +327,7 @@ class ForgeLM(nn.Module):
                 hk = h[:, -logits_to_keep:]
             elif isinstance(logits_to_keep, torch.Tensor):
                 hk = h[:, logits_to_keep]
-            logits = self.lm_head(hk)
+            logits = self._softcap(self.lm_head(hk))
         return ModelOutput(logits=logits, loss=loss, hidden_states=h if return_hidden else None, aux_loss=aux_loss)
 
     # ------------------------------------------------------------------ generation (reference, uniform-length batches)

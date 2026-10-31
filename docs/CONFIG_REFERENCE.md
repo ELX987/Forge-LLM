@@ -77,7 +77,7 @@ nesting level). "Validated" here means *parses and passes the model's checks*, n
 | Template / file | Purpose |
 |-----------------|---------|
 | `dataset-jsonl` | Ingest the bundled `sample-corpus.jsonl` as `tiny-corpus` (byte tokenizer) |
-| `dataset-hf-streaming` | Example of a streamed Hugging Face source (needs network and the `datasets` package; check licence) |
+| `dataset-hf-streaming` | Example of a streamed Hugging Face source (needs network and the `datasets` extra: `pip install 'forge[hf]'`; check licence). Sources: a local path under `kind: hf` is read as files (`hf_config` ignored); `kind: auto` falls back to a Hub id when the path does not exist; legacy bare ids (`wikitext`) are redirected to `Salesforce/wikitext`; unknown config/split/`text_field` errors list the valid values; the Hub token comes from Settings/`HF_TOKEN`, never the job config; `POST /datasets/source-preview` (UI: **Check source**) resolves a source without ingesting |
 | `sample-corpus.jsonl`, `sample-sft.jsonl` | Tiny hand-written sample data for smoke tests (CC0) |
 
 ### configs/chips (Plan Appendix B examples)

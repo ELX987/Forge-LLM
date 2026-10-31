@@ -17,9 +17,14 @@ from forge.models.linear import make_linear
 class RMSNorm(nn.Module):
     """RMSNorm computed in fp32. ``unit_offset=True`` uses ``(1 + weight)`` (gemma)."""
 
-    def __init__(self, dim: int, eps: float = 1e-6, unit_offset: bool = False, dtype=None, device=None):
+    def __init__(
+        self, dim: int, eps: float = 1e-6, unit_offset: bool = False, dtype=None, device=None, *, with_scale: bool = True, fp32_scale: bool = False
+    ):
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype, device=device) if unit_offset else torch.ones(dim, dtype=dtype, device=device))
+        self.with_scale = with_scale
+        self.fp32_scale = fp32_scale
+        if with_scale:
+            self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype, device=device) if unit_offset else torch.ones(dim, dtype=dtype, device=device))
         self.eps = eps
         self.unit_offset = unit_offset
 
@@ -27,19 +32,23 @@ class RMSNorm(nn.Module):
         dt = x.dtype
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        if not self.with_scale:  # gemma4 v-norm: scale-less
+            return xf.to(dt)
         if self.unit_offset:
             return (xf * (1.0 + self.weight.float())).to(dt)
+        if self.fp32_scale:  # gemma4: weight multiplied in fp32, single rounding at the end
+            return (xf * self.weight.float()).to(dt)
         return self.weight * xf.to(dt)
 
     def extra_repr(self) -> str:
-        return f"{tuple(self.weight.shape)}, eps={self.eps}, unit_offset={self.unit_offset}"
+        return f"{tuple(self.weight.shape) if self.with_scale else None}, eps={self.eps}, unit_offset={self.unit_offset}"
 
 
 # ------------------------------------------------------------------------------------------------ rope
 def compute_inv_freq(head_dim: int, theta: float, scaling: dict[str, Any] | None, max_position: int) -> tuple[torch.Tensor, float]:
     """Return ``(inv_freq[head_dim/2] float32, attention_factor)`` for the RoPE variant in ``scaling``.
 
-    Supported ``rope_type``: ``None`` (plain), ``linear``, ``llama3`` (Llama-3.1 smooth interpolation), ``yarn``.
+    Supported ``rope_type``: ``None`` (plain), ``linear``, ``llama3`` (Llama-3.1 smooth interpolation), ``yarn``, ``proportional`` (gemma4 partial rotary).
     """
     dim = head_dim
     pos_freqs = theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim)
@@ -51,6 +60,12 @@ def compute_inv_freq(head_dim: int, theta: float, scaling: dict[str, Any] | None
     factor = float(scaling.get("factor", 1.0))
     if rt == "linear":
         return inv_freq / factor, att
+    if rt == "proportional":  # gemma4 full-attention layers: rotate only the first `partial_rotary_factor` fraction of the angles
+        angles = int(float(scaling.get("partial_rotary_factor", 1.0)) * dim // 2)
+        rot = 1.0 / (theta ** (torch.arange(0, 2 * angles, 2, dtype=torch.float32, device="cpu") / dim))  # exponent denominator is the FULL head_dim
+        if dim // 2 > angles:
+            rot = torch.cat([rot, torch.zeros(dim // 2 - angles, dtype=torch.float32)])  # zero frequency = identity (cos 1, sin 0)
+        return rot / factor, att
     if rt == "llama3":
         low_ff = float(scaling.get("low_freq_factor", 1.0))
         high_ff = float(scaling.get("high_freq_factor", 4.0))
@@ -90,17 +105,17 @@ def compute_inv_freq(head_dim: int, theta: float, scaling: dict[str, Any] | None
         extrap = 1.0 - ramp
         inv = (1.0 / (factor * pos_freqs)) * (1 - extrap) + inv_freq * extrap
         return inv, att
-    raise ConfigError(f"unsupported rope_type {rt!r} (supported: linear, llama3, yarn)")
+    raise ConfigError(f"unsupported rope_type {rt!r} (supported: linear, llama3, yarn, proportional)")
 
 
 class RotaryEmbedding(nn.Module):
     """Produces ``cos, sin`` of shape ``[B, T, head_dim]`` (float32) for arbitrary integer positions."""
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, head_dim: int | None = None, theta: float | None = None, scaling: Any = "cfg"):
         super().__init__()
-        self.head_dim = int(cfg.head_dim)  # type: ignore[arg-type]
-        self.theta = float(cfg.rope_theta)
-        self.scaling = cfg.rope_scaling
+        self.head_dim = int(head_dim if head_dim is not None else cfg.head_dim)  # type: ignore[arg-type]
+        self.theta = float(theta if theta is not None else cfg.rope_theta)
+        self.scaling = cfg.rope_scaling if isinstance(scaling, str) else scaling
         self.max_pos = cfg.max_position_embeddings
         self._cache: dict[Any, tuple[torch.Tensor, float]] = {}
         self.inv_freq_cpu, self.attention_factor = compute_inv_freq(self.head_dim, self.theta, self.scaling, self.max_pos)

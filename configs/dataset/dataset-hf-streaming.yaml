@@ -1,12 +1,14 @@
 # dataset-hf-streaming (job type: dataset_ingest) -- ingest a slice of a Hugging Face dataset with streaming.
-# Needs network access and the `datasets` package on the host (not installed by default; `pip install datasets`).
+# Needs network access and the `datasets` package on the host (extra: pip install 'forge[hf]'). Gated datasets need the
+# Hugging Face token in Settings (or HF_TOKEN); the token is never written into this config.
+# A local folder/file in `path` is read directly (hf_config is then ignored); use the namespaced 'org/name' id.
 # The dataset below is only an example of the field layout: CHECK ITS LICENCE and terms before training on it, and
 # replace `path`/`hf_config`/`split`/`text_field` with your own source. `max_docs` keeps the first run small and cheap;
 # `max_total_tokens` stops the whole job. Not exercised by the CPU tests (they never touch the network).
 name: hf-sample-slice
 sources:
   - kind: hf
-    path: wikitext                  # example HF dataset id
+    path: Salesforce/wikitext       # example HF dataset id (namespaced; bare 'wikitext' is redirected)
     hf_config: wikitext-103-raw-v1
     split: train
     text_field: text

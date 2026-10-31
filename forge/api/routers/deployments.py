@@ -120,6 +120,24 @@ async def list_deployments(response: Response, svc: Services = Depends(get_servi
     return rows
 
 
+def _preflight_servable(model_value: str) -> None:
+    """Fail the request (instead of a crashed serve job) when a local model's architecture is not servable by the paged runner."""
+    import json
+
+    cfg_path = Path(str(model_value)).expanduser() / "config.json"
+    try:
+        if not cfg_path.is_file():
+            return
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        from forge.models import ModelConfig
+        from forge.serve.runner import check_servable
+
+        cfg = ModelConfig.from_hf_config(raw)
+    except Exception:  # noqa: BLE001 - unreadable / unparseable configs are reported by the serve job itself
+        return
+    check_servable(cfg)
+
+
 @router.post("", status_code=201, summary="Start serving a model (creates a `serve` job)")
 def create(body: DeploymentCreate, svc: Services = Depends(get_services)) -> dict[str, Any]:
     jt = get_job_type("serve")
@@ -132,6 +150,7 @@ def create(body: DeploymentCreate, svc: Services = Depends(get_services)) -> dic
         model_value = local or row["path_or_repo"]
     elif Path(ref).expanduser().is_dir():
         model_value = str(Path(ref).expanduser().resolve())
+    _preflight_servable(model_value)
     params: dict[str, Any] = {}
     if body.template:
         t = next((t for t in list_templates(jt) if t["name"] == body.template), None)

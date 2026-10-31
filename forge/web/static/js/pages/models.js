@@ -40,11 +40,13 @@ export default async function render(ctx) {
         { key: 'params_b', label: 'Params', num: true, render: (m) => (m.params_b != null ? fmtNum(m.params_b) + 'B' : '-') },
         { key: 'licence', label: 'Licence', render: (m) => h('div', h('div', m.licence || '-'), distillBadge(m)) },
         { key: 'hash', label: 'Weights hash', render: (m) => hashLabel(m.hash) },
-        { key: 'status', label: 'Status', render: (m) => statusBadge(m.status || 'ready') },
+        { key: 'status', label: 'Status', render: (m) => h('div', statusBadge(m.status || 'ready'),
+          m.info && m.info.forge_supported === false ? badge('unsupported arch', 'bad', { tip: m.info.unsupported_reason || 'Forge cannot run this architecture.' }) : null,
+          m.status === 'failed' && m.info && m.info.error ? h('div', { class: 'small muted' }, m.info.error) : null) },
         { key: 'created_at', label: 'Added', render: (m) => fmtRel(m.created_at) },
         { key: 'act', label: '', noSort: true, render: (m) => h('div', { class: 'row tight' },
           h('button', { class: 'btn sm', onclick: () => inspect(m) }, 'Inspect'),
-          m.source === 'hf' && m.status !== 'ready' ? h('button', { class: 'btn sm', onclick: () => download(m) }, 'Download') : null,
+          m.source === 'hf' && m.status !== 'ready' && m.status !== 'downloading' ? h('button', { class: 'btn sm', onclick: () => download(m) }, 'Download') : null,
           h('a', { class: 'btn sm', href: `#/finetune?model=${encodeURIComponent(m.id)}` }, 'Fine-tune'),
           h('button', { class: 'btn sm danger', 'aria-label': `Delete ${m.name}`, onclick: () => del(m) }, 'Delete')) },
       ], rows: all, sort: { key: 'created_at', dir: 'desc' },
@@ -59,6 +61,8 @@ export default async function render(ctx) {
       const kvb = r.kv_bytes_per_token;
       dlg.setBody(h('div', { class: 'stack' },
         kv([['Name', m.name], ['Id', m.id], ['Licence', r.licence || m.licence || '-'], ['Params', r.params_b != null ? fmtNum(r.params_b) + 'B' : '-']]),
+        r.forge_supported === false ? h('div', { class: 'notice error' }, r.unsupported_reason || 'This architecture is not supported by Forge.') : null,
+        (r.warnings || []).length ? h('div', { class: 'notice warn' }, (r.warnings || []).map((w) => h('div', w))) : null,
         r.config ? h('div', h('h3', 'Architecture'), objectView(r.config)) : null,
         kvb ? h('div', h('h3', 'KV bytes per token ', help('Per-token KV cache footprint at different KV precisions. Derived from the architecture, not measured.')),
           typeof kvb === 'object' ? kv(Object.entries(kvb).map(([bits, b]) => [`${bits}-bit KV`, fmtBytes(Number(b))])) : h('span', fmtBytes(kvb))) : null,
@@ -76,14 +80,15 @@ export default async function render(ctx) {
   }
   function addHf() {
     formDialog({ title: 'Add Hugging Face model', submitLabel: 'Add',
-      intro: 'Registers the repo. Tick "download now" to queue a download job (uses HF_TOKEN from the server environment for gated repos).',
+      intro: 'Registers the repo. Use the full Hugging Face id as org/name (e.g. google/gemma-4-E4B - a bare "gemma-4-E4B" is not a repo). Tick "download now" to queue a download job. Gated repos (Gemma, Llama) need the licence accepted on huggingface.co and HF_TOKEN exported on the server before it starts.',
       fields: [
-        { name: 'path_or_repo', label: 'Repo id', placeholder: 'meta-llama/Llama-3.1-8B', required: true },
+        { name: 'path_or_repo', label: 'Repo id (org/name)', placeholder: 'google/gemma-4-E4B', required: true },
         { name: 'name', label: 'Display name', placeholder: '(defaults to the repo name)' },
         { name: 'revision', label: 'Revision', placeholder: 'main' },
         { name: 'download', label: 'Download now', type: 'checkbox', value: true },
       ],
       onSubmit: async (v) => {
+        if (!/^[A-Za-z0-9][\w.-]*\/[\w.-]+$/.test((v.path_or_repo || '').trim())) throw new Error('Repo id must look like org/name, e.g. google/gemma-4-E4B');
         const m = await api.post('/models', { source: 'hf', path_or_repo: v.path_or_repo, name: v.name || v.path_or_repo.split('/').pop(), revision: v.revision || null });
         toast('Model added', 'ok'); reload();
         if (v.download && m && m.id) { try { const job = await api.post(`/models/${encodeURIComponent(m.id)}/download`, {}); if (job && job.id) navigate(`/jobs/${job.id}`); } catch (e) { toastError(e, 'Download'); } }

@@ -163,17 +163,39 @@ class ModelSpec(_M):
         if n_exp:
             kw.update(form="moe", num_experts=int(n_exp), experts_per_token=int(top_k or 2))
         pb = first("params_b")
+        hybrid = _hybrid_model_config(cfg) if isinstance(cfg, dict) else None
+        if hybrid is not None:  # lfm2: conv layers keep no KV cache and have their own weights -> exact analytic counts
+            kw.update(attention="hybrid", full_attn_layers=len(hybrid.kv_layers), intermediate_size=hybrid.intermediate_size,
+                      tie_embeddings=hybrid.tie_word_embeddings)
+            if pb is None:
+                pb = hybrid.param_count() / 1e9
+                if hybrid.moe is not None and first("active_params_b") is None:
+                    kw["active_params_b"] = hybrid.active_param_count() / 1e9
         if pb is None:
             kw["params_b"] = _estimate_params_b(kw, moe_inter)
             kw["params_estimated"] = True
         else:
             kw["params_b"] = float(pb)
-        if n_exp and first("active_params_b") is None:
+        if n_exp and first("active_params_b") is None and "active_params_b" not in kw:
             kw["active_params_b"] = _estimate_active_b(kw, moe_inter)
         elif first("active_params_b") is not None:
             kw["active_params_b"] = float(first("active_params_b"))
         kw.update(overrides)
         return cls(**kw)
+
+
+def _hybrid_model_config(cfg: dict[str, Any]) -> Any:
+    """The ``ModelConfig`` of a config dict with gated-conv layers (lfm2), else None."""
+    lt = cfg.get("layer_types")
+    if not ((isinstance(lt, (list, tuple)) and "conv" in lt) or cfg.get("conv_L_cache") is not None or cfg.get("full_attn_idxs") is not None):
+        return None
+    try:
+        from forge.models.config import ModelConfig
+
+        mc = ModelConfig.model_validate(cfg) if "arch" in cfg else ModelConfig.from_hf_config(cfg)
+    except Exception:
+        return None
+    return mc if mc.is_hybrid else None
 
 
 def _estimate_params_b(kw: dict[str, Any], moe_inter: int | None) -> float:
