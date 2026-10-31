@@ -15,6 +15,9 @@ Unified **training, fine-tuning, compression and serving** system for LLMs, buil
 
 ## Quickstart: local CPU development (any OS)
 
+> Do **not** use this on a GPU host: the CPU-only torch wheel replaces CUDA torch, and on some Linux builds it fails on
+> `import torch` (`AttributeError: module 'torch._C' has no attribute '_has_gds'`). On vast.ai use the section below.
+
 ```bash
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -27,7 +30,7 @@ forge serve-ui                                          # web UI + API on http:/
 ## Quickstart: vast.ai (Linux + NVIDIA)
 
 1. Rent an instance with a recent PyTorch + CUDA image and an exposed port (or use the SSH tunnel).
-2. `git clone <your private repo> && cd "Forge LLM" && bash scripts/vast_setup.sh`
+2. `git clone <your private repo> && cd Forge-LLM && bash scripts/vast_setup.sh` (keeps the image's CUDA torch; do not create a venv with CPU torch)
 3. `bash scripts/run_server.sh` then open the forwarded port (or `ssh -L 8765:localhost:8765 ...`).
 4. `bash scripts/gpu_smoke.sh` and `bash scripts/run_gpu_tests.sh` to validate kernels on your GPU.
 
