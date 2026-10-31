@@ -26,6 +26,9 @@ pytestmark = pytest.mark.skipif(not _OK, reason="torch.distributed/gloo unavaila
 
 
 def _worker(rank, world, init_file, cfg_json, ds_dir, run_dir, strategy, out_q):
+    import faulthandler
+
+    faulthandler.dump_traceback_later(100, exit=False)  # a stalled rendezvous/collective shows up in the log
     os.environ.update(RANK=str(rank), WORLD_SIZE=str(world), LOCAL_RANK=str(rank), FORGE_HOME=str(Path(run_dir) / f"home{rank}"))
     import torch.distributed as dist
     from test_train_fixtures import make_model
@@ -63,15 +66,25 @@ def _run_dist(tmp_path, strategy, **over):
     cfg = small_train_cfg(ds, micro_batch_size=2, grad_accum_steps=1, budget={"max_steps": 4}, parallel={"strategy": strategy, "device": "cpu"},
                           optim={"name": "sgd", "lr": 0.05, "momentum": 0.0, "weight_decay": 0.0, "grad_clip": 0.0},
                           schedule={"name": "constant", "warmup_steps": 0}, eval={"every_steps": 2, "num_batches": 2}, **over)
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")  # inherited by the spawned ranks; avoids hostname resolution stalls
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     init_file = str(Path(tempfile.mkdtemp()) / "rdzv")
     procs = [ctx.Process(target=_worker, args=(r, 2, init_file, cfg.model_dump_json(), str(ds), str(tmp_path), strategy, q)) for r in range(2)]
     for p in procs:
         p.start()
-    results = [q.get(timeout=240) for _ in procs]
+    try:
+        results = [q.get(timeout=120) for _ in procs]
+    except Exception:  # queue.Empty: a rank never reported (rendezvous or collective stalled)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        pytest.fail(f"distributed ranks did not report within 120 s (alive={[p.exitcode for p in procs]})")
     for p in procs:
         p.join(timeout=60)
+        if p.is_alive():
+            p.terminate()
     return cfg, ds, {r[0]: r for r in results}
 
 
