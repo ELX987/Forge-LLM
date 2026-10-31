@@ -147,7 +147,7 @@ def _norm_worker(rank, world, init_file, cfg_json, ds_dir, run_dir, out_q):
         ds = SD([ds_dir], 16, seed=3, role="train", val_sequences=4)
         tr = TR(mk(0), cfg, MT(ds, cfg, None, 16), NC(run_dir=Path(run_dir) / f"r{rank}"), dinfo=dinfo)
         tr.fit()
-        out_q.put((rank, {k: v.clone() for k, v in D.get_model_state(tr.model).items()}))
+        out_q.put((rank, {k: v.detach().cpu().float().numpy() for k, v in D.get_model_state(tr.model).items()}))  # numpy: no fd-passing of tensor storages
         dist.barrier()
         dist.destroy_process_group()
     except BaseException:  # noqa: BLE001
@@ -171,6 +171,7 @@ def test_ddp_gradient_is_token_weighted_when_ranks_have_unequal_supervised_count
     for p in procs:
         p.start()
     res = dict(q.get(timeout=240) for _ in procs)
+    res = {r: ({k: torch.from_numpy(v) for k, v in x.items()} if isinstance(x, dict) else x) for r, x in res.items()}
     for p in procs:
         p.join(timeout=60)
     assert isinstance(res[0], dict), res[0]

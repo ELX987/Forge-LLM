@@ -49,7 +49,7 @@ def _worker(rank, world, init_file, cfg_json, ds_dir, run_dir, strategy, out_q):
         tr = Trainer(make_model(0), cfg, LMTask(ds, cfg, va, 16), ctx, dinfo=dinfo)
         res = tr.fit()
         sd = D.get_model_state(tr.model)
-        out_q.put((rank, res["status"], res["steps"], {k: v.clone() for k, v in sd.items()} if sd else None, [m for _, m in ctx.metrics][:1]))
+        out_q.put((rank, res["status"], res["steps"], {k: v.detach().cpu().float().numpy() for k, v in sd.items()} if sd else None, [m for _, m in ctx.metrics][:1]))
         dist.barrier()
         dist.destroy_process_group()
     except BaseException:  # noqa: BLE001
@@ -85,7 +85,15 @@ def _run_dist(tmp_path, strategy, **over):
         p.join(timeout=60)
         if p.is_alive():
             p.terminate()
-    return cfg, ds, {r[0]: r for r in results}
+    # tensors cross the queue as numpy: torch shares tensor storages by fd passing, which fails when the sender
+    # exits before the receiver reads (ConnectionResetError / EOFError)
+    fixed = []
+    for r in results:
+        r = list(r)
+        if isinstance(r[3], dict):
+            r[3] = {k: torch.from_numpy(v) for k, v in r[3].items()}
+        fixed.append(tuple(r))
+    return cfg, ds, {r[0]: r for r in fixed}
 
 
 def _single(ds, cfg, tmp_path):
