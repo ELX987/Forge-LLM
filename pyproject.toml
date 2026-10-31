@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge-llm"
+dynamic = ["version"]
+description = "Forge LLM: unified training, compression, fine-tuning and serving system with Triton kernels and a web UI"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.5",
+    "pyyaml>=6",
+    "numpy>=1.24",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.26",
+    "zstandard>=0.22",
+    "safetensors>=0.4",
+    "psutil>=5.9",
+    "blake3>=0.4",
+    "huggingface_hub>=0.23",
+    "transformers>=4.44",
+    "tokenizers>=0.19",
+    "nvidia-ml-py>=12.535",
+]
+
+[project.optional-dependencies]
+# torch is assumed preinstalled on GPU hosts (match your CUDA); this extra is for convenience only.
+torch = ["torch>=2.3"]
+gpu = ["triton>=2.2"]
+serve = ["python-multipart>=0.0.9", "sse-starlette>=1.8"]
+parquet = ["pyarrow>=14"]
+dev = ["pytest>=7.4", "pytest-timeout>=2.2", "ruff>=0.4", "pyarrow>=14", "python-multipart>=0.0.9"]
+
+[project.scripts]
+forge = "forge.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "forge.__version__.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["forge*"]
+
+[tool.setuptools.package-data]
+forge = ["web/static/**/*", "kernels/specs/*.yaml", "planner/data/*.yaml", "eval/data/*.jsonl", "py.typed"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008", "UP007", "UP045"]

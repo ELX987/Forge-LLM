@@ -1,0 +1,17 @@
+# nvfp4-ptq (recipe) -- EXPERIMENTAL: NVFP4 post-training quantisation (16-element E2M1 blocks, E4M3 block scales,
+# FP32 tensor scale; GPTQ-style error compensation). The Plan (paper P1) says FP4 is not automatically better than INT4
+# W4A16: compare against w4a16-gptq-g128 on accuracy AND speed before adopting. On non-Blackwell GPUs the compute is
+# emulated (ADR 0005): you get the storage saving and the accuracy numbers, not a speed-up. Native kernels untested.
+# Gate G-W4 is reused as the closest preset; thresholds are targets, not validated constants.
+recipe: nvfp4-ptq
+inputs:
+  calib: builtin-mix
+stages:
+  - calibrate: {set: builtin-mix, n_seqs: 512, seq_len: 2048, stats: [hessian, channel_scale]}
+  - ptq: {method: gptq, format: nvfp4, bits: 4, group: 16, act_order: false, damp: 0.01}
+  - pack: {layout: auto, target: null}
+  - gate: {suite: g-w4, seeds: 3, stats: bootstrap_2000, suites: [distribution, mcq]}
+baselines: [w4a16-gptq-g128, fp8-w8a8]
+budget: {gpu_hours: 4, max_wall_hours: 6}
+policy: {licence_check: true}
+seeds: [0]

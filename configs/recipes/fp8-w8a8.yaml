@@ -1,0 +1,16 @@
+# fp8-w8a8 (recipe): FP8 (E4M3) quantisation of the linear layers, FP8 KV cache, then gate G-FP8.
+# The production default on GPUs with FP8 tensor cores (sm_89+: RTX 40xx, L4/L40S, H100). On older GPUs the weights can
+# be stored in FP8 but the matmul is dequantised (no speed-up). act_quant: auto lets the runtime choose dynamic
+# per-token activation scaling where the kernel supports it. Not validated on hardware.
+recipe: fp8-w8a8
+inputs:
+  calib: builtin-mix
+stages:
+  - calibrate: {set: builtin-mix, n_seqs: 256, seq_len: 2048, stats: [channel_scale]}
+  - ptq: {method: rtn, format: fp8, bits: 8, act_quant: auto}
+  - kv: {scheme: fp8_e4m3, residual_window: 0}
+  - gate: {suite: g-fp8, seeds: 3, stats: bootstrap_2000, suites: [distribution, mcq]}
+baselines: []
+budget: {gpu_hours: 1, max_wall_hours: 2}
+policy: {licence_check: true}
+seeds: [0]

@@ -1,0 +1,22 @@
+# dataset-hf-streaming (job type: dataset_ingest) -- ingest a slice of a Hugging Face dataset with streaming.
+# Needs network access and the `datasets` package on the host (not installed by default; `pip install datasets`).
+# The dataset below is only an example of the field layout: CHECK ITS LICENCE and terms before training on it, and
+# replace `path`/`hf_config`/`split`/`text_field` with your own source. `max_docs` keeps the first run small and cheap;
+# `max_total_tokens` stops the whole job. Not exercised by the CPU tests (they never touch the network).
+name: hf-sample-slice
+sources:
+  - kind: hf
+    path: wikitext                  # example HF dataset id
+    hf_config: wikitext-103-raw-v1
+    split: train
+    text_field: text
+    streaming: true
+    max_docs: 50000
+tokenizer: Qwen/Qwen2.5-0.5B        # use the tokenizer of the model you will train
+add_eos: true
+min_doc_tokens: 16
+dedup_exact: true
+dedup_minhash: true
+val_fraction: 0.01
+max_total_tokens: 50000000
+licence: cc-by-sa-3.0               # verify against the dataset card; recorded in the manifest

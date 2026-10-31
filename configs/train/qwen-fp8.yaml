@@ -1,0 +1,46 @@
+# qwen-fp8 (job type: train) -- precision-ladder rung R1: FP8 mixed-precision training of a small Qwen model.
+# Needs an FP8-capable GPU for real FP8 tensor-core speed: sm_89 (RTX 40xx, L4, L40S) or sm_90 (H100/H200) and later.
+# On other GPUs and on CPU the backend falls back to EMULATED FP8 (fake-quant) with a warning: the numerics are
+# right but it is slower than bf16, not faster. Backend selection: torchao float8 -> TransformerEngine -> emulated.
+# NOT validated on hardware yet. Compare against an R0 run of the same config (change precision.rung) and read the
+# loss-gap diagnostic before trusting the result.
+name: qwen2.5-1.5b-fp8
+seed: 1337
+model:
+  source: pretrained
+  path: Qwen/Qwen2.5-1.5B             # Apache-2.0
+  dtype: bfloat16
+data:
+  dataset: ["my-corpus"]
+  seq_len: 2048
+  val_sequences: 64
+micro_batch_size: 4
+grad_accum_steps: 8
+activation_checkpointing: false
+optim:
+  lr: 0.00005
+  weight_decay: 0.1
+  grad_clip: 1.0
+schedule:
+  name: cosine
+  warmup_steps: 100
+  min_lr_ratio: 0.1
+precision:
+  rung: R1
+  backend: auto                       # torchao | transformer_engine | emulated
+  fp8_format: hybrid                  # E4M3 forward, E5M2 gradients
+  fp8_scaling: dynamic
+  exempt_patterns: [embed, lm_head, head, norm, router, gate.weight]
+  exempt_first_layers: 1              # keep the first/last blocks in bf16 (sensitive layers)
+  exempt_last_layers: 2
+  diagnostics_every: 50
+  loss_gap_every: 50                  # shadow high-precision forward to report the loss gap
+checkpoint:
+  every_steps: 500
+  resume: auto
+eval:
+  every_steps: 250
+budget:
+  max_steps: 2000
+logging:
+  log_every: 10

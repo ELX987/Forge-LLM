@@ -1,0 +1,17 @@
+# G-FP8 - FP8 W8A8 and FP8 KV cache (Plan 10.1). TARGET thresholds, recalibrated at Gate G1.
+gate: G-FP8-v1
+status: TARGET
+title: FP8 weights/activations and FP8 KV
+description: "KL p99 <= 0.01, flip rate <= 1%, task suite non-inferior at delta = 0.5 pt, long-context >= 99% of parent."
+applies_to: [fp8_w8a8, fp8_kv]
+parent: required
+ci_policy: conservative
+noninferiority: {margin_pts: 0.5, alpha: 0.05, fdr: benjamini_hochberg}
+metrics:
+  kl_p99: {max: 0.01}
+  top1_flip: {max: 0.01}
+  suite_score_diff_pts: {noninferior: true, description: "candidate - parent suite score in points, non-inferior at the margin"}
+  longctx_ratio: {min: 0.99, at_length: deployment}
+noise_floor: from_parent_repeats(n=5)
+suites: [distribution, mcq, longctx]
+source: "Plan 10.1 gate table (G-FP8); targets from Plan 2.3 (FP8 >= 99.5% retained)"

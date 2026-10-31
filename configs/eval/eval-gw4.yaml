@@ -1,0 +1,48 @@
+# eval-gw4 (job type: eval) -- compare a W4A16 candidate against its BF16 parent and apply gate G-W4.
+# Replace candidate.ref / parent.ref with your artifact hash (kind: artifact) or model directory (kind: path).
+# Suites: distribution (KL, p99 KL, top-1 flip rate, ECE on held-out text), mcq (multiple choice from local jsonl),
+# longgen, longctx (needle / multi-key retrieval at the deployment length) and safety. The parent is re-evaluated
+# `noise_repeats` times to estimate the run-to-run noise floor; differences inside it are marked "within noise".
+# Gate thresholds in the shipped presets are TARGET values to be recalibrated at Plan Gate G1, not validated constants.
+# Verdicts are pass | fail | inconclusive (inconclusive = not enough evidence; collect more samples).
+# Not validated on real models or hardware.
+name: eval-w4a16-vs-bf16
+candidate:
+  kind: artifact
+  ref: "blake3:replace-with-candidate-artifact-hash"
+  label: llama-8b-w4a16
+  backend: forge
+  dtype: bfloat16
+  device: auto
+  params_b: 8
+parent:
+  kind: path
+  ref: "models/llama-3.1-8b-instruct"
+  label: llama-8b-bf16
+  backend: forge
+  dtype: bfloat16
+  device: auto
+  params_b: 8
+suites:
+  - name: distribution
+    params: {}
+  - name: mcq
+    params: {}
+  - name: longctx
+    params: {}
+  - name: longgen
+    params: {}
+  - name: safety
+    params: {}
+gate: g-w4
+seeds: [0, 1, 2]
+n_bootstrap: 2000
+alpha: 0.05
+noise_repeats: 5
+noise_perturb: both
+deployment_length: 8192
+context:
+  params_b: 8
+extra_flags: {}
+save_generations: true
+tags: [w4a16, gate]

@@ -1,0 +1,19 @@
+# G-SPEC - speculative decoding (Plan 10.1). The serving engine's distribution-exactness test (empirical vs exact joint on a
+# small vocabulary, forge.serve.spec) provides exactness_test_passed; speed-up must be measured at the production batch
+# distribution (production_batch_measured), not only at B=1.
+gate: G-SPEC-v1
+status: TARGET
+title: Speculative decoding
+description: "Distribution-exactness test passes; speed-up measured at the production batch distribution, not only B=1."
+applies_to: [speculative_decoding, ngram_lookup, draft_model, eagle]
+parent: optional
+ci_policy: conservative
+noninferiority: {margin_pts: 0.0, alpha: 0.05, fdr: none}
+metrics:
+  throughput_speedup: {min: 1.0, required: false, description: "measured tokens/s ratio at the top tested concurrency; below 1 means speculation hurts at that load"}
+flags:
+  exactness_test_passed: "rejection sampling reproduces the target distribution (P7 Appendix A.1)"
+  production_batch_measured: "speed-up measured at the production batch-size distribution"
+noise_floor: from_parent_repeats(n=3)
+suites: [throughput]
+source: "Plan 10.1 gate table (G-SPEC); P7 sections 5.2 and 5.8"

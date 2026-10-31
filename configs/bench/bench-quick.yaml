@@ -1,0 +1,20 @@
+# bench-quick (job type: bench) -- short sweep used by scripts/gpu_smoke.sh and scripts/run_gpu_tests.sh.
+# A few shapes and few repeats: a sanity check that the kernels run and roughly where they land, NOT a benchmark.
+# Do not quote these numbers; use bench-gemm-sweep (and autotune) for real measurements.
+kernels: [w4a16_gemm, w8a16_gemm, fp8_gemm]
+dtypes: [bf16]
+m_values: [1, 16, 256]
+n: 4096
+k: 4096
+group_size: 128
+warmup: 5
+repeats: 10
+flush_l2: true
+check_correctness: true
+include_baseline: true
+measure_peaks: true
+autotune: false
+device: 0
+seed: 0
+allow_cpu: false
+save_results: true

@@ -1,0 +1,26 @@
+# SEED EXAMPLES, NOT A BENCHMARK. 24 trivial items to smoke-test the multiple-choice scorer end to end.
+# Format: {id, question, choices:[...], answer: index|letter, subject?, context?}. Point MCQConfig.data_path at your own jsonl for real runs.
+{"id": "m000", "question": "What is 7 plus 5?", "choices": ["10", "11", "12", "13"], "answer": 2, "subject": "arithmetic"}
+{"id": "m001", "question": "What is 9 times 3?", "choices": ["24", "27", "30", "21"], "answer": 1, "subject": "arithmetic"}
+{"id": "m002", "question": "What is 20 minus 8?", "choices": ["10", "11", "12", "13"], "answer": 2, "subject": "arithmetic"}
+{"id": "m003", "question": "What is half of 18?", "choices": ["7", "8", "9", "10"], "answer": 2, "subject": "arithmetic"}
+{"id": "m004", "question": "Which number is largest?", "choices": ["15", "51", "5", "11"], "answer": 1, "subject": "arithmetic"}
+{"id": "m005", "question": "Which is a primary colour of light?", "choices": ["Green", "Brown", "Pink", "Grey"], "answer": 0, "subject": "general"}
+{"id": "m006", "question": "Water freezes at what temperature in degrees Celsius at sea level?", "choices": ["0", "10", "50", "100"], "answer": 0, "subject": "science"}
+{"id": "m007", "question": "Which planet is closest to the sun?", "choices": ["Venus", "Mercury", "Mars", "Earth"], "answer": 1, "subject": "science"}
+{"id": "m008", "question": "How many days are there in a week?", "choices": ["five", "six", "seven", "eight"], "answer": 2, "subject": "general"}
+{"id": "m009", "question": "Which gas do plants take in for photosynthesis?", "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Helium"], "answer": 2, "subject": "science"}
+{"id": "m010", "question": "What do bees mainly collect from flowers?", "choices": ["Nectar", "Sand", "Salt", "Gravel"], "answer": 0, "subject": "science"}
+{"id": "m011", "question": "Which of these is a mammal?", "choices": ["Salmon", "Dolphin", "Lizard", "Frog"], "answer": 1, "subject": "science"}
+{"id": "m012", "question": "What is the opposite of 'ancient'?", "choices": ["Old", "Modern", "Heavy", "Quiet"], "answer": 1, "subject": "language"}
+{"id": "m013", "question": "Which word is a verb?", "choices": ["Run", "Blue", "Quickly", "Table"], "answer": 0, "subject": "language"}
+{"id": "m014", "question": "Which word rhymes with 'cat'?", "choices": ["Dog", "Hat", "Sun", "Pen"], "answer": 1, "subject": "language"}
+{"id": "m015", "question": "Which tool is used to measure length?", "choices": ["Ruler", "Thermometer", "Clock", "Scale"], "answer": 0, "subject": "general"}
+{"id": "m016", "question": "Which shape has three sides?", "choices": ["Square", "Circle", "Triangle", "Hexagon"], "answer": 2, "subject": "general"}
+{"id": "m017", "question": "In Python, which keyword defines a function?", "choices": ["func", "def", "lambda_", "fn"], "answer": 1, "subject": "code"}
+{"id": "m018", "question": "In Python, what does len([1, 2, 3]) return?", "choices": ["2", "3", "4", "1"], "answer": 1, "subject": "code"}
+{"id": "m019", "question": "Which data structure works first-in first-out?", "choices": ["Stack", "Queue", "Tree", "Heap"], "answer": 1, "subject": "code"}
+{"id": "m020", "question": "What does CPU stand for?", "choices": ["Central Processing Unit", "Computer Personal Unit", "Core Power Utility", "Central Program Update"], "answer": 0, "subject": "code"}
+{"id": "m021", "question": "If all cats are animals and Tom is a cat, then Tom is...", "choices": ["a plant", "an animal", "a rock", "a car"], "answer": 1, "subject": "reasoning"}
+{"id": "m022", "question": "A shop sells pens at 2 coins each. How many coins for 6 pens?", "choices": ["8", "10", "12", "14"], "answer": 2, "subject": "reasoning"}
+{"id": "m023", "question": "Which comes next: 2, 4, 6, 8, ...?", "choices": ["9", "10", "11", "12"], "answer": 1, "subject": "reasoning"}

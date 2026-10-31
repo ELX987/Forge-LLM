@@ -1,0 +1,45 @@
+# Forge LLM - CUDA image (Linux + NVIDIA). NOT built or run during development (no NVIDIA machine available);
+# treat as unvalidated until you build it on a GPU host:  docker compose -f docker/docker-compose.yml build
+#
+# Base: the official PyTorch runtime image (torch + CUDA user-space libs preinstalled). Pick the tag matching
+# your driver: CUDA 12.4 runs on driver >= 550; RTX 50xx / B200 need a CUDA 12.8 image (build arg BASE_IMAGE).
+ARG BASE_IMAGE=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    FORGE_HOME=/data \
+    FORGE_API_HOST=0.0.0.0 \
+    FORGE_API_PORT=8765 \
+    HF_HOME=/data/hf_cache \
+    TRITON_CACHE_DIR=/data/triton_cache
+
+# gcc is required by Triton to build its small CUDA launcher stubs at first use.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git build-essential tmux curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/forge
+
+# Install dependencies first for better layer caching.
+COPY pyproject.toml README.md LICENSE ./
+COPY forge/__version__.py forge/__version__.py
+RUN python -c "import sys; assert sys.version_info >= (3, 10), sys.version"
+
+COPY forge ./forge
+COPY configs ./configs
+COPY scripts ./scripts
+COPY tests ./tests
+COPY tests_gpu ./tests_gpu
+COPY conftest.py pytest.ini Makefile ./
+RUN pip install -e ".[gpu,serve,parquet,dev]"
+
+VOLUME ["/data"]
+EXPOSE 8765
+
+# The token is read from FORGE_API_TOKEN; when empty the entrypoint generates one and prints it.
+COPY docker/entrypoint.sh /usr/local/bin/forge-entrypoint
+RUN chmod +x /usr/local/bin/forge-entrypoint
+ENTRYPOINT ["forge-entrypoint"]
+CMD ["serve-ui"]

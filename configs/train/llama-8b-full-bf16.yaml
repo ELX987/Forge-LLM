@@ -1,0 +1,56 @@
+# llama-8b-full-bf16 (job type: train) -- continued pre-training of an 8B dense model, all weights, BF16 (rung R0).
+# UNTESTED at 8B scale on hardware. Memory estimate for AdamW (bf16 weights + bf16 grads + fp32 Adam states) is
+# roughly 8B x (2 + 2 + 8) = ~96 GB before activations, so:
+#   * 1 x 80 GB GPU does NOT fit with plain AdamW. Use FSDP over >= 4 x 80 GB (below), or optim.name: adamw8bit
+#     (needs bitsandbytes) plus activation checkpointing on a single 80 GB card (still tight).
+#   * Check feasibility first: Recipes -> estimate panel, or POST /api/v1/planner/estimate.
+# Gated model: accept the licence on the Hugging Face Hub and export HF_TOKEN before starting. Check the licence's
+# terms yourself before training or distilling (Plan TR-8).
+name: llama-8b-cpt-bf16
+seed: 1337
+model:
+  source: pretrained
+  path: meta-llama/Llama-3.1-8B       # HF repo id, local dir, or a Forge model id
+  dtype: bfloat16
+data:
+  dataset: ["my-corpus"]              # replace with your ingested dataset id (tokenised with the SAME tokenizer)
+  seq_len: 4096
+  val_sequences: 64
+micro_batch_size: 1
+grad_accum_steps: 16                  # global batch = 1 x 16 x world_size sequences
+activation_checkpointing: true
+optim:
+  name: adamw
+  lr: 0.00002                         # continued pre-training: much lower than a from-scratch peak LR
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+schedule:
+  name: wsd                           # warmup-stable-decay: easy to extend a run without restarting
+  warmup_steps: 200
+  decay_ratio: 0.2
+  min_lr_ratio: 0.1
+precision:
+  rung: R0
+  compute_dtype: bfloat16
+parallel:
+  strategy: fsdp
+  nproc_per_node: 8                   # set to the number of GPUs you rented
+  fsdp_sharding: full_shard
+checkpoint:
+  every_steps: 500
+  keep_last: 2
+  keep_best: true
+  resume: auto                        # picks up after an interrupted (e.g. pre-empted) instance
+eval:
+  every_steps: 250
+  num_batches: 16
+stability:
+  on_nonfinite: rollback
+  on_spike: rollback
+  max_restarts: 3
+budget:
+  max_steps: 5000
+  max_minutes: 720                    # hard wall-clock stop; the run ends at whichever budget is hit first
+logging:
+  log_every: 10

@@ -1,0 +1,23 @@
+# G-FP4TRAIN - NVFP4 training runs (Plan 10.1). EXPERIMENTAL / gated track (Plan 1.3 Tier 3). TARGET thresholds.
+# loss_gap_rel (relative training/validation loss gap vs the BF16/FP8 reference over the horizon) comes from the training run:
+# pass it via EvalConfig.extra_metrics {loss_gap_rel: 0.012}. The band below is a placeholder for a pre-registered value
+# (published recipes report ~1-2% gaps, P5 chapter 8).
+gate: G-FP4TRAIN-v1
+status: TARGET
+title: NVFP4 training
+description: >
+  Loss gap within the pre-registered band vs the reference over the horizon; TR-2 diagnostics green; downstream suite within
+  noise of the reference; healing-phase decision documented.
+applies_to: [nvfp4_training]
+parent: required
+ci_policy: conservative
+noninferiority: {margin_pts: 1.0, alpha: 0.05, fdr: benjamini_hochberg}
+metrics:
+  loss_gap_rel: {max: 0.02, description: "pre-registered band (placeholder 2%)"}
+  suite_score_diff_pts: {within_noise: true}
+flags:
+  tr2_diagnostics_green: "zero-gradient tile fraction, scale flush, SR bias diagnostics within bounds (TR-2)"
+  healing_decision_documented: "high-precision tail / healing phase decision recorded"
+noise_floor: from_parent_repeats(n=3)
+suites: [distribution, mcq]
+source: "Plan 10.1 gate table (G-FP4TRAIN); P5 chapters 8 and 9"

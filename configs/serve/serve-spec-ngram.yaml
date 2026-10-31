@@ -1,0 +1,28 @@
+# serve-spec-ngram (job type: serve) -- speculative decoding with the prompt-lookup (n-gram) drafter.
+# Speculative decoding does not change the output distribution (exact rejection sampling) but its SPEED benefit is
+# regime-dependent (Plan 7.5, paper P7): it helps at low batch sizes and on context-copying workloads (summarisation,
+# code editing, RAG) and can HURT at high batch. The load-aware controller chooses gamma per step and may choose 0.
+# Verify with eval gate G-SPEC and the throughput suite before relying on it. Not validated on hardware.
+model: llama-3.1-8b-instruct-w4a16
+served_model_name: llama-8b-spec
+dtype: auto
+kv_dtype: auto
+max_model_len: 8192
+max_num_seqs: 16
+max_num_batched_tokens: 4096
+prefix_caching: true
+speculation:
+  mode: ngram
+  max_gamma: 5
+  controller: load_aware
+  max_batch_for_spec: 16               # never speculate above this many running sequences
+  ngram_max: 3
+  ngram_min: 1
+  ngram_window: 4096
+  hysteresis: 0.03
+host: 127.0.0.1
+port: 8801
+api_key: null
+sampling:
+  temperature: 0.0                     # greedy makes n-gram acceptance easiest to measure
+  max_tokens: 512

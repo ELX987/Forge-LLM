@@ -1,0 +1,42 @@
+# Example chip descriptor (Plan Appendix B): NVIDIA GeForce RTX 4090 24 GB, DATASHEET values only (provenance: vendor).
+# Rounded public figures (dense, FP32 accumulate); verify against the vendor material. Consumer parts are often power /
+# clock limited well below the headline numbers, which is exactly why `forge probe` measurements override these.
+# FP8 tensor cores exist on sm_89 (usable via torch._scaled_mm); no block-scaled FP4.
+id: rtx4090-24g-datasheet
+fingerprint: ""
+vendor: nvidia
+family: ada
+name: NVIDIA GeForce RTX 4090
+sm: 89
+compute_capability: "8.9"
+compute_units: 128
+clock_mhz: 2520
+memory:
+  hbm_gb: 24                       # GDDR6X, not HBM; the schema field name is historical
+  hbm_bw_gbs: {datasheet: 1008, measured: null, src: vendor datasheet}
+  l2_mb: 72
+  transaction_bytes: 128
+  max_vector_load_bytes: 16
+on_chip:
+  smem_per_cu_kib: 99
+  smem_banks: 32
+  bank_width_bytes: 4
+  regs_per_cu: 65536
+  max_regs_per_thread: 255
+  async_copy: [cp_async]
+  cluster_launch: false
+matrix_units:
+  - {dtype: "fp16|bf16", atom: [16, 8, 16], peak_tflops: {datasheet: 165, measured: null}}
+  - {dtype: fp8_e4m3, peak_tflops: {datasheet: 330, measured: null}, block_scaled: false}
+  - {dtype: int8, peak_tflops: {datasheet: 330, measured: null}}
+sparsity: {two_four: true}
+launch_latency_us: null
+interconnect: {intra_gbs: null, inter_gbs: null, topology: pcie}
+derived:
+  ridge_flop_per_byte: {bf16: 164, fp8: 327}
+power_limit_w: 450
+tier: C
+probe_provenance:
+  memory: vendor
+  matrix_units: vendor
+  on_chip: vendor

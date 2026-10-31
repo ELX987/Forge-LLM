@@ -1,0 +1,64 @@
+# nvfp4-pilot (job type: train) -- precision-ladder rung R2: NVFP4 training PILOT.  *** EXPERIMENTAL / GATED ***
+#
+# Status (read before running):
+#   * The evidence for FP4 training is thin (Plan R11, paper P5). This template runs a small, clearly labelled
+#     pilot with the Plan TR-2 diagnostics. It is not meant to train a production model.
+#   * Everywhere except Blackwell-class GPUs (sm_100/103, and sm_120/121 only if `forge probe` confirms it) the FP4
+#     GEMMs are EMULATED by fake-quant (ADR 0005): numerics only, no speed-up -- expect it to be SLOWER than bf16.
+#   * Native FP4 kernels have never been run on hardware in this repo.
+#   * The job refuses to start unless precision.allow_unvalidated_fp4 is true (set below, on purpose).
+# Recipe (from the NVFP4 paper): 16-element blocks with E4M3 scales + FP32 tensor scale, stochastic rounding on
+# gradient operands, random Hadamard transform on the weight-gradient GEMM inputs, 2D 16x16 weight scaling, some
+# layers kept in BF16 and a final high-precision "healing" phase. Watch fp4/loss_gap, fp4/zero_grad_tile_frac,
+# fp4/scale_flush_frac and fp4/sr_bias in the training monitor; stop if the loss gap vs your R0 run leaves your band.
+name: nvfp4-pilot-0.5b
+seed: 1337
+model:
+  source: pretrained
+  path: Qwen/Qwen2.5-0.5B             # Apache-2.0; small enough to run an R0 comparison run cheaply
+  dtype: bfloat16
+data:
+  dataset: ["my-corpus"]
+  seq_len: 2048
+  val_sequences: 64
+micro_batch_size: 4
+grad_accum_steps: 8
+optim:
+  lr: 0.00003
+  weight_decay: 0.1
+  grad_clip: 1.0
+schedule:
+  name: wsd
+  warmup_steps: 100
+  decay_ratio: 0.2
+precision:
+  rung: R2
+  allow_unvalidated_fp4: true         # explicit acknowledgement that this is experimental
+  fp4_block: 16
+  fp4_stochastic_rounding: true
+  fp4_rht_wgrad: true
+  fp4_rht_block: 16
+  fp4_weight_2d: true
+  exempt_first_layers: 1
+  exempt_last_layers: 4               # roughly 15% of the layers stay in high precision for a 24-layer model
+  healing_fraction: 0.18              # last 18% of the steps run back in R0
+  healing_rung: R0
+  diagnostics_every: 25
+  loss_gap_every: 25
+  sr_bias_draws: 32
+  reference_loss_file: null           # optional: JSONL of (step, loss) from an R0 run for fp4/loss_gap_ref
+checkpoint:
+  every_steps: 250
+  pre_anneal: true                    # keeps a checkpoint right before healing so you can roll back
+  resume: auto
+eval:
+  every_steps: 100
+  in_high_precision: true
+stability:
+  on_nonfinite: rollback
+  on_spike: rollback
+  max_restarts: 2
+budget:
+  max_steps: 1500
+logging:
+  log_every: 10

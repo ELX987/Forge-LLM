@@ -1,0 +1,42 @@
+# Example chip descriptor (Plan Appendix B): NVIDIA H100 SXM 80 GB, DATASHEET values only (provenance: vendor).
+# Numbers are rounded from public vendor material and must be re-checked against the datasheet for your exact SKU
+# (SXM vs PCIe vs NVL differ). Every "measured" slot is left null: run `forge probe` on the real device to fill them;
+# measured values then override these. tier stays C until kernels pass tests_gpu on this chip (docs/runbooks/adding-a-chip-descriptor.md).
+id: h100-sxm-80g-datasheet
+fingerprint: ""
+vendor: nvidia
+family: hopper
+name: NVIDIA H100 SXM 80GB
+sm: 90
+compute_capability: "9.0"
+compute_units: 132
+clock_mhz: 1755
+memory:
+  hbm_gb: 80
+  hbm_bw_gbs: {datasheet: 3350, measured: null, src: vendor datasheet}
+  l2_mb: 50
+  transaction_bytes: 128
+  max_vector_load_bytes: 16
+on_chip:
+  smem_per_cu_kib: 227
+  smem_banks: 32
+  bank_width_bytes: 4
+  regs_per_cu: 65536
+  max_regs_per_thread: 255
+  async_copy: [cp_async, bulk_async]
+  cluster_launch: true
+matrix_units:
+  - {dtype: "fp16|bf16", atom: [16, 8, 16], peak_tflops: {datasheet: 989, measured: null}}
+  - {dtype: fp8_e4m3, peak_tflops: {datasheet: 1979, measured: null}, block_scaled: false}
+  - {dtype: int8, peak_tflops: {datasheet: 1979, measured: null}}
+sparsity: {two_four: true}
+launch_latency_us: null
+interconnect: {intra_gbs: 450, inter_gbs: 50, topology: switch}
+derived:
+  ridge_flop_per_byte: {bf16: 295, fp8: 591}   # peak FLOP/s divided by HBM bytes/s (datasheet-based)
+power_limit_w: 700
+tier: C
+probe_provenance:
+  memory: vendor
+  matrix_units: vendor
+  on_chip: vendor

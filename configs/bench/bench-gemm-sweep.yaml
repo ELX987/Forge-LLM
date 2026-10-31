@@ -1,0 +1,28 @@
+# bench-gemm-sweep (job type: bench) -- GEMM kernel sweep over batch size M at an 8B-class hidden size, with roofline
+# percentages, correctness check against the fp32 oracle and a dense 16-bit baseline for speed-ups.
+# Cases: w4a16_gemm, w8a16_gemm, fp8_gemm, fp8_act_quant, int8_w8a8_gemm, fp4_nvfp4_gemm, fp4_mxfp4_gemm,
+# fp4_mxfp4_w4a4_gemm. Empty `kernels` runs everything runnable on the device (capability-gated).
+# M = 1..16 is the bandwidth-bound decode regime, M >= 256 the compute-bound prefill regime.
+# The Plan KPIs (85% of HBM bandwidth, 3.2x vs BF16 at M<=16) are TARGETS: numbers from this job are measurements for
+# THIS device/driver/Triton only, and nothing is validated until you have run it. Set autotune: true for the slow
+# correctness-gated search (results are cached in FORGE_HOME/autotune per chip/shape/layout).
+# On a machine without CUDA the job refuses unless allow_cpu is true, and CPU numbers are not kernel measurements.
+kernels: []
+dtypes: [bf16]                     # use fp16 on sm_70/sm_75 (no bf16)
+m_values: [1, 2, 4, 8, 16, 32, 64, 128, 256, 1024]
+n: 4096
+k: 4096
+group_size: 128
+warmup: 10
+repeats: 30                        # median and IQR are reported
+flush_l2: true                     # cold L2 for bandwidth-bound kernels
+check_correctness: true
+include_baseline: true
+measure_peaks: true                # measures copy bandwidth and matmul TFLOP/s for roofline percentages
+autotune: false
+autotune_repeats: 15
+autotune_max_candidates: 24
+device: 0
+seed: 0
+allow_cpu: false
+save_results: true

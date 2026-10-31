@@ -1,0 +1,24 @@
+# fp8-w8a8 (job type: compress) -- FP8 quantisation + FP8 KV, gated by G-FP8.
+# Job wrapper around the recipe in configs/recipes/fp8-w8a8.yaml (read that file's header for stage-by-stage notes).
+# `model` is the model to compress: a registered model dir, an HF repo id or an artifact digest. Gated repos need
+# HF_TOKEN. `chip`: id of a probed chip descriptor (Hardware -> Probe) or null for the portable layout.
+# The `licence` / `distill_allowed` fields feed the licence gate; set them from the model card you actually reviewed.
+# Output: an artifact in the content-addressed store with lineage (parent, recipe hash, calibration hash) and the gate
+# verdict recorded. A failing gate marks the job failed AFTER the artifact is registered (fail_on_gate).
+# Not validated on real models or hardware.
+name: llama-8b-fp8
+model: meta-llama/Llama-3.1-8B-Instruct
+model_source: auto
+recipe_path: configs/recipes/fp8-w8a8.yaml
+output_name: llama-8b-fp8
+dtype: bfloat16
+device: auto
+seed: 0
+chip: null
+licence: llama-3.1
+distill_allowed: null
+params_b: 8.0
+use_cache: true
+use_store: true
+persist_intermediate: true
+fail_on_gate: true

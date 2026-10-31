@@ -1,0 +1,34 @@
+# tiny-lora-smoke (job type: finetune) -- CPU-only smoke test of the LoRA path on the built-in TINY model.
+# Uses configs/dataset/sample-sft.jsonl. Loss values say nothing about quality; this checks the plumbing only.
+name: tiny-lora-smoke
+method: lora
+model:
+  source: tiny
+  tokenizer: byte
+lora:
+  r: 4
+  alpha: 8
+  target_modules: [q_proj, v_proj]
+data:
+  train_files: ["configs/dataset/sample-sft.jsonl"]   # relative to the repo root; use an absolute path elsewhere
+  val_fraction: 0.1
+  template: chatml
+  max_seq_len: 128
+micro_batch_size: 2
+grad_accum_steps: 1
+optim:
+  lr: 0.003
+schedule:
+  name: constant
+  warmup_steps: 2
+parallel:
+  device: cpu
+checkpoint:
+  every_steps: 0
+eval:
+  every_steps: 10
+  num_batches: 2
+budget:
+  max_steps: 20
+logging:
+  log_every: 5

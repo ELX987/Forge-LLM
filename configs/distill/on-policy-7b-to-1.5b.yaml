@@ -1,0 +1,53 @@
+# on-policy distillation (job type: distill) -- the STUDENT samples completions, the TEACHER scores them live.
+# Slower per step than offline (a teacher forward every step, plus generation) but trains on the student's own
+# distribution, which reduces exposure bias. Same licence gate as the offline template (Plan TR-8).
+# Diversity monitoring watches for collapse of generated data (distinct-n / self-BLEU). Not validated on hardware.
+name: onpolicy-qwen7b-to-1.5b
+mode: on_policy
+model:
+  source: pretrained
+  path: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: bfloat16
+teacher:
+  path: Qwen/Qwen2.5-7B-Instruct
+  name: Qwen2.5-7B-Instruct
+  licence: apache-2.0
+  dtype: bfloat16
+loss:
+  kind: reverse_kl                    # mode-seeking; a common choice for on-policy distillation
+  temperature: 1.0
+  alpha: 1.0
+cache:
+  use_cache: false                    # no cache: the teacher scores fresh student samples each step
+on_policy:
+  prompts:
+    files: ["datasets/prompts.jsonl"] # jsonl with a `prompt` field (or a `messages` list)
+    field: prompt
+    max_prompt_tokens: 512
+    use_chat_template: true
+    template: chatml
+  generation:
+    max_new_tokens: 128
+    temperature: 1.0
+    top_p: 1.0
+  prompts_per_step: 2
+  log_samples_every: 50
+diversity:
+  enabled: true
+  min_distinct_n: 0.2
+micro_batch_size: 2
+grad_accum_steps: 8
+activation_checkpointing: true
+optim:
+  lr: 0.00001
+  weight_decay: 0.0
+schedule:
+  name: cosine
+  warmup_steps: 20
+precision:
+  rung: R0
+checkpoint:
+  every_steps: 200
+  resume: auto
+budget:
+  max_steps: 1000

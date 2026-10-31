@@ -1,0 +1,29 @@
+# dataset-jsonl (job type: dataset_ingest) -- tokenise a JSONL text corpus into packed token shards.
+# This template ingests the bundled 40-sentence sample corpus with the built-in byte-level tokenizer so the tiny
+# CPU smoke runs (configs/train/tiny-smoke.yaml) work out of the box. The dataset is named `tiny-corpus`, which is
+# what the smoke template refers to. Relative paths resolve against the server's working directory (the repo root
+# when started with scripts/run_server.sh); use absolute paths otherwise.
+#
+# For real data: point `sources` at your files (jsonl / txt / parquet / directory / Hugging Face dataset), set
+# `tokenizer` to the SAME tokenizer as the model you will train (repo id or local path), keep dedup_exact on, and set
+# `licence`. Shards are ~256 MiB; the manifest (token counts, mixture, dedup report) is stored in the artifact store.
+name: tiny-corpus
+sources:
+  - kind: jsonl
+    path: configs/dataset/sample-corpus.jsonl
+    name: sample-corpus
+    text_field: text               # dotted paths allowed, e.g. "data.text"
+tokenizer: byte                    # 'byte' = built-in tokenizer for tests; use e.g. meta-llama/Llama-3.1-8B for real runs
+add_bos: false
+add_eos: true                      # EOS separates documents in packed data
+dtype: auto
+shard_size_mib: 256
+min_doc_tokens: 1
+dedup_exact: true
+dedup_minhash: false               # near-duplicate removal (MinHash-LSH); enable for web-scale text
+val_fraction: 0.1                  # held-out documents chosen by content hash (stable across re-ingests)
+licence: cc0-1.0                   # the sample corpus was written for this repository
+contamination:
+  eval_files: []                   # add evaluation files here to scan (and optionally drop) overlapping n-grams
+  ngram: 13
+  action: report

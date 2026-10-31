@@ -1,0 +1,41 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# node (optional tooling)
+node_modules/
+
+# forge runtime state
+.forge/
+runs/
+models/
+checkpoints/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.npy
+!forge/**/fixtures/*.npy
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# secrets
+.env
+*.token

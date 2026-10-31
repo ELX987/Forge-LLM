@@ -1,0 +1,42 @@
+# tiny-smoke (job type: train) -- CPU-only end-to-end smoke test.
+# Trains the built-in TINY test model (random init, byte-level tokenizer) for 30 steps on the bundled sample corpus.
+# Purpose: prove that ingest -> train -> metrics -> checkpoint -> export works on any machine in about a minute.
+# The loss values mean nothing about model quality; the model has only a few hundred thousand parameters.
+#
+# Prerequisite: ingest configs/dataset/sample-corpus.jsonl with configs/dataset/dataset-jsonl.yaml (name: tiny-corpus),
+# then put the resulting dataset id / manifest path in data.dataset below.
+name: tiny-smoke
+seed: 1337
+model:
+  source: tiny              # build the test model; no weights are downloaded
+  tokenizer: byte           # built-in byte-level tokenizer
+data:
+  dataset: ["tiny-corpus"]  # dataset id or manifest.json path produced by the dataset_ingest job
+  seq_len: 64
+  val_sequences: 4
+  num_workers: 0
+micro_batch_size: 2
+grad_accum_steps: 1
+optim:
+  lr: 0.003
+  weight_decay: 0.01
+  grad_clip: 1.0
+schedule:
+  name: cosine
+  warmup_steps: 5
+  min_lr_ratio: 0.1
+precision:
+  rung: R0                  # reference precision; on CPU the compute dtype resolves to float32
+parallel:
+  device: cpu               # force CPU even on a GPU host
+checkpoint:
+  every_steps: 15
+  keep_last: 2
+  resume: none
+eval:
+  every_steps: 10
+  num_batches: 2
+budget:
+  max_steps: 30
+logging:
+  log_every: 5

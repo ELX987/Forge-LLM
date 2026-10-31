@@ -1,0 +1,40 @@
+# Example chip descriptor (Plan Appendix B): NVIDIA A100 SXM 80 GB, DATASHEET values only (provenance: vendor).
+# Rounded public figures; verify against the vendor datasheet for your SKU. Measured slots are null until `forge probe`
+# runs on the device. No FP8 / FP4 matrix units on this generation: FP8 is weight-only via dequantisation (K1 path).
+id: a100-sxm-80g-datasheet
+fingerprint: ""
+vendor: nvidia
+family: ampere
+name: NVIDIA A100 SXM 80GB
+sm: 80
+compute_capability: "8.0"
+compute_units: 108
+clock_mhz: 1410
+memory:
+  hbm_gb: 80
+  hbm_bw_gbs: {datasheet: 2039, measured: null, src: vendor datasheet}
+  l2_mb: 40
+  transaction_bytes: 128
+  max_vector_load_bytes: 16
+on_chip:
+  smem_per_cu_kib: 163
+  smem_banks: 32
+  bank_width_bytes: 4
+  regs_per_cu: 65536
+  max_regs_per_thread: 255
+  async_copy: [cp_async]
+  cluster_launch: false
+matrix_units:
+  - {dtype: "fp16|bf16", atom: [16, 8, 16], peak_tflops: {datasheet: 312, measured: null}}
+  - {dtype: int8, peak_tflops: {datasheet: 624, measured: null}}
+sparsity: {two_four: true}
+launch_latency_us: null
+interconnect: {intra_gbs: 300, inter_gbs: 25, topology: switch}
+derived:
+  ridge_flop_per_byte: {bf16: 153}
+power_limit_w: 400
+tier: C
+probe_provenance:
+  memory: vendor
+  matrix_units: vendor
+  on_chip: vendor

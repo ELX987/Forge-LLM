@@ -1,0 +1,21 @@
+# tiny-smoke (job type: compress) -- CPU smoke test of the compression pipeline on the built-in tiny model.
+# Quantises a randomly initialised ~100k-parameter model with RTN int4 (recipe below, inline) and checks the pipeline end
+# to end: calibration, packing, the stage cache, artifact registration. Quality numbers are meaningless for a random
+# model; this proves the plumbing only. `model: tiny:0` builds the test model with seed 0 (no download).
+name: compress-tiny-smoke
+model: "tiny:0"
+model_source: tiny
+recipe:
+  recipe: tiny-rtn-int4
+  inputs:
+    calib: synthetic
+  stages:
+    - calibrate: {set: synthetic, n_seqs: 8, seq_len: 32}
+    - ptq: {method: rtn, format: int, bits: 4, group: 32, sym: true}
+    - pack: {layout: auto, target: null}
+    - eval: {suites: [distribution], builtin: true, n_seqs: 4, seq_len: 32}
+  seeds: [0]
+dtype: float32
+device: cpu
+seed: 0
+params_b: null

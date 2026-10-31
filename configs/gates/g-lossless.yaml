@@ -1,0 +1,25 @@
+# G-LOSSLESS - Plan 10.1 gate class for changes that must not alter model outputs:
+# paging, prefix caching, entropy coding, disaggregation, re-packing.
+# Thresholds are TARGET values (recalibrated at Gate G1), not validated constants.
+#
+# Context variable (EvalConfig.context):
+#   storage_transform: true   -> logits must be bitwise identical (storage-only transforms: entropy coding, re-pack)
+#                      false  -> serving features: documented floating-point nondeterminism is tolerated.
+# When storage_transform is unset the STRICTER threshold applies (and the verdict details say so).
+gate: G-LOSSLESS-v1
+status: TARGET
+title: Lossless transforms
+description: >
+  Outputs identical (bitwise for storage transforms; within documented floating-point nondeterminism for serving
+  features). Memory / latency are reported by the throughput suite but are not pass/fail here.
+applies_to: [paging, prefix_caching, entropy_coding, disaggregation, repack]
+parent: required
+ci_policy: conservative
+noninferiority: {margin_pts: 0.0, alpha: 0.05, fdr: benjamini_hochberg}
+metrics:
+  max_abs_logit_diff: {max: 0.0, applies_if: storage_transform, else_max: 0.01, description: "max |parent - candidate| over all logits"}
+  kl_p99: {max: 1.0e-6, applies_if: storage_transform, else_max: 1.0e-4}
+  top1_flip: {max: 0.0, applies_if: storage_transform, else_max: 0.001}
+noise_floor: from_parent_repeats(n=3)
+suites: [distribution]
+source: "Plan 10.1 gate classes"

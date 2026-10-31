@@ -1,0 +1,17 @@
+# Fleet manifest example (Plan Appendix C.4): one quantised base model, several role adapters/deltas, a shared
+# prompt prefix and a cascade to a larger model for hard cases.
+#
+# STATUS: the fleet runtime (Plan Phase 10, C-110..C-114: adapter/delta kernels, context manager, fleet scheduler)
+# is NOT implemented in this release. This file documents the intended manifest shape and is only schema-checked by
+# tests/test_configs_templates.py (required keys and types). Hashes below are placeholders, not real artifacts.
+fleet: support-triage-v3
+base: sha256:student8b_w4a16              # placeholder artifact reference
+roles:
+  planner:  {adapter: sha256:lora_planner,   prompt: p_planner.md,  budget_tokens: 32768, fold_at: 24576}
+  coder:    {adapter: sha256:lora_coder,     prompt: p_coder.md,    budget_tokens: 24576}
+  verifier: {delta: sha256:bitdelta_ver,     prompt: p_verifier.md, budget_tokens: 16384}
+shared_prefix: [global_system.md, tool_schemas.json]   # must come first in every prompt (prefix-cache friendly); linted
+cascade: {routine: student8b, hard: base70b_w4a16, router: rules_v2}
+speculation: {default: ngram, controller: load_aware, max_gamma: 5}
+eviction_policy: typed_v1
+scheduler: critical_path

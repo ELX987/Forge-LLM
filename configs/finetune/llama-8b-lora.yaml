@@ -1,0 +1,53 @@
+# llama-8b-lora (job type: finetune) -- LoRA supervised fine-tuning of an 8B instruct model on chat data.
+# Memory: bf16 base is ~16 GB plus activations; plan for 24-40 GB with activation checkpointing (on below). On a
+# 24 GB card use method: qlora (4-bit base) or a shorter max_seq_len. Check with the planner estimate first.
+# Gated model: accept the Llama licence on the Hugging Face Hub and export HF_TOKEN. Read the licence before use.
+# Not validated on hardware yet.
+name: llama-8b-lora-sft
+seed: 1337
+method: lora                         # full | lora | qlora
+model:
+  source: pretrained
+  path: meta-llama/Llama-3.1-8B-Instruct
+  dtype: bfloat16
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+data:
+  train_files: ["datasets/my-chat-sft.jsonl"]   # chat `messages` jsonl (shape: configs/dataset/sample-sft.jsonl)
+  val_fraction: 0.02
+  format: auto
+  template: llama3                   # chat template used to render messages
+  max_seq_len: 2048
+  train_on_prompt: false             # loss on assistant tokens only
+  packing: false
+micro_batch_size: 2
+grad_accum_steps: 8                  # effective batch of 16 sequences
+activation_checkpointing: true
+optim:
+  lr: 0.0002
+  weight_decay: 0.0
+  grad_clip: 1.0
+schedule:
+  name: cosine
+  warmup_steps: 20
+  min_lr_ratio: 0.0
+precision:
+  rung: R0
+checkpoint:
+  every_steps: 100
+  keep_last: 2
+  resume: auto
+eval:
+  every_steps: 50
+  num_batches: 16
+  early_stopping: false
+budget:
+  max_epochs: 2
+save_adapter: true                   # adapter_config.json + adapter weights
+save_merged: true                    # also export a merged full model, ready for compression / serving
+merged_dtype: bfloat16
+logging:
+  log_every: 5

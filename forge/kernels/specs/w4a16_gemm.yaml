@@ -1,0 +1,32 @@
+# Plan Appendix C.2 / chapter 6.4 K1: weight-only INT4 GEMM with in-kernel dequantisation.
+kernel: w4a16_gemm
+family: gemm
+op: "Y[M,N] = X[M,K] @ dequant(Wq[N,K])^T + bias"
+description: >-
+  Bandwidth-bound decode GEMM. Weights stored as int4 packed into int32 lanes in a chip-derived
+  layout (fragment-interleaved, Marlin-style) or the portable row layout consumed by the Triton kernel.
+dtypes: {x: bf16, w: int4, scale: bf16, acc: fp32, y: bf16}
+compute_dtype: bf16
+quant:
+  weight_bits: 4
+  group: [32, 64, 128, -1]
+  zero_point: optional
+  scale_apply: epilogue_if_per_column
+  weight_scaling: per_group
+shape_hints: {M: [1, 2, 4, 8, 16, 32, 64, 128], N: model_native, K: model_native}
+search:
+  tile_m: [16, 32, 64]
+  tile_n: [64, 128, 256]
+  tile_k: [64, 128]
+  stages: [2, 3, 4, 5]
+  warps: [4, 8]
+  split_k: [1, 2, 4, auto]
+fusion: {prologue: none, epilogue: [bias, residual, act_quant]}
+layout: {weights: fragment_interleaved_or_portable_row, scales: col_contig, align_bytes: 16}
+oracle: ref.w4a16_gemm_ref
+tolerance: {rel: 2.0e-3, abs: 1.0e-3, rel_norm: 2.0e-2, bitexact_int_paths: true}
+kpi: {bw_fraction_min: 0.85, speedup_vs_bf16_min: 3.2, at_M: [1, 16]}
+min_sm: 70
+notes:
+  - "Triton portable_row kernel: implemented; logic checked in the Triton CPU interpreter only, NOT compiled/benchmarked on a GPU."
+  - "KPIs are Plan TARGETS (C-043), not measurements."

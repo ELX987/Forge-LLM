@@ -1,0 +1,15 @@
+# lowrank (recipe) -- EXPERIMENTAL: whitened-SVD low-rank factorisation of linear layers with heterogeneous rank allocation
+# and optional healing steps. A layer is only factorised when rank r < m*n/(m+n) (otherwise it would move MORE bytes:
+# Plan K9 / paper P4); allow_above_breakeven overrides that. Single-source evidence in the papers; results should be
+# recorded in the claims ledger as supported/refuted.
+recipe: lowrank-whitened-svd
+inputs:
+  calib: builtin-mix
+stages:
+  - calibrate: {set: builtin-mix, n_seqs: 256, seq_len: 2048, stats: [hessian]}
+  - lowrank: {target_ratio: 0.7, rank_alloc: heterogeneous, whiten: true, min_rank: 16, heal_steps: 100, heal_lr: 0.0001}
+  - gate: {suite: g-struct, seeds: 3, stats: bootstrap_2000, suites: [distribution, mcq]}
+baselines: [w4a16-gptq-g128]
+budget: {gpu_hours: 8, max_wall_hours: 12}
+policy: {licence_check: true}
+seeds: [0]

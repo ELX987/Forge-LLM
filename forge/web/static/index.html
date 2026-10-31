@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Forge LLM</title>
+  <meta name="description" content="Forge LLM - train, fine-tune, compress, evaluate and serve language models.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%233159d6'/%3E%3Cpath d='M9 8h14v4h-9v3h7v4h-7v5H9z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/app.css">
+  <script>
+    // Apply the saved theme before first paint (no flash). localStorage may be blocked.
+    try { var t = JSON.parse(localStorage.getItem('forge.theme') || '"auto"'); if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t); } catch (e) {}
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#view">Skip to content</a>
+  <div class="app">
+    <aside class="sidebar" id="sidebar" aria-label="Primary">
+      <a class="brand" href="#/dashboard" aria-label="Forge LLM home">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--accent)"/><path d="M9 8h14v4h-9v3h7v4h-7v5H9z" fill="var(--accent-fg)"/></svg>
+        <span>Forge LLM</span>
+      </a>
+      <nav class="nav" id="nav">
+        <div class="nav-group">Overview</div>
+        <a href="#/dashboard" data-icon="grid">Dashboard</a>
+        <div class="nav-group">Assets</div>
+        <a href="#/models" data-icon="cube">Models</a>
+        <a href="#/datasets" data-icon="db">Datasets</a>
+        <a href="#/hardware" data-icon="chip">Hardware</a>
+        <div class="nav-group">Run</div>
+        <a href="#/jobs/new" data-icon="plus">New Job</a>
+        <a href="#/jobs" data-icon="list">Jobs</a>
+        <a href="#/finetune" data-icon="tune">Fine-tune</a>
+        <a href="#/recipes" data-icon="flow">Recipes</a>
+        <div class="nav-group">Serve</div>
+        <a href="#/inference" data-icon="chat">Inference</a>
+        <div class="nav-group">Analyse</div>
+        <a href="#/compare" data-icon="scale">Compare</a>
+        <a href="#/kernels" data-icon="bolt">Kernel Lab</a>
+        <a href="#/storage" data-icon="disk">Storage</a>
+        <a href="#/claims" data-icon="check">Claims Ledger</a>
+        <div class="nav-group">System</div>
+        <a href="#/settings" data-icon="gear">Settings</a>
+      </nav>
+    </aside>
+    <div class="scrim" id="scrim"></div>
+    <header class="app-header">
+      <button class="btn ghost icon menu-btn" id="menu-btn" aria-label="Toggle navigation" aria-controls="sidebar" aria-expanded="false"></button>
+      <span class="title" id="page-title">Forge LLM</span>
+      <span class="spacer"></span>
+      <span id="conn-status" class="badge dim" title="API connection">connecting...</span>
+      <button class="btn ghost icon" id="theme-btn" aria-label="Toggle colour theme" title="Toggle light / dark"></button>
+    </header>
+    <div class="banner-area" id="banners"></div>
+    <main class="main" id="view" tabindex="-1" aria-live="polite">
+      <noscript>Forge LLM needs JavaScript (vanilla ES modules, no build step, no external requests).</noscript>
+    </main>
+  </div>
+  <div id="toasts" aria-live="polite"></div>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

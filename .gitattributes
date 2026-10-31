@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.sh eol=lf
+*.pdf binary
+*.safetensors binary
+*.png binary
+*.npy binary

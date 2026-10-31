@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: "Run the GPU job on a self-hosted runner labelled [self-hosted, gpu]"
+        type: boolean
+        default: false
+      pytest_args:
+        description: "Extra pytest arguments for the GPU job (e.g. -k w4a16)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff
+      - run: python -m ruff check forge tests tests_gpu
+      - name: shell scripts are LF and shellcheck-clean
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          if grep -rIl $'\r' scripts docker --include='*.sh'; then echo "CRLF found in shell scripts"; exit 1; fi
+          shellcheck -x scripts/*.sh docker/entrypoint.sh
+      - name: front end has no remote URLs (ADR 0006)
+        run: |
+          if [ -d forge/web/static ]; then
+            if grep -rnE "(src|href)=[\"']https?://|@import +url\(https?://|from +[\"']https?://|import\(.https?://" forge/web/static; then
+              echo "remote URL in front end"; exit 1
+            fi
+          fi
+
+  cpu-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install CPU torch and Forge
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Unit tests (CPU only; tests_gpu auto-skips)
+        run: python -m pytest tests tests_gpu -q --timeout=300
+
+  docker-build:
+    # Build check only (no GPU needed to build, nothing is pushed or run).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f docker/Dockerfile.cuda -t forge-llm:ci .
+
+  gpu-tests:
+    # Manual only: needs a self-hosted runner with an NVIDIA GPU, driver and CUDA-enabled torch.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Environment
+        run: |
+          nvidia-smi
+          python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+      - name: Install
+        run: |
+          python3 -m pip install -e ".[gpu,serve,parquet,dev]"
+      - name: GPU tests + report
+        env:
+          REPORT_DIR: ${{ github.workspace }}/gpu_report
+        run: bash scripts/run_gpu_tests.sh ${{ inputs.pytest_args }}
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-report
+          path: gpu_report/

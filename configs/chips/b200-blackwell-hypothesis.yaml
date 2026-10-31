@@ -1,0 +1,45 @@
+# Example chip descriptor (Plan Appendix B): NVIDIA B200 (Blackwell, sm_100) -- A HYPOTHESIS, NOT A MEASUREMENT.
+# Vendor-claimed figures, rounded, dense (non-sparse) where applicable; re-check against the datasheet for your SKU.
+# The FP4 block-scaled matrix unit is listed because the vendor documents it, but per Plan HW-2 / ADR 0005 nothing is
+# enabled on the strength of this file: `forge probe` must confirm native block-scaled FP4 on the actual device and
+# the oracle comparison must pass (tests_gpu). Until then keep tier: C and treat the fp4 entry as `untested`.
+id: b200-datasheet-hypothesis
+fingerprint: ""
+vendor: nvidia
+family: blackwell
+name: NVIDIA B200
+sm: 100
+compute_capability: "10.0"
+compute_units: 148
+clock_mhz: null
+memory:
+  hbm_gb: 180
+  hbm_bw_gbs: {datasheet: 8000, measured: null, src: vendor datasheet}
+  l2_mb: 126
+  transaction_bytes: 128
+  max_vector_load_bytes: 16
+on_chip:
+  smem_per_cu_kib: 227
+  smem_banks: 32
+  bank_width_bytes: 4
+  regs_per_cu: 65536
+  max_regs_per_thread: 255
+  async_copy: [cp_async, bulk_async]
+  cluster_launch: true
+matrix_units:
+  - {dtype: "fp16|bf16", atom: [16, 8, 16], peak_tflops: {datasheet: 2250, measured: null}}
+  - {dtype: fp8_e4m3, peak_tflops: {datasheet: 4500, measured: null}, block_scaled: false}
+  - dtype: fp4_e2m1
+    peak_tflops: {datasheet: 9000, measured: null}
+    block_scaled: {block: 16, scale: e4m3, scale_atom: [128, 4]}   # NVFP4; MXFP4 uses block 32 with E8M0 scales
+sparsity: {two_four: true}
+launch_latency_us: null
+interconnect: {intra_gbs: 900, inter_gbs: 50, topology: switch}
+derived:
+  ridge_flop_per_byte: {bf16: 281, fp8: 563, fp4: 1125}
+power_limit_w: 1000
+tier: C
+probe_provenance:
+  memory: vendor
+  matrix_units: untested
+  on_chip: vendor

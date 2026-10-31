@@ -1,0 +1,34 @@
+# Plan 6.4 K3: FP8 GEMM (per-tensor / per-token / per-block scaling) + fused activation quantisation.
+kernel: fp8_gemm
+family: gemm
+op: "Y[M,N] = (Xq[M,K] * sx) @ (Wq[N,K] * sw)^T + bias"
+description: >-
+  FP8 E4M3 W8A8 GEMM using tl.dot on fp8 operands (sm_89+), fp32 accumulation, scale application in the
+  epilogue (per-tensor / per-token x per-channel) or per K-block (1x128 activations, 128x128 weights).
+  Falls back to torch._scaled_mm, then to dequantise->bf16 matmul on chips without FP8 MMA.
+dtypes: {x: fp8_e4m3, w: fp8_e4m3, scale: fp32, acc: fp32, y: bf16}
+compute_dtype: fp8_e4m3
+quant:
+  weight_bits: 8
+  group: [128]
+  zero_point: none
+  scale_apply: epilogue
+  act_scaling: per_token
+  weight_scaling: per_channel
+shape_hints: {M: [1, 16, 64, 128, 256, 1024, 4096], N: model_native, K: model_native}
+search:
+  tile_m: [16, 32, 64, 128]
+  tile_n: [64, 128, 256]
+  tile_k: [64, 128]
+  stages: [3, 4, 5]
+  warps: [4, 8]
+  split_k: [1]
+fusion: {prologue: [rmsnorm_absmax_quant], epilogue: [bias, residual]}
+layout: {weights: row_major, scales: fp32_vectors, align_bytes: 128}
+oracle: ref.fp8_gemm_ref
+tolerance: {rel: 2.0e-3, abs: 1.0e-3, rel_norm: 2.0e-2, bitexact_int_paths: false}
+kpi: {tflops_fraction_min: 0.90, at_M: [4096]}
+min_sm: 89
+notes:
+  - "Native FP8 tl.dot path needs sm_89+/Triton >= 3.0; implemented, interpreter-checked where supported, NOT GPU validated."
+  - "Run-to-run bit reproducibility holds for split_k=1 (fixed reduction order)."

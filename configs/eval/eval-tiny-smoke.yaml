@@ -1,0 +1,25 @@
+# eval-tiny-smoke (job type: eval) -- CPU plumbing check of the evaluation harness with the distribution suite.
+# Point candidate and parent at the same small local HF-format directory (for example a model exported by the
+# tiny-smoke training job) to see the machinery run: with identical models KL is 0 and the flip rate is 0. This
+# says nothing about a real compression method; it only proves the harness runs end to end.
+name: eval-tiny-smoke
+candidate:
+  kind: path
+  ref: "models/tiny-smoke"          # a model directory exported by a tiny training job
+  backend: forge
+  dtype: float32
+  device: cpu
+parent:
+  kind: path
+  ref: "models/tiny-smoke"
+  backend: forge
+  dtype: float32
+  device: cpu
+tokenizer: byte
+suites:
+  - name: distribution
+    params: {}
+gate: null
+seeds: [0]
+n_bootstrap: 200
+noise_repeats: 0

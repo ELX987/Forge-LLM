@@ -1,0 +1,20 @@
+# w4a16-gptq-g128 (recipe, Plan Appendix C.1): 4-bit GPTQ weights, group size 128, activation order, FP8 KV cache,
+# then gate G-W4 against the BF16 parent. Run it with a `compress` job (recipe_path: configs/recipes/w4a16-gptq-g128.yaml,
+# model: your BF16 model) or a `recipe` job. The model being compressed is the job's `model`; it is not repeated here.
+# Calibration: `calib` names a registered set (builtin-mix | builtin-prose|code|math|chat | synthetic | file:<path> |
+# your own). Use text that resembles production prompts: calibration sensitivity is a documented risk (Plan R15).
+# `pack` derives the device layout (layout_id) for the target chip; `target: null` = local GPU / portable layout.
+# NOT validated on hardware: the Triton K1 kernel that consumes this layout is unproven (docs/KERNELS.md).
+recipe: w4a16-gptq-g128-fp8kv
+inputs:
+  calib: builtin-mix
+stages:
+  - calibrate: {set: builtin-mix, n_seqs: 512, seq_len: 2048, stats: [hessian, channel_scale]}
+  - ptq: {method: gptq, format: int, bits: 4, group: 128, act_order: true, damp: 0.01, sym: false}
+  - pack: {layout: auto, target: null}
+  - kv: {scheme: fp8_e4m3, residual_window: 128}
+  - gate: {suite: g-w4, seeds: 3, stats: bootstrap_2000, suites: [distribution, mcq]}
+baselines: [fp8_w8a8, fresh_student_8b]
+budget: {gpu_hours: 4, max_wall_hours: 6}
+policy: {licence_check: true}
+seeds: [0]

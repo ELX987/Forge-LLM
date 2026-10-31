@@ -1,0 +1,31 @@
+# serve-8b-w4a16 (job type: serve) -- OpenAI-compatible server for an 8B model quantised to W4A16 (GPTQ, group 128).
+# `model` is a model directory, HF repo id or Forge artifact reference. Produce the artifact first with
+# configs/compress/w4a16-gptq-g128.yaml (compress job). Packed W4A16 weights run through the Triton K1 kernel on CUDA,
+# otherwise through the dequantise-then-matmul reference path (correct, slow). K1 is NOT validated on hardware yet.
+# Fits a 24 GB GPU: ~5.5 GB of weights plus an FP8 KV cache. Use the Capacity simulator (Inference page) before
+# tuning max_num_seqs / max_model_len.
+model: llama-3.1-8b-instruct-w4a16      # replace with your quantised model id / dir / artifact hash
+served_model_name: llama-8b-w4a16
+dtype: auto                             # bf16 on sm>=80, fp16 on older GPUs
+quant: null                             # null = use whatever packed format the artifact contains
+device: auto
+kv_dtype: fp8_e4m3                      # halves KV bytes vs bf16; accuracy impact is workload-dependent -> run the long-context eval
+block_size: 16
+gpu_mem_util: 0.90
+max_model_len: 8192
+max_num_seqs: 32
+max_num_batched_tokens: 4096
+chunked_prefill: true
+prefix_caching: true
+host_kv_gb: 0                           # raise (e.g. 16) to enable the host-DRAM KV tier / swap preemption
+preemption_mode: recompute
+cuda_graphs: false                      # implemented, not validated on hardware: enable only after a smoke test
+speculation:
+  mode: "off"                          # quoted: bare off is a YAML boolean
+host: 127.0.0.1                         # reach it through an SSH tunnel; 0.0.0.0 exposes it publicly
+port: 8800
+api_key: null                           # set a key if the port is reachable by anyone else
+sampling:
+  temperature: 0.7
+  top_p: 0.95
+  max_tokens: 512

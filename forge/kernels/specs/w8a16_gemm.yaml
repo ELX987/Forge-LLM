@@ -1,0 +1,29 @@
+# Plan 6.4 K1 (8-bit variant): weight-only INT8 GEMM, per-channel or per-group scales.
+kernel: w8a16_gemm
+family: gemm
+op: "Y[M,N] = X[M,K] @ dequant(Wq[N,K])^T + bias"
+description: Weight-only INT8 GEMM with in-kernel dequantisation (symmetric int8, per-channel or grouped scales).
+dtypes: {x: bf16, w: int8, scale: bf16, acc: fp32, y: bf16}
+compute_dtype: bf16
+quant:
+  weight_bits: 8
+  group: [32, 64, 128, -1]
+  zero_point: none
+  scale_apply: epilogue_if_per_column
+  weight_scaling: per_group
+shape_hints: {M: [1, 2, 4, 8, 16, 32, 64, 128], N: model_native, K: model_native}
+search:
+  tile_m: [16, 32, 64]
+  tile_n: [64, 128, 256]
+  tile_k: [64, 128]
+  stages: [2, 3, 4]
+  warps: [4, 8]
+  split_k: [1, 2, 4, auto]
+fusion: {prologue: none, epilogue: [bias, residual]}
+layout: {weights: portable_row, scales: col_contig, align_bytes: 16}
+oracle: ref.w8a16_gemm_ref
+tolerance: {rel: 2.0e-3, abs: 1.0e-3, rel_norm: 2.0e-2, bitexact_int_paths: true}
+kpi: {bw_fraction_min: 0.85, speedup_vs_bf16_min: 1.8, at_M: [1, 16]}
+min_sm: 70
+notes:
+  - "Triton kernel implemented; interpreter-checked only, not GPU validated."

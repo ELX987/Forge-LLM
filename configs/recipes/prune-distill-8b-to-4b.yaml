@@ -1,0 +1,21 @@
+# prune-distill-8b-to-4b (recipe, Plan C-063): structured pruning of an 8B model towards ~4B, short built-in logit
+# recovery (or delegate to the distill job for the real run), then gate G-STRUCT.
+# IMPORTANT: a real 8B->4B result needs tens of billions of distillation tokens. The `distill` stage below uses the
+# built-in short healing (mode: builtin) which is a pilot, not the real run. For production set `mode: delegate` and a
+# `config` mapping (see configs/distill/*.yaml) so the full distillation trainer is used.
+# What to prune is controlled by the prune parameters: mlp_keep (fraction of MLP width), head_keep with head_mode
+# (GQA-aware group pruning), hidden_keep, depth_remove (whole blocks). Pick them so the parameter count lands near
+# your target; check the stage output for the resulting config. Licence gate (TR-8): the teacher must permit distillation.
+# Not validated on hardware or at 8B scale.
+recipe: prune-distill-8b-to-4b
+inputs:
+  calib: builtin-mix
+stages:
+  - calibrate: {set: builtin-mix, n_seqs: 1024, seq_len: 2048, stats: [channel_scale]}
+  - prune: {importance: activation, mlp_keep: 0.6, head_mode: group, head_keep: 0.75, depth_remove: 4, depth_mode: block_influence, protect_ends: true}
+  - distill: {mode: builtin, steps: 200, lr: 0.0001, temperature: 1.0, seq_len: 512, set: builtin-mix, licence_check: true}
+  - gate: {suite: g-struct, seeds: 3, stats: bootstrap_2000, suites: [distribution, mcq, longgen]}
+baselines: [fresh_student_4b]
+budget: {gpu_hours: 200, max_wall_hours: 72}
+policy: {licence_check: true}
+seeds: [0]

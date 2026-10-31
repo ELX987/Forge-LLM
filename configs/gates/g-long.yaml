@@ -1,0 +1,23 @@
+# G-LONG - eviction, sparse / latent / hybrid attention (Plan 10.1). TARGET thresholds.
+# multi_benchmark_evidence is set automatically by the harness when at least two independent long-context-sensitive suites
+# (longctx plus agentic or longgen) were run; multiturn_reuse_noninferior must be supplied (EvalConfig.extra_flags).
+gate: G-LONG-v1
+status: TARGET
+title: Long-context mechanisms
+description: >
+  Multi-hop and aggregation tasks non-inferior; multi-turn reuse non-inferior; no single-benchmark-only evidence
+  (needle-in-a-haystack saturates and hides failures, P3 F7).
+applies_to: [kv_eviction, sparse_attention, latent_attention, hybrid_attention]
+parent: required
+ci_policy: conservative
+noninferiority: {margin_pts: 3.0, alpha: 0.05, fdr: benjamini_hochberg}
+metrics:
+  longctx_multihop_diff_pts: {noninferior: true}
+  longctx_aggregation_diff_pts: {noninferior: true}
+  longctx_ratio: {min: 0.95, at_length: deployment}
+flags:
+  multiturn_reuse_noninferior: "SCBench-style multi-turn reuse is non-inferior (external evidence)"
+  multi_benchmark_evidence: "at least two independent benchmarks support the claim"
+noise_floor: from_parent_repeats(n=5)
+suites: [longctx, longgen, agentic]
+source: "Plan 10.1 gate table (G-LONG); P3 F4 and F7, P6 evidence ledger"

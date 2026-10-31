@@ -1,0 +1,40 @@
+{"text": "A graphics processing unit runs thousands of threads in parallel, which makes it well suited to matrix multiplication."}
+{"text": "Large language models spend most of their decoding time moving weights from memory to the compute units."}
+{"text": "Quantisation stores weights with fewer bits and rescales them on the fly, trading a little accuracy for a smaller footprint."}
+{"text": "A key value cache stores the attention keys and values of earlier tokens so they need not be recomputed."}
+{"text": "Continuous batching lets a server add new requests to a running batch as soon as other requests finish."}
+{"text": "Speculative decoding drafts several tokens cheaply and verifies them with the large model in one pass."}
+{"text": "The learning rate usually warms up for a few hundred steps and then decays along a cosine curve."}
+{"text": "Gradient clipping limits the norm of the gradient so a single bad batch cannot destroy the weights."}
+{"text": "Low rank adaptation freezes the base weights and trains two thin matrices whose product is added to a layer."}
+{"text": "A checkpoint records the weights and the optimiser state so that training can resume after an interruption."}
+{"text": "Distillation trains a small student model to match the output distribution of a larger teacher model."}
+{"text": "Pruning removes whole attention heads or hidden channels and then recovers quality with further training."}
+{"text": "Evaluation should compare a compressed model with its parent on the same prompts and report uncertainty."}
+{"text": "Content addressed storage names every blob by the hash of its bytes, so identical data is stored only once."}
+{"text": "A kernel is a small program that runs on the graphics processor and is launched over a grid of thread blocks."}
+{"text": "The roofline model says that performance is limited either by memory bandwidth or by peak arithmetic throughput."}
+{"text": "Tokens are the pieces of text a model reads; a tokenizer maps strings to integers and back."}
+{"text": "Mixed precision training keeps master weights in high precision while the heavy matrix products run in fewer bits."}
+{"text": "When a loss value suddenly spikes, a robust trainer rolls back to the last good checkpoint and lowers the learning rate."}
+{"text": "Reproducible experiments record seeds, library versions and hardware so that a result can be checked later."}
+{"text": "Shared memory is a small, fast scratchpad on each streaming multiprocessor that threads in a block can use together."}
+{"text": "Rotary position embeddings encode the position of a token by rotating pairs of query and key channels."}
+{"text": "Grouped query attention shares each key and value head among several query heads to shrink the cache."}
+{"text": "Stochastic rounding rounds up or down at random with probability proportional to the distance, so the mean is unbiased."}
+{"text": "A prefix cache reuses the key value blocks of a shared system prompt across many different requests."}
+{"text": "Weights packed as four bit integers must be unpacked and converted before the tensor cores can use them."}
+{"text": "A good smoke test is small enough to run in a minute and still touches every stage of the pipeline."}
+{"text": "Garbage collection in a content addressed store keeps everything reachable from a pinned artifact and removes the rest."}
+{"text": "The hidden size, the number of layers and the vocabulary size determine most of a model's parameter count."}
+{"text": "Batch size trades throughput against latency: larger batches use the hardware better but make each user wait longer."}
+{"text": "Calibration data for quantisation should resemble the text the deployed model will see."}
+{"text": "Noise between repeated evaluations sets the smallest difference that can be called a real improvement."}
+{"text": "Memory bandwidth, not arithmetic, usually limits single stream decoding on modern accelerators."}
+{"text": "A web interface can stream progress to the browser with server sent events over a plain HTTP connection."}
+{"text": "Fine tuning on a few thousand good examples can change the style of a model without teaching it new facts."}
+{"text": "Long context evaluation inserts a fact deep in a long document and asks the model to retrieve it later."}
+{"text": "Each rented GPU hour costs money, so cheap validation steps should run before the expensive ones."}
+{"text": "Hadamard rotations spread outliers across channels, which can make low bit quantisation easier."}
+{"text": "Sparse attention lets each query attend to a small selected subset of earlier tokens instead of all of them."}
+{"text": "The best configuration file is short, commented and validated against a schema before a job starts."}

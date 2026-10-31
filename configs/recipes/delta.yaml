@@ -1,0 +1,15 @@
+# delta (recipe) -- EXPERIMENTAL: store a fine-tuned model as a compressed delta against its base (BitDelta-style 1-bit sign
+# + scale, or a low-rank delta). Memory then scales with deltas rather than full models (multi-tenant / fleet use, Plan
+# C-111). Run it as a compress job whose `model` is the FINE-TUNED model; `base` below is the base model (path, repo or
+# digest). Quality must be gated per fine-tune. Serving kernels for deltas (segmented-batched adapters) are not
+# implemented in this release: this recipe produces and verifies the artifact only.
+recipe: delta-bitdelta
+inputs:
+  calib: builtin-mix
+stages:
+  - delta: {method: bitdelta, base: meta-llama/Llama-3.1-8B, calibrate_steps: 40, calib_set: builtin-mix}
+  - gate: {suite: g-lossless, seeds: 3, stats: bootstrap_2000, suites: [distribution]}
+baselines: []
+budget: {gpu_hours: 2, max_wall_hours: 3}
+policy: {licence_check: true}
+seeds: [0]

@@ -1,0 +1,35 @@
+# Plan 6.4 K2: block-scaled FP4 GEMM (NVFP4: 16 x E4M3 + fp32 tensor scale; MXFP4: 32 x E8M0).
+kernel: fp4_block_gemm
+family: gemm
+op: "Y[M,N] = dq(Xfp4[M,K]) @ dq(Wfp4[N,K])^T + bias ; dq = e2m1 * block_scale * tensor_scale"
+description: >-
+  Block-scaled FP4 GEMM. Native tl.dot_scaled (MXFP4) on Blackwell when the installed Triton supports it;
+  otherwise dequantise-to-bf16 Triton kernel (weight-only, keeps the storage win on older GPUs).
+  Scales are stored logical [rows, K/B] or padded+swizzled in 128x4 atoms.
+dtypes: {x: bf16_or_fp4, w: fp4_e2m1, scale: e4m3_or_e8m0, acc: fp32, y: bf16}
+compute_dtype: fp4_e2m1
+quant:
+  weight_bits: 4
+  group: [16, 32]
+  zero_point: none
+  scale_apply: prologue
+  act_scaling: block_16
+  weight_scaling: block_16
+shape_hints: {M: [1, 16, 128, 1024, 4096], N: model_native, K: model_native}
+search:
+  tile_m: [16, 32, 64, 128]
+  tile_n: [64, 128, 256]
+  tile_k: [64, 128, 256]
+  stages: [2, 3, 4]
+  warps: [4, 8]
+  split_k: [1]
+fusion: {prologue: [act_quant_fp4], epilogue: [bias, quantise_for_next_gemm]}
+layout: {weights: payload_u8_k_major, scales: swizzle_128x4, align_bytes: 16}
+oracle: ref.fp4_block_gemm_ref
+tolerance: {rel: 2.0e-3, abs: 1.0e-3, rel_norm: 2.0e-2, bitexact_int_paths: true}
+kpi: {tflops_fraction_min: 0.8, at_M: [4096]}
+min_sm: 70
+experimental: true
+notes:
+  - "Native block-scaled MMA is a hypothesis to be confirmed by the hardware probe (Plan HW-2); tl.dot_scaled usage is version-guarded and NOT validated."
+  - "Weight-only dequant kernel (any sm) and fused quantiser kernel are interpreter-checked only; the fused quantiser uses integer E4M3/E8M0 conversion (any sm)."

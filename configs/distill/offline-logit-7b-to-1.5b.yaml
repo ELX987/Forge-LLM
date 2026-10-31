@@ -1,0 +1,50 @@
+# offline-logit distillation (job type: distill) -- cache a teacher's top-k distribution once, train the student on it.
+# Teacher Qwen2.5-7B-Instruct (Apache-2.0) -> student Qwen2.5-1.5B. Both use the SAME tokenizer/vocabulary, which logit
+# distillation requires. The top-k cache is keyed by (teacher, data, k, ...) and reused across students (Plan 8.5).
+# LICENCE GATE (Plan TR-8): the job refuses unless the teacher licence is permissive or you attest distill_allowed.
+# Not validated on hardware yet. Needs ~16 GB for the teacher in bf16 while the cache is built, then only the student.
+name: distill-qwen7b-to-1.5b
+mode: offline_logit
+model:                                # the STUDENT
+  source: pretrained
+  path: Qwen/Qwen2.5-1.5B
+  dtype: bfloat16
+teacher:
+  path: Qwen/Qwen2.5-7B-Instruct
+  name: Qwen2.5-7B-Instruct
+  licence: apache-2.0
+  dtype: bfloat16
+loss:
+  kind: forward_kl                    # forward_kl | reverse_kl | jsd | ce_only
+  temperature: 1.0
+  alpha: 1.0                          # weight of the distillation term; (1 - alpha) goes to hard-label CE
+  tail_mode: bin                      # residual mass outside the top-k is one extra category
+cache:
+  use_cache: true
+  k: 32
+  lp_quant: fp16
+  teacher_batch_size: 4
+  min_coverage_warn: 0.9              # warn if the top-k covers < 90% of the teacher mass on average
+data_kind: tokens
+token_data:
+  dataset: ["my-corpus"]
+  seq_len: 2048
+  val_sequences: 64
+micro_batch_size: 4
+grad_accum_steps: 8
+optim:
+  lr: 0.00002
+  weight_decay: 0.0
+schedule:
+  name: cosine
+  warmup_steps: 100
+precision:
+  rung: R0
+checkpoint:
+  every_steps: 500
+  resume: auto
+eval:
+  every_steps: 250
+budget:
+  max_steps: 3000
+eval_teacher_agreement: true

@@ -1,0 +1,57 @@
+# Forge LLM - docker compose (needs Docker + NVIDIA Container Toolkit on a Linux host).
+#   export FORGE_API_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
+#   docker compose -f docker/docker-compose.yml up --build
+# The UI binds to 127.0.0.1 on the host by default; use an SSH tunnel to reach it remotely.
+# Unvalidated: written without access to an NVIDIA machine.
+services:
+  forge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cuda
+      args:
+        BASE_IMAGE: ${FORGE_BASE_IMAGE:-pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime}
+    image: forge-llm:cuda
+    ports:
+      - "${FORGE_BIND:-127.0.0.1}:${FORGE_API_PORT:-8765}:8765"
+      # Deployment (serve job) ports; adjust to FORGE_SERVE_BASE_PORT.
+      - "${FORGE_BIND:-127.0.0.1}:8800-8810:8800-8810"
+    environment:
+      FORGE_API_TOKEN: ${FORGE_API_TOKEN:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      FORGE_MAX_CONCURRENT_JOBS: ${FORGE_MAX_CONCURRENT_JOBS:-1}
+    volumes:
+      - forge-data:/data
+    shm_size: "16gb"
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  gpu-tests:
+    image: forge-llm:cuda
+    profiles: ["test"]
+    command: ["bash", "scripts/run_gpu_tests.sh"]
+    working_dir: /opt/forge
+    environment:
+      REPORT_DIR: /data/gpu_report
+    volumes:
+      - forge-data:/data
+    shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  forge-data:

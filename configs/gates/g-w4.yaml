@@ -1,0 +1,22 @@
+# G-W4 - W4A16 / MXFP4 / NVFP4 PTQ and 4-bit KV (Plan Appendix C.3, thresholds labelled TARGET).
+gate: G-W4-v2
+status: TARGET
+title: 4-bit weights / KV
+description: >
+  Suite >= 98% of parent (>= 30B) / 96% (below 30B), long-context >= 95% at the deployment length, long-generation
+  reasoning >= 95%, KL p99 <= 0.05, flip <= 4%, safety deltas within noise.
+applies_to: [w4a16, mxfp4, nvfp4_ptq, kv4]
+parent: required
+ci_policy: conservative
+noninferiority: {margin_pts: 2.0, alpha: 0.05, fdr: benjamini_hochberg}
+metrics:
+  kl_p99: {max: 0.05}
+  top1_flip: {max: 0.04}
+  suite_score_ratio: {min: 0.98, applies_if: "params_b >= 30", else_min: 0.96}
+  suite_score_diff_pts: {noninferior: true, description: "non-inferior within margin_pts (C.3)"}
+  longctx_ratio: {min: 0.95, at_length: deployment}
+  longgen_reasoning: {min: 0.95}
+  safety_delta: {within_noise: true}
+noise_floor: from_parent_repeats(n=5)
+suites: [distribution, mcq, longctx, longgen, safety]
+source: "Plan Appendix C.3 and 10.1; P1 section 19 validation step"

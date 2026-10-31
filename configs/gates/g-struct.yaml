@@ -1,0 +1,23 @@
+# G-STRUCT - pruned / distilled students (Plan 10.1). TARGET thresholds.
+# The "declared floor" is set per recipe; override with EvalConfig.gate_overrides, e.g.
+#   gate_overrides: {metrics: {suite_score_ratio: {min: 0.92}}}
+gate: G-STRUCT-v1
+status: TARGET
+title: Pruned / distilled students
+description: >
+  Meets the size target; suite score at or above the declared floor versus the parent AND beats the fresh-student baseline
+  arm at equal footprint; safety / bias deltas reported; licence gate passed.
+applies_to: [prune, distill, depth_prune, expert_prune]
+parent: required
+ci_policy: conservative
+noninferiority: {margin_pts: 2.0, alpha: 0.05, fdr: benjamini_hochberg}
+metrics:
+  suite_score_ratio: {min: 0.90, description: "declared floor vs the parent (placeholder 0.90, set per recipe)"}
+  safety_delta: {required: false, description: "reported, not gated (the UI must show it)"}
+flags:
+  size_target_met: "artifact bytes / params meet the recipe's size target"
+  beats_fresh_student_arm: "beats the distil-into-a-fresh-smaller-student baseline at equal footprint (P4 F8)"
+  licence_gate_passed: "teacher / parent licence permits distillation (LicenceBlocked otherwise)"
+noise_floor: from_parent_repeats(n=5)
+suites: [distribution, mcq, longctx, longgen, safety]
+source: "Plan 10.1 gate table (G-STRUCT); P2 F3-F4, P4 F8"

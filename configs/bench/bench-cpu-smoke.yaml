@@ -1,0 +1,17 @@
+# bench-cpu-smoke (job type: bench) -- run the REFERENCE paths on CPU to check the benchmark plumbing on a machine
+# without an NVIDIA GPU. These are NOT kernel measurements (no Triton kernel runs), only a test of the harness.
+kernels: [w4a16_gemm]
+dtypes: [bf16]
+m_values: [1, 4]
+n: 256
+k: 256
+group_size: 128
+warmup: 1
+repeats: 3
+flush_l2: false
+check_correctness: true
+include_baseline: true
+measure_peaks: false
+autotune: false
+allow_cpu: true
+save_results: false
