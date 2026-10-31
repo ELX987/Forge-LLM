@@ -29,7 +29,14 @@ step forge_doctor --allow-fail --timeout 300 -- "$PY" -m forge.cli doctor
 step forge_probe --allow-fail --timeout 900 -- "$PY" -m forge.cli probe --quick
 
 # Also run the CPU suite on the GPU host: catches environment (version) problems early.
-step cpu_tests --allow-fail --timeout 1800 -- "$PY" -m pytest tests -q --no-header -p no:cacheprovider \
+# Same watchdog for the CPU suite; the signal method interrupts a deadlocked main thread, fails that one test
+# with a traceback and carries on with the rest.
+CPU_TIMEOUT_ARGS=()
+if "$PY" -c "import pytest_timeout" 2>/dev/null && [ "${FORGE_TEST_TIMEOUT:-240}" != "0" ]; then
+    CPU_TIMEOUT_ARGS=("--timeout=${FORGE_CPU_TEST_TIMEOUT:-180}" "--timeout-method=signal")
+fi
+step cpu_tests --allow-fail --timeout 3600 -- "$PY" -m pytest tests -v --no-header -p no:cacheprovider \
+    "${CPU_TIMEOUT_ARGS[@]}" -o faulthandler_timeout=170 \
     "--junitxml=$REPORT_DIR/junit_cpu.xml"
 
 # GPU suite: do not stop at first failure, collect everything. -rs shows skip reasons.
