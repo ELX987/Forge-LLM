@@ -243,8 +243,8 @@ def apply_r2(model: nn.Module, seed: int = 0) -> None:
     for bi, blk in enumerate(r["blocks"]):
         a = blk.self_attn
         d = int(getattr(a, "head_dim"))
-        q2 = random_orthogonal_hadamard(d, seed + 7919 * (bi + 1), dtype=torch.float64)
         v, o = a.v_proj, a.o_proj
+        q2 = random_orthogonal_hadamard(d, seed + 7919 * (bi + 1), device=v.weight.device, dtype=torch.float64)
         with torch.no_grad():
             wv = v.weight.double().reshape(-1, d, v.weight.shape[1])  # [kvh, D, H]
             v.weight.copy_((q2.t().unsqueeze(0) @ wv).reshape(v.weight.shape).to(v.weight.dtype))
@@ -363,7 +363,7 @@ def rotate_model(model: nn.Module, cfg: RotationConfig | dict | None = None, tok
         apply_r2(model, cfg.seed)
     if cfg.online_hadamard_down:
         report["online_hadamard_layers"] = add_online_hadamard(model, cfg.online_block)
-    report["orthogonality_error"] = float((q.double().t() @ q.double() - torch.eye(h, dtype=torch.float64)).abs().max())
+    report["orthogonality_error"] = float((q.double().t() @ q.double() - torch.eye(h, dtype=torch.float64, device=q.device)).abs().max())
     return report
 
 

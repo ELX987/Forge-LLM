@@ -65,6 +65,17 @@ def _cur(inputs: dict[str, Any], ctx: RunContext, key: str = "model") -> tuple[s
     return d, state.resolve_model(d, ctx)
 
 
+def _placement(inputs: dict[str, Any]) -> dict[str, Any]:
+    """``device``/``dtype`` kwargs of the job's current model, so reference models (base/teacher) resolved from disk land on the same device
+    instead of ``resolve_model``'s "cuda if available" default."""
+    lm = state.get_live(inputs.get("model")) if isinstance(inputs.get("model"), str) else None
+    try:
+        p = next(lm.model.parameters())
+    except (AttributeError, StopIteration):
+        return {}
+    return {"device": str(p.device), "dtype": str(p.dtype).replace("torch.", "")}
+
+
 def _fork(lm: state.LiveModel) -> nn.Module:
     """Model to modify: a deep copy below the copy threshold, else the live object itself."""
     if model_nbytes(lm.model) < state.options().get("copy_below_bytes", 2 << 30):
@@ -378,7 +389,7 @@ def stage_delta(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContext)
     ft_digest = p.finetuned or inputs.get("model")
     base_digest = p.base or inputs.get("base_model")
     ft = state.require_live(ft_digest, ctx, "fine-tuned model")
-    base = state.require_live(base_digest, ctx, "base model")
+    base = state.require_live(base_digest, ctx, "base model", **_placement({"model": ft_digest}))
     if ft_digest == base_digest:
         raise ConfigError("delta stage: base and fine-tuned model are the same artifact (set params.base / params.finetuned)")
     sd_b, sd_f = base.model.state_dict(), ft.model.state_dict()
@@ -424,12 +435,12 @@ def _parent_for(inputs: dict[str, Any], ctx: RunContext, explicit: str | None) -
     base = inputs.get("base_model")
     if explicit:
         try:
-            return state.resolve_model(explicit, ctx)
+            return state.resolve_model(explicit, ctx, **_placement(inputs))
         except NotFound:
             ctx.log(f"parent '{explicit}' is not a known artifact; using the job's input model as the reference", "warning")
     if base is None or base == inputs.get("model"):
         return None
-    return state.resolve_model(base, ctx)
+    return state.resolve_model(base, ctx, **_placement(inputs))
 
 
 def _eval_report_dict(rep: Any) -> dict[str, Any]:
@@ -615,7 +626,7 @@ def stage_distill(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContex
     t_digest = p.teacher or inputs.get("teacher") or inputs.get("base_model")
     if t_digest is None or t_digest == parent:
         raise ConfigError("distill needs a teacher: set params.teacher, run prune/lowrank before it, or provide a different base model")
-    tlm = state.resolve_model(t_digest, ctx)
+    tlm = state.resolve_model(t_digest, ctx, **_placement(inputs))
     _teacher_allowed(tlm.meta, _meta(inputs).get("policy", {}), p.licence_check)
     if p.mode == "builtin":
         from forge.compress.quickeval import distill_kl

@@ -25,12 +25,13 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
+
 import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 
 from forge.core.errors import ConfigError
 from forge.formats.fp8 import FP8_MAX, from_fp8, round_fp8, to_fp8
-from forge.formats.int_quant import dequantize_int, quantize_int
+from forge.formats.int_quant import _div_const, dequantize_int, quantize_int
 from forge.formats.packing import pack_bits, unpack_bits
 
 
@@ -61,7 +62,7 @@ def dequantize_kv_fp8(x8: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype 
 
 
 def quantize_kv_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    s = (x.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-12)
+    s = _div_const(x.float().abs().amax(dim=-1, keepdim=True), 127.0).clamp(min=1e-12)
     return torch.round(x.float() / s).clamp(-128, 127).to(torch.int8), s
 
 

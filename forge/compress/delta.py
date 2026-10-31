@@ -131,7 +131,7 @@ def compute_delta(base_sd: dict[str, torch.Tensor], ft_sd: dict[str, torch.Tenso
             raise ConfigError(f"shape mismatch for {k}: {tuple(wb.shape)} vs {tuple(wf.shape)}")
         if not wb.is_floating_point():
             continue
-        diff = wf.float() - wb.float()
+        diff = wf.float() - wb.to(wf.device).float()
         if not bool(diff.abs().max() > 0):
             continue
         if _is_target(k, wb):

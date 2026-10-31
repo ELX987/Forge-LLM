@@ -312,3 +312,27 @@ def test_ptq_config_combination_validation():
     with pytest.raises(ValueError):
         PTQConfig(mixed_precision=True, format="mxfp4")
     assert PTQConfig(method="gptq", format="nvfp4").format == "nvfp4"
+
+
+def test_delta_stage_resolves_base_on_the_finetuned_models_device(tmp_path, monkeypatch):
+    """The base model must be loaded on the fine-tune's device/dtype, not resolve_model's 'cuda if available' default."""
+    from forge.compress import state, stages
+    from forge.models.loader import save_model
+    from forge.models.tiny import build_tiny_model
+
+    bdir = save_model(build_tiny_model(0), tmp_path / "base")
+    seen = {}
+    orig = state.resolve_model
+
+    def spy(digest, ctx=None, *, dtype=None, device=None):
+        seen.update(dtype=dtype, device=device)
+        return orig(digest, ctx, dtype=dtype, device=device)
+
+    monkeypatch.setattr(state, "resolve_model", spy)
+    ft = build_tiny_model(0)
+    state.put_live("ft-test-digest", ft, None)
+    try:
+        state.require_live(str(bdir), None, "base", **stages._placement({"model": "ft-test-digest"}))
+    finally:
+        pass
+    assert seen["device"] == "cpu" and seen["dtype"] == "float32"

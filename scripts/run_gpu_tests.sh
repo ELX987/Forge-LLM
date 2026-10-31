@@ -29,7 +29,7 @@ step forge_doctor --allow-fail --timeout 300 -- "$PY" -m forge.cli doctor
 step forge_probe --allow-fail --timeout 900 -- "$PY" -m forge.cli probe --quick
 
 # Also run the CPU suite on the GPU host: catches environment (version) problems early.
-step cpu_tests --allow-fail --timeout 1800 -- "$PY" -m pytest tests -q -x --no-header -p no:cacheprovider \
+step cpu_tests --allow-fail --timeout 1800 -- "$PY" -m pytest tests -q --no-header -p no:cacheprovider \
     "--junitxml=$REPORT_DIR/junit_cpu.xml"
 
 # GPU suite: do not stop at first failure, collect everything. -rs shows skip reasons.

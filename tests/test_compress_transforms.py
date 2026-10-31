@@ -342,3 +342,44 @@ def test_lossless_quantized_model_reports_honest_ratio():
 def test_fallback_codec_roundtrip(dt):
     t = (torch.randn(257, 13) * 3).to(dt) if dt.is_floating_point else torch.randint(0, 100, (257, 13)).to(dt)
     assert LL._roundtrip_equal(LL._fb_decode(LL._fb_encode(t)), t)
+
+
+# ---------------------------------------------------------------------------------------------- device-handling regressions (GPU report 2)
+def test_random_orthogonal_hadamard_honours_device_meta():
+    from forge.compress.rotation import random_orthogonal_hadamard
+
+    q = random_orthogonal_hadamard(16, 0, device="meta", dtype=torch.float64)
+    assert q.device.type == "meta" and q.dtype == torch.float64
+
+
+def test_apply_r2_builds_rotation_on_weight_device(monkeypatch):
+    """apply_r2 used to build q2 on the default device (CPU) while the weights were on CUDA -> bmm device mismatch."""
+    import forge.compress.rotation as rot
+
+    seen = []
+    orig = rot.random_orthogonal_hadamard
+
+    def spy(n, seed=0, device=None, dtype=torch.float32):
+        seen.append(device)
+        return orig(n, seed, device=device, dtype=dtype)
+
+    monkeypatch.setattr(rot, "random_orthogonal_hadamard", spy)
+    from forge.models.tiny import build_tiny_model
+
+    m = build_tiny_model(0)
+    rot.fuse_norms(m, False)
+    rot.apply_r2(m, 0)
+    assert seen and all(torch.device(d) == next(m.parameters()).device for d in seen)
+
+
+def test_int_scale_uses_true_division_and_matches_reference():
+    """scale = amax / qmax must be a true IEEE division (CUDA rewrites tensor / python-scalar as a reciprocal multiply)."""
+    from forge.formats.int_quant import _div_const, compute_qparams
+
+    x = torch.randn(64, 4, 32)
+    for bits in (4, 8):
+        s, _ = compute_qparams(x, bits, True)
+        ref = x.abs().amax(-1, keepdim=True) / float((1 << (bits - 1)) - 1)
+        assert torch.equal(s, ref)
+    a = torch.rand(1000) * 5
+    assert torch.equal(_div_const(a, 7.0), a / 7.0)

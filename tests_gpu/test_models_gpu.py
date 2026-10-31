@@ -6,6 +6,7 @@ paths of the same module.  Kernel-backed paths are skipped when ``forge.kernels`
 from __future__ import annotations
 
 import copy
+import os
 
 import pytest
 import torch
@@ -21,12 +22,40 @@ def _cuda_model(dtype=torch.bfloat16, **ov):
     return m.to(device="cuda", dtype=dtype).eval()
 
 
+def _tf32_forced_by_env() -> bool:
+    """NVIDIA NGC PyTorch containers export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, which forces cuBLAS TF32 for fp32
+    matmuls regardless of ``torch.backends.cuda.matmul.allow_tf32`` / ``set_float32_matmul_precision`` (it cannot be
+    undone in-process).  TF32 has a 10-bit mantissa (~1e-3 relative per matmul), so fp32 logits then differ from CPU by
+    a few 1e-4 of the max logit - that is the host configuration, not a model bug."""
+    if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "") == "1":
+        return True
+    # measure instead of trusting env alone: true fp32 matmul error vs an fp64 reference is ~1e-6, TF32 is ~1e-3
+    g = torch.Generator().manual_seed(0)
+    a, b = torch.randn(128, 256, generator=g), torch.randn(256, 128, generator=g)
+    ref = a.double() @ b.double()
+    got = (a.cuda() @ b.cuda()).double().cpu()
+    return bool(((got - ref).abs().max() / ref.abs().max()) > 1e-4)
+
+
 def _tol(dtype):
-    return 3e-2 if dtype in (torch.bfloat16, torch.float16) else 1e-4
+    if dtype in (torch.bfloat16, torch.float16):
+        return 3e-2
+    return 2e-3 if _tf32_forced_by_env() else 1e-4
+
+
+@pytest.fixture
+def highest_fp32_precision():
+    """Pin true-fp32 matmuls for the test (forge itself never changes global matmul precision) and restore after."""
+    prev = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_forward_matches_cpu_fp32(dtype):
+def test_forward_matches_cpu_fp32(dtype, highest_fp32_precision):
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         pytest.skip("bf16 unsupported on this GPU")
     ref_model = build_tiny_model().eval()

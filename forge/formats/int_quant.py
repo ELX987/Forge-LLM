@@ -41,6 +41,14 @@ def _grouped(w: torch.Tensor, group_size: int, dim: int) -> tuple[torch.Tensor, 
     return x.reshape(*x.shape[:-1], k // g, g), g
 
 
+def _div_const(x: torch.Tensor, d: float) -> torch.Tensor:
+    """``x / d`` as a true IEEE division on every device.
+
+    ``x / python_scalar`` is not device-invariant in PyTorch: the CUDA kernel rewrites it as ``x * (1/d)`` (CPU scalar fast path), which can differ
+    from the CPU result in the last ulp and therefore flip a rounding decision.  Dividing by a 0-dim tensor on ``x``'s device avoids that path."""
+    return x / torch.full((), float(d), dtype=x.dtype, device=x.device)
+
+
 def compute_qparams(
     xg: torch.Tensor, bits: int, sym: bool, clip_ratio: float | torch.Tensor = 1.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -49,13 +57,13 @@ def compute_qparams(
     maxq = (1 << bits) - 1
     if sym:
         amax = xg.abs().amax(dim=-1, keepdim=True) * clip_ratio
-        scale = amax / max((1 << (bits - 1)) - 1, 1)
+        scale = _div_const(amax, max((1 << (bits - 1)) - 1, 1))
         scale = torch.where(scale > 0, scale, torch.ones_like(scale))
         zero = torch.full_like(scale, float(1 << (bits - 1)))
     else:
         xmin = xg.amin(dim=-1, keepdim=True).clamp(max=0) * clip_ratio
         xmax = xg.amax(dim=-1, keepdim=True).clamp(min=0) * clip_ratio
-        scale = (xmax - xmin) / maxq
+        scale = _div_const(xmax - xmin, maxq)
         scale = torch.where(scale > 0, scale, torch.ones_like(scale))
         zero = torch.round(-xmin / scale).clamp(0, maxq)
     return scale, zero

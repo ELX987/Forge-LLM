@@ -20,6 +20,7 @@ Nothing here is a measurement: it only records what was run and what happened.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -152,6 +153,12 @@ def cmd_env(argv: list[str]) -> int:
 
         env["torch_cuda"] = torch.version.cuda
         env["cuda_available"] = bool(torch.cuda.is_available())
+        # numerics-relevant global state: explains fp32 CUDA-vs-CPU tolerance failures (TF32 can be forced by env)
+        env["fp32_matmul_precision"] = torch.get_float32_matmul_precision()
+        env["allow_tf32_matmul"] = bool(torch.backends.cuda.matmul.allow_tf32)
+        env["allow_tf32_cudnn"] = bool(torch.backends.cudnn.allow_tf32)
+        env["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "")
+        env["NVIDIA_TF32_OVERRIDE"] = os.environ.get("NVIDIA_TF32_OVERRIDE", "")
         if torch.cuda.is_available():
             env["devices"] = [
                 {
@@ -201,13 +208,19 @@ def cmd_bench_export(argv: list[str]) -> int:
     return 0
 
 
+def _suite_label(name: str) -> str:
+    """junit_cpu.xml -> 'CPU suite (tests/)'; junit_gpu.xml -> 'GPU suite (tests_gpu/)'."""
+    stem = name[len("junit_"):-len(".xml")] if name.startswith("junit_") and name.endswith(".xml") else name
+    return {"cpu": "CPU suite (tests/)", "gpu": "GPU suite (tests_gpu/)"}.get(stem, f"{stem} suite")
+
+
 def _parse_junit(path: Path) -> dict:
     try:
         root = ET.parse(path).getroot()
     except Exception as e:  # noqa: BLE001
-        return {"file": path.name, "error": repr(e)}
+        return {"file": path.name, "suite": _suite_label(path.name), "error": repr(e)}
     suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    out = {"file": path.name, "tests": 0, "failures": 0, "errors": 0, "skipped": 0, "time": 0.0, "failed": [], "skipped_reasons": {}}
+    out = {"file": path.name, "suite": _suite_label(path.name), "tests": 0, "failures": 0, "errors": 0, "skipped": 0, "time": 0.0, "failed": [], "skipped_reasons": {}}
     for s in suites:
         out["tests"] += int(s.get("tests", 0))
         out["failures"] += int(s.get("failures", 0))
@@ -254,7 +267,8 @@ def cmd_finalize(argv: list[str]) -> int:
 
     md: list[str] = ["# Forge GPU report", "", f"Generated: {report['generated']}", f"Overall: **{overall}**", ""]
     md += ["## Environment", ""]
-    for k in ("python", "platform", "torch", "torch_cuda", "triton", "transformers", "forge", "cuda_available"):
+    for k in ("python", "platform", "torch", "torch_cuda", "triton", "transformers", "forge", "cuda_available",
+              "fp32_matmul_precision", "allow_tf32_matmul", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "NVIDIA_TF32_OVERRIDE"):
         if k in env:
             md.append(f"- {k}: `{env[k]}`")
     smi = env.get("nvidia_smi")
@@ -267,17 +281,17 @@ def cmd_finalize(argv: list[str]) -> int:
         flag = "ok" if s["exit_code"] == 0 else ("TIMEOUT" if s.get("timed_out") else str(s["exit_code"]))
         md.append(f"| {s['name']} | {flag} | {s['seconds']} | {s['log']} |")
     if junits:
-        md += ["", "## GPU tests", "", "| file | passed | failed | errors | skipped | seconds |", "|---|---|---|---|---|---|"]
+        md += ["", "## Test results", "", "| suite | junit file | passed | failed | errors | skipped | seconds |", "|---|---|---|---|---|---|---|"]
         for j in junits:
             if "error" in j:
-                md.append(f"| {j['file']} | parse error: {j['error']} | | | | |")
+                md.append(f"| {j['suite']} | {j['file']} | parse error: {j['error']} | | | | |")
                 continue
-            md.append(f"| {j['file']} | {j['passed']} | {j['failures']} | {j['errors']} | {j['skipped']} | {j['time']} |")
+            md.append(f"| {j['suite']} | {j['file']} | {j['passed']} | {j['failures']} | {j['errors']} | {j['skipped']} | {j['time']} |")
         for j in junits:
             for f in j.get("failed", [])[:50]:
-                md.append(f"- FAILED `{f['test']}`: {f['message']}")
+                md.append(f"- FAILED [{j['suite']}] `{f['test']}`: {f['message']}")
             for reason, n in j.get("skipped_reasons", {}).items():
-                md.append(f"- skipped x{n}: {reason}")
+                md.append(f"- skipped x{n} [{j['suite']}]: {reason}")
     if bench:
         md += ["", "## Bench summary (this host, quick sweep; not a validated result)", "", "```json", json.dumps(bench, indent=2)[:6000], "```"]
     bad = [s for s in steps if s["exit_code"] != 0]

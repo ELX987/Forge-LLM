@@ -45,6 +45,7 @@ from forge.formats.fp4 import (
     fake_quant_mxfp4,
     fake_quant_nvfp4,
 )
+from forge.formats.int_quant import _div_const
 from forge.formats.packing import pack_bits, unpack_bits
 from forge.formats.fp4 import unpack_fp4
 
@@ -341,7 +342,7 @@ class Int8W8A8Linear(_InputTransform, PackedLinear):
     @classmethod
     def from_weight(cls, w: torch.Tensor, bias: torch.Tensor | None = None, *, act_quant: str = "dynamic", input_scale: torch.Tensor | None = None, dtype=None) -> Int8W8A8Linear:
         wf = w.detach().float()
-        s = (wf.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
+        s = _div_const(wf.abs().amax(dim=1, keepdim=True), 127.0).clamp_min(1e-12)
         m = cls(w.shape[1], w.shape[0], bias is not None, act_quant=act_quant, has_input_scale=input_scale is not None, dtype=dtype or w.dtype, device=w.device)
         m.qweight.copy_(torch.round(wf / s).clamp(-128, 127).to(torch.int8))
         m.scales.copy_(s)
@@ -371,7 +372,7 @@ class Int8W8A8Linear(_InputTransform, PackedLinear):
         x = self._pre(x)
         if self.act_quant == "dynamic":
             xf = x.float()
-            s = (xf.abs().amax(dim=-1, keepdim=True) / 127.0).clamp_min(1e-12)
+            s = _div_const(xf.abs().amax(dim=-1, keepdim=True), 127.0).clamp_min(1e-12)
             x = (torch.round(xf / s).clamp(-128, 127) * s).to(x.dtype)
         return F.linear(x, self.dequantize(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 

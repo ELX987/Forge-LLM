@@ -2,10 +2,13 @@
 
 ``Y = (Xq @ Wq^T)_int32 * sx[:, None] * sw[None, :] + bias``.  ``tl.dot`` on int8 operands accumulates in int32
 (exact; reduction order irrelevant), the fp32 epilogue applies per-token x per-channel scales.  Needs sm_75+ (int8
-tensor cores) and BLOCK_K >= 32.  Status: logic verified with the Triton CPU interpreter, not run on a GPU.
+tensor cores) and BLOCK_K >= 32.  The quantiser must use IEEE
+division (``div_rn``) to be bit exact with ``torch.round(x / s)``; Triton's ``/`` is approximate on GPU.
+Status: logic verified with the Triton CPU interpreter, not run on a GPU.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -13,6 +16,19 @@ import torch
 from .gemm_common import HAS_TRITON, cdiv, default_mm_config, launch_fitting, next_pow2, require_triton, tl, triton
 
 if HAS_TRITON:
+    if os.environ.get("TRITON_INTERPRET") == "1":  # CPU interpreter: numpy division is already IEEE (its libdevice shim returns None)
+
+        @triton.jit
+        def _div_rn(x, y):
+            return x / y
+
+    else:  # GPU: plain ``/`` lowers to ``div.full.f32`` (approximate, up to 2 ulp); libdevice gives IEEE round-to-nearest
+        try:
+            from triton.language.extra import libdevice as _libdevice
+
+            _div_rn = _libdevice.div_rn
+        except Exception:  # older Triton
+            _div_rn = tl.math.div_rn
 
     @triton.jit
     def _int8_gemm_kernel(
@@ -65,12 +81,12 @@ if HAS_TRITON:
             xv = tl.load(x_ptr + row * stride_xm + offs, mask=offs < K, other=0.0).to(tl.float32)
             amaxv = tl.maximum(amaxv, tl.abs(xv))
         amax = tl.max(amaxv, axis=0)
-        scale = tl.where(amax > 0.0, amax / 127.0, 1.0)
+        scale = tl.where(amax > 0.0, _div_rn(amax, 127.0), 1.0)
         tl.store(s_ptr + row, scale)
         for start in range(0, K, BLOCK):
             offs = start + offs0
             xv = tl.load(x_ptr + row * stride_xm + offs, mask=offs < K, other=0.0).to(tl.float32)
-            v = tl.minimum(tl.maximum(xv / scale, -127.0), 127.0)
+            v = tl.minimum(tl.maximum(_div_rn(xv, scale), -127.0), 127.0)
             # round-half-to-even via the 1.5 * 2**23 trick (|v| <= 127 << 2**22); matches torch.round
             r = (v + 12582912.0) - 12582912.0
             tl.store(q_ptr + row * stride_qm + offs, r.to(tl.int8), mask=offs < K)

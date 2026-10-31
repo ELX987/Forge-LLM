@@ -193,7 +193,7 @@ def persist_model(
         return None
 
 
-def require_live(digest: str | None, ctx: RunContext, what: str = "model") -> LiveModel:
+def require_live(digest: str | None, ctx: RunContext, what: str = "model", **kw: Any) -> LiveModel:
     if digest is None:
         raise ConfigError(f"no {what} in the recipe namespace (is the recipe input 'model' set?)")
-    return resolve_model(digest, ctx)
+    return resolve_model(digest, ctx, **kw)

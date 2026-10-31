@@ -65,6 +65,13 @@ _RATE: dict[str, dict[str, Any]] = {
     "blackwell_geforce": dict(family="blackwell", sm=120, fp32=128, smem_total=100, smem_block=99,
                               rates={"fp16": 512, "bf16": 512, "tf32": 256, "fp8": 2048, "int8": 2048,
                                      "fp4": 4096}),
+    # RTX PRO (workstation/server) Blackwell, sm_120: unlike GeForce, FP32-accumulate tensor rates are NOT halved
+    # (NVIDIA: PRO 6000 = 4000 AI TOPS FP4 sparse -> 2000 dense = 188 SMs x 2617 MHz x 4096 per SM per clock).
+    # The per-SM rates are estimates; a real GPU run on a Max-Q part measured fp16 301 / bf16 313 TFLOP/s, which
+    # the GeForce-rate (512) derivation (221) could not explain.
+    "blackwell_pro":    dict(family="blackwell", sm=120, fp32=128, smem_total=100, smem_block=99,
+                             rates={"fp16": 1024, "bf16": 1024, "tf32": 512, "fp8": 2048, "int8": 2048,
+                                    "fp4": 4096}),
 }
 
 # conservative per-SM-per-clock rate set to use when only the SM level of an unknown part is known
@@ -350,12 +357,14 @@ _c("rtx-5070-ti", "GeForce RTX 5070 Ti", "blackwell_geforce", 70, 2452, 16, "GDD
    pat=[r"rtx 5070 ti"], ex=[_LAPTOP], pcie=5, form="desktop", conf="approximate", note=_BW_GF)
 _c("rtx-5070", "GeForce RTX 5070", "blackwell_geforce", 48, 2512, 12, "GDDR7", 672, 48, 250,
    pat=[r"rtx 5070\b"], ex=[r"\bti\b", _LAPTOP], pcie=5, form="desktop", conf="approximate", note=_BW_GF)
-_c("rtx-pro-6000-blackwell", "RTX PRO 6000 Blackwell (Workstation/Server)", "blackwell_geforce", 188, 2617, 96,
+_c("rtx-pro-6000-blackwell", "RTX PRO 6000 Blackwell (Workstation/Server)", "blackwell_pro", 188, 2617, 96,
    "GDDR7", 1792, 128, 600, pat=[r"rtx pro 6000"], ex=[r"max q|maxq|max-q"], pcie=5, conf="approximate",
-   note="Consumer-class Blackwell (sm_120) workstation part; " + _BW_GF)
-_c("rtx-pro-6000-blackwell-maxq", "RTX PRO 6000 Blackwell Max-Q", "blackwell_geforce", 188, 2300, 96, "GDDR7",
+   note="Workstation Blackwell (sm_120) with full-rate FP32-accumulate tensor cores; per-SM rates are "
+        "estimates, not datasheet: " + _BW_GF)
+_c("rtx-pro-6000-blackwell-maxq", "RTX PRO 6000 Blackwell Max-Q", "blackwell_pro", 188, 2300, 96, "GDDR7",
    1792, 128, 300, pat=[r"rtx pro 6000.*(max q|maxq|max-q)"], pcie=5, conf="approximate",
-   note="Clock is a guess (power-limited to 300 W); " + _BW_GF)
+   note="Boost clock is an estimate; at 300 W sustained clocks (and measured TFLOP/s, ~0.5-0.75x of catalogue "
+        "peak) sit below it. Per-SM rates are estimates; " + _BW_GF)
 _c("gb10", "GB10 (DGX Spark)", "blackwell_geforce", 48, None, 128, "LPDDR5X", 273, 24, 140, pat=[r"\bgb10\b"],
    sm=121, pcie=5, form="module", conf="approximate",
    tf={"fp4": 500.0, "fp8": 250.0, "fp16": 125.0, "bf16": 125.0, "tf32": None, "int8": None},

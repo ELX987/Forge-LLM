@@ -209,3 +209,21 @@ def test_registered_in_registry():
 
     assert "h100-sxm5-80g" in registry.names("chip")
     assert registry.get("chip", "t4")["sm"] == 75
+
+
+def test_rtx_pro_6000_uses_full_rate_blackwell_pro_rates():
+    """GPU run on an RTX PRO 6000 Max-Q measured fp16 301 / bf16 313 / tf32 141 TFLOP/s; the GeForce rate set
+    (FP32-accumulate halved) gave 221/221/110.  PRO parts use full-rate (estimated) per-SM rates."""
+    for key in ("rtx-pro-6000-blackwell", "rtx-pro-6000-blackwell-maxq"):
+        c = KNOWN_CHIPS[key]
+        assert c["rate_set"] == "blackwell_pro" and c["sm"] == 120
+        assert c["confidence"]["tflops"] == "approximate"
+        assert c["tflops_basis"]["fp16"] != "datasheet"  # estimated, not a vendor figure
+        assert c["tflops"]["fp16"] > 301.8 and c["tflops"]["bf16"] > 313.1 and c["tflops"]["tf32"] > 140.9
+    mq = KNOWN_CHIPS["rtx-pro-6000-blackwell-maxq"]
+    assert mq["tflops"]["fp16"] == pytest.approx(188 * 1024 * 2300 / 1e6, abs=0.01)
+    # GeForce 5090 keeps the halved FP32-accumulate rate (~209.5 TFLOP/s)
+    assert KNOWN_CHIPS["rtx-5090"]["tflops"]["fp16"] == pytest.approx(209.5, abs=0.5)
+    # the effective ridge from that run (measured 301.82 TFLOP/s / 1467.68 GB/s) is below 1.5x the datasheet ridge
+    ds_ridge = mq["tflops"]["fp16"] * 1e3 / mq["mem_bw_gbs"]
+    assert 301.82e3 / 1467.68 < ds_ridge

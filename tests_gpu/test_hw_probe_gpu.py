@@ -1,6 +1,8 @@
 """End-to-end hardware probe on a real NVIDIA GPU (auto-skipped without CUDA)."""
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -48,7 +50,11 @@ def test_effective_ridge_not_above_datasheet_ridge(result):
     eff, dsr = res.report["effective_ridge"], res.report["datasheet_ridge"]
     for k, v in eff.items():
         if k in dsr and res.descriptor.matrix_unit_for(k).peak_tflops.measured:
-            assert v < 1.5 * dsr[k], (k, v, dsr[k])  # measured stacks sit at or below datasheet ridge (Plan HW-5)
+            # measured stacks sit at or below the datasheet ridge (Plan HW-5); above it means the catalogue peak is too
+            # low (report), above 1.5x means the catalogue is implausibly wrong (fail).
+            assert v < 1.5 * dsr[k], (k, v, dsr[k])
+            if v > dsr[k]:
+                warnings.warn(f"catalogue too low: effective ridge {k} {v} > datasheet ridge {dsr[k]}", stacklevel=1)
 
 
 def test_throttle_summary_present_or_explained(result):
