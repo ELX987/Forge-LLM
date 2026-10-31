@@ -32,22 +32,7 @@ print("bf16 supported:", torch.cuda.is_bf16_supported())
 print("device:", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))
 EOF
 
-step triton_sanity --allow-fail --timeout 300 -- "$PY" - <<'EOF'
-import torch, triton, triton.language as tl
-
-@triton.jit
-def add_kernel(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    m = offs < n
-    tl.store(o_ptr + offs, tl.load(x_ptr + offs, mask=m) + tl.load(y_ptr + offs, mask=m), mask=m)
-
-n = 1_000_003
-x = torch.randn(n, device="cuda"); y = torch.randn(n, device="cuda"); o = torch.empty_like(x)
-add_kernel[(triton.cdiv(n, 1024),)](x, y, o, n, BLOCK=1024)
-torch.testing.assert_close(o, x + y)
-print("triton", triton.__version__, "vector add ok")
-EOF
+step triton_sanity --allow-fail --timeout 300 -- "$PY" scripts/triton_sanity.py
 
 step forge_doctor --allow-fail --timeout 300 -- "$PY" -m forge.cli doctor
 step forge_probe --allow-fail --timeout 900 -- "$PY" -m forge.cli probe --quick

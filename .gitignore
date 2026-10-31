@@ -17,10 +17,10 @@ htmlcov/
 node_modules/
 
 # forge runtime state
-.forge/
-runs/
-models/
-checkpoints/
+/.forge/
+/runs/
+/models/
+/checkpoints/
 *.safetensors
 *.gguf
 *.pt
@@ -39,3 +39,7 @@ Thumbs.db
 # secrets
 .env
 *.token
+
+# user-supplied report archives
+/*.zip
+/gpu_report/
