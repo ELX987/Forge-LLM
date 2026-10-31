@@ -83,10 +83,14 @@ def test_resume_reproduces_uninterrupted_run_bitwise(ds_dir, tmp_path):
 
 
 def test_grad_accumulation_equivalent_to_large_batch(ds_dir, tmp_path):
-    kw = dict(budget={"max_steps": 2}, optim={"name": "sgd", "lr": 0.05, "momentum": 0.0, "weight_decay": 0.0, "grad_clip": 0.0},
+    # parallel.device defaults to 'auto' (CUDA when present, which is right for the library); the 2e-6 equivalence bound is an
+    # fp32-on-CPU statement (summation order differs between 1x4 and 4x1 micro-batches, and TF32 matmuls on a GPU add ~1e-3
+    # relative error), so pin CPU to keep the test meaningful and identical on GPU hosts.
+    kw = dict(parallel={"device": "cpu"}, budget={"max_steps": 2}, optim={"name": "sgd", "lr": 0.05, "momentum": 0.0, "weight_decay": 0.0, "grad_clip": 0.0},
               schedule={"name": "constant", "warmup_steps": 0})
     a, _, _ = run(ds_dir, tmp_path / "a", micro_batch_size=4, grad_accum_steps=1, **kw)
     b, _, _ = run(ds_dir, tmp_path / "b", micro_batch_size=1, grad_accum_steps=4, **kw)
+    assert a.device.type == "cpu" and b.device.type == "cpu"
     assert _same(_params(a.raw), _params(b.raw), atol=2e-6)
 
 
@@ -267,10 +271,13 @@ def test_pre_anneal_checkpoint_and_wsd_schedule(ds_dir, tmp_path):
 
 
 def test_mfu_reported_when_peak_known(ds_dir, tmp_path):
-    tr, res, ctx = run(ds_dir, tmp_path, budget={"max_steps": 3}, logging={"log_every": 1, "peak_tflops_per_gpu": 0.01})
+    tr, res, ctx = run(ds_dir, tmp_path, budget={"max_steps": 3}, parallel={"device": "cpu"},
+                      logging={"log_every": 1, "peak_tflops_per_gpu": 0.01})
     mfu = ctx.metric_series("mfu")
     assert mfu and all(v > 0 for _, v in mfu)
-    tr2, _, ctx2 = run(ds_dir, tmp_path / "b", budget={"max_steps": 2})
+    # parallel.device defaults to 'auto' (-> CUDA when present), so pin CPU to keep the "unknown peak" premise on GPU hosts
+    tr2, _, ctx2 = run(ds_dir, tmp_path / "b", budget={"max_steps": 2}, parallel={"device": "cpu"})
+    assert tr2.device.type == "cpu"
     assert not ctx2.metric_series("mfu")  # unknown peak (CPU): omitted rather than invented
 
 

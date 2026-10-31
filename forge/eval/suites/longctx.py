@@ -121,7 +121,7 @@ def _cap(n: int, length: int, per_item_tokens: int = 70, frac: float = 0.35, min
 def gen_niah_multikey(tok: Any, length: int, seed: int, max_new: int, n_distractors: int = 8) -> LongCtxItem:
     rng = random.Random(seed)
     n_distractors = _cap(n_distractors, length, minimum=2)
-    keys = list({_key(rng) for _ in range(n_distractors + 1)})
+    keys = list(dict.fromkeys(_key(rng) for _ in range(n_distractors + 1)))
     keys = keys[: n_distractors + 1]
     vals = [_number(rng) for _ in keys]
     target = rng.randrange(len(keys))
@@ -135,7 +135,7 @@ def gen_niah_multivalue(tok: Any, length: int, seed: int, max_new: int, n_values
     rng = random.Random(seed)
     n_values = _cap(n_values, length, minimum=2)
     key = _key(rng)
-    vals = list({_number(rng) for _ in range(n_values)})
+    vals = list(dict.fromkeys(_number(rng) for _ in range(n_values)))
     needles = [(d, f"One of the special magic numbers for {key} is: {v}.") for d, v in zip(_depths(rng, len(vals)), vals)]
     q = f"What are all the special magic numbers for {key} mentioned in the text above?"
     hay = _assemble(tok, rng, length, needles, reserve=len(tok.encode(q)) + max_new + 24)
@@ -145,7 +145,7 @@ def gen_niah_multivalue(tok: Any, length: int, seed: int, max_new: int, n_values
 def gen_niah_multiquery(tok: Any, length: int, seed: int, max_new: int, n_queries: int = 3) -> LongCtxItem:
     rng = random.Random(seed)
     n_queries = _cap(n_queries, length, minimum=2)
-    keys = list({_key(rng) for _ in range(n_queries)})
+    keys = list(dict.fromkeys(_key(rng) for _ in range(n_queries)))
     vals = [_number(rng) for _ in keys]
     needles = [(d, f"One of the special magic numbers for {k} is: {v}.") for d, k, v in zip(_depths(rng, len(keys)), keys, vals)]
     q = "What are the special magic numbers for " + ", ".join(keys) + " mentioned in the text above?"
@@ -172,7 +172,7 @@ def gen_variable_tracking(tok: Any, length: int, seed: int, max_new: int, hops: 
 
 def gen_aggregation(tok: Any, length: int, seed: int, max_new: int, top_k: int = 3) -> LongCtxItem:
     rng = random.Random(seed)
-    vocab = list({_name(rng, 2).lower() for _ in range(40)})
+    vocab = list(dict.fromkeys(_name(rng, 2).lower() for _ in range(40)))
     heavy, light = vocab[:top_k], vocab[top_k : top_k + 12]
     budget = max(32, length - max_new - 60)
     words: list[str] = []
@@ -188,8 +188,8 @@ def gen_aggregation(tok: Any, length: int, seed: int, max_new: int, top_k: int =
             break
         words = words[: max(top_k * 6, len(words) - max(1, int(over / avg)))]
         text = " ".join(words)
-    cnt = {w: words.count(w) for w in set(words)}
-    top = sorted(cnt, key=lambda w: -cnt[w])[:top_k]
+    cnt = {w: words.count(w) for w in dict.fromkeys(words)}  # insertion-ordered: set order depends on PYTHONHASHSEED
+    top = sorted(cnt, key=lambda w: (-cnt[w], w))[:top_k]
     q = f"What are the {top_k} most frequently appearing words in the list above?"
     return _finish("aggregation", length, text, q, top, tok, {"counts": {w: cnt[w] for w in top}},
                    instr="Below is a long list of words. Count how often each appears.\n")
@@ -198,7 +198,7 @@ def gen_aggregation(tok: Any, length: int, seed: int, max_new: int, top_k: int =
 def gen_multihop(tok: Any, length: int, seed: int, max_new: int, hops: int = 3) -> LongCtxItem:
     rng = random.Random(seed)
     hops = _cap(hops, length, per_item_tokens=120, minimum=2)
-    people = list({_name(rng) for _ in range(hops + 1)})[: hops + 1]
+    people = list(dict.fromkeys(_name(rng) for _ in range(hops + 1)))[: hops + 1]
     while len(people) < hops + 1:
         people.append(_name(rng, 4))
     city = _name(rng, 3) + "ville"

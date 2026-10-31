@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 
 from forge.kernels.triton.attn_common import HAVE_TRITON
-from forge.kernels.triton.util_dispatch import cdiv, next_pow2
+from forge.kernels.triton.util_dispatch import cdiv, next_pow2, require_fp8_store
 
 if HAVE_TRITON:
     import triton
@@ -168,6 +168,8 @@ def quantize_rowwise_triton(x: torch.Tensor, qdtype: str = "int8", group_size: i
     (FP8 requires sm_89+ for the Triton store)."""
     if not HAVE_TRITON:
         raise RuntimeError("triton is not available")
+    if qdtype != "int8":
+        require_fp8_store(x.device, "quantize_rowwise_triton")
     k = x.shape[-1]
     g = k if group_size is None else group_size
     if k % g:
@@ -186,6 +188,8 @@ def rmsnorm_quant_triton(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-
     """Fused (residual add +) RMSNorm + per-row quantise. ``x [R, K]`` (K <= 16384)."""
     if not HAVE_TRITON:
         raise RuntimeError("triton is not available")
+    if qdtype != "int8":
+        require_fp8_store(x.device, "rmsnorm_quant_triton")
     r, k = x.shape
     if k > 16384:
         raise ValueError("hidden size above 16384 is not supported by the fused kernel")

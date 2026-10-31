@@ -346,3 +346,36 @@ def test_from_nvfp4_tensor_adapter():
     f.tensor_scale, f.shape = p.tensor_scale, (8, 64)
     q = PackedFP4.from_nvfp4_tensor(f)
     assert q.fmt == "nvfp4" and torch.equal(q.scales, p.scales) and torch.equal(dequantize_fp4_ref(q), dequantize_fp4_ref(p))
+
+
+def test_int8_ref_scale_is_correctly_rounded_division():
+    import torch
+    from forge.kernels.ref import quantize_int8_ref
+
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(512, 64, generator=g) * torch.rand(512, 1, generator=g) * 10
+    _, s = quantize_int8_ref(x, "per_token")
+    amax = x.abs().amax(dim=-1)
+    assert torch.equal(s, (amax.double() / 127.0).float())
+
+
+def test_int8_quant_agreement_flags_only_untied_mismatches():
+    import torch
+    from forge.kernels.ref import int8_quant_agreement, quantize_int8_ref
+
+    x = torch.randn(8, 128)
+    q, s = quantize_int8_ref(x, "per_token")
+    st = int8_quant_agreement(x, q, s, q, s)
+    assert st["code_mismatches"] == 0 and st["scale_ulp_max"] == 0
+    q2 = q.clone()
+    q2[0, 0] += 1  # a random (non-tie) flip must be reported as untied
+    st = int8_quant_agreement(x, q2, s, q, s)
+    assert st["untied_mismatches"] == 1 and st["max_code_diff"] == 1
+    s2 = torch.nextafter(s, torch.full_like(s, 1e9))
+    assert int8_quant_agreement(x, q, s2, q, s)["scale_ulp_max"] == 1.0
+    # an exact tie: x/s == 2.5 -> oracle gives 2 (half-even); a kernel giving 3 is excused
+    xt = torch.tensor([[2.5, 127.0]])
+    qt, st_ = quantize_int8_ref(xt, "per_token")
+    assert qt[0, 0] == 2
+    qk = qt.clone(); qk[0, 0] = 3
+    assert int8_quant_agreement(xt, qk, st_, qt, st_)["untied_mismatches"] == 0

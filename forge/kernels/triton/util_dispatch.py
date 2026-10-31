@@ -119,6 +119,16 @@ def fp8_native(device) -> bool:
     return sm is not None and sm >= 89 and not interpret_mode()
 
 
+def require_fp8_store(device, what: str) -> None:
+    """Raise if an FP8-E4M3-*output* Triton kernel would be launched on a CUDA GPU below sm_89 (``float8e4nv`` does not exist
+    there; Triton fails with "type fp8e4nv not supported in this architecture").  The ``ops_util`` dispatchers route those cases
+    to the torch reference path, so reaching this means a launcher was called directly."""
+    sm = device_sm(device)
+    if sm is not None and sm < 89:
+        raise RuntimeError(f"{what}: fp8 (float8e4nv) output needs sm_89+, device is sm_{sm}; use the int8 variant or the "
+                           "reference path (forge.kernels.ops_util dispatches there automatically)")
+
+
 def bf16_ok(dtype, device) -> bool:
     """bf16 tensor-core dots need sm_80+ (fp16 works on sm_70+)."""
     import torch

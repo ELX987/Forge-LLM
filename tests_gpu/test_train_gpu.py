@@ -144,7 +144,7 @@ def _worker(rank, world, init_file, cfg_json, ds_dir, run_dir, out_q):
     from forge.train.config import TrainConfig
 
     try:
-        dist.init_process_group("nccl", init_method="file:///" + init_file, rank=rank, world_size=world)
+        dist.init_process_group("nccl", init_method=Path(init_file).as_uri(), rank=rank, world_size=world)
         cfg = TrainConfig.model_validate_json(cfg_json)
         dinfo = D.init_distributed(cfg.parallel)
         ds = ShardedTokenDataset([ds_dir], cfg.data.seq_len, seed=3, role="train", val_sequences=4)

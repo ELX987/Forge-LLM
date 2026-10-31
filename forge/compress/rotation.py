@@ -15,9 +15,16 @@ R2 (per head, ``head_dim``): value rows ``W_v <- Q2^T W_v`` per KV head and ``W_
 R4 (optional, online): a block Hadamard before ``down_proj`` (``OnlineHadamardLinear``); PTQ keeps it as ``rot_block`` of the packed module.
 
 Tied embeddings: the output head is untied (cloned) because the final norm must be folded into it.
+
+Numerical precision: rotations must be applied (and the equivalence verified) in fp32/fp64 at ``highest`` matmul precision, regardless
+of the process-wide TF32 setting (``torch.backends.cuda.matmul.allow_tf32``, ``torch.set_float32_matmul_precision('high')``, or
+``TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1``).  TF32 keeps only 10 mantissa bits (~1e-3 relative error per product), which would bake noise
+into every rotated weight.  ``rotate_model`` therefore runs inside ``exact_matmul()``, which switches TF32 off and restores the previous
+settings in a ``finally``.  It does not change the precision of the *model's own* forward passes outside ``rotate_model``.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any, Literal
 
@@ -338,9 +345,32 @@ def learn_rotation(
 
 
 # ------------------------------------------------------------------------------------------------ driver
-@torch.no_grad()
+@contextlib.contextmanager
+def exact_matmul():
+    """Disable TF32 for fp32 matmuls/convs (``highest`` precision) inside the block; previous global settings are restored on exit."""
+    cuda_m, cudnn_c = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    prec = torch.get_float32_matmul_precision()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prec)
+        torch.backends.cuda.matmul.allow_tf32 = cuda_m
+        torch.backends.cudnn.allow_tf32 = cudnn_c
+
+
 def rotate_model(model: nn.Module, cfg: RotationConfig | dict | None = None, tokens: torch.Tensor | None = None) -> dict[str, Any]:
-    """Fuse norms and rotate ``model`` in place (R1 [+ R2] [+ online R4]). Returns a report dict. ``tokens`` feed the learned objective."""
+    """Fuse norms and rotate ``model`` in place (R1 [+ R2] [+ online R4]). Returns a report dict. ``tokens`` feed the learned objective.
+
+    Always executed at fp32 ``highest`` matmul precision (see :func:`exact_matmul`), whatever the global TF32 setting is."""
+    with exact_matmul():
+        return _rotate_model(model, cfg, tokens)
+
+
+@torch.no_grad()
+def _rotate_model(model: nn.Module, cfg: RotationConfig | dict | None = None, tokens: torch.Tensor | None = None) -> dict[str, Any]:
     cfg = RotationConfig.model_validate(cfg) if isinstance(cfg, dict) else (cfg or RotationConfig())
     report: dict[str, Any] = {"mode": cfg.mode, "r2": cfg.r2, "online_hadamard_down": cfg.online_hadamard_down}
     report.update(fuse_norms(model, cfg.untie_embeddings))

@@ -219,8 +219,9 @@ def test_ops_reexports_and_lazy_external_names():
 # ------------------------------------------------------------------------------------------ catalog
 def test_catalog_rows_are_json_serialisable_and_honest_on_cpu():
     from forge.kernels.catalog import get_kernel, list_kernels, register_catalog_entry
+    from forge.kernels.layouts.chip import ChipInfo
 
-    rows = list_kernels()
+    rows = list_kernels(ChipInfo())  # explicit CPU chip: the default (current device) would be the GPU on a GPU host
     by = {r["name"]: r for r in rows}
     for n in ("w4a16_gemm", "w8a16_gemm", "fp8_gemm", "fp4_block_gemm", "int8_w8a8_gemm"):
         r = by[n]
@@ -250,7 +251,10 @@ def test_bench_config_schema_for_ui():
     assert defaults_for(BenchConfig)["repeats"] == 30
 
 
-def test_run_bench_skips_without_gpu_and_cpu_smoke_works(forge_home):
+def test_run_bench_skips_without_gpu_and_cpu_smoke_works(forge_home, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)  # emulate a GPU-less host (also on GPU hosts)
     from forge.core.db import get_db
     from forge.kernels.bench import BenchConfig, query_results, run_bench
 

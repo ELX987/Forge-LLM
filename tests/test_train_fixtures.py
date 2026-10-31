@@ -125,7 +125,7 @@ def small_train_cfg(ds_dir: Path, **over):
         "schedule": {"name": "cosine", "warmup_steps": 2, "min_lr_ratio": 0.1},
         "budget": {"max_steps": 6}, "checkpoint": {"every_steps": 0, "keep_last": 3},
         "eval": {"every_steps": 0, "num_batches": 2}, "logging": {"log_every": 1},
-        "save_final_model": False, "register_artifact": False,
+        "save_final_model": False, "register_artifact": False, "parallel": {"device": "cpu"},  # hermetic on GPU hosts
     }
     for k, v in over.items():
         if isinstance(v, dict) and isinstance(cfg.get(k), dict):

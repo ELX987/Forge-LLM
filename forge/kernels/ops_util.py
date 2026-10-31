@@ -45,6 +45,14 @@ KERNELS: dict[str, dict[str, Any]] = {
 }
 
 
+def _fp8_store_ok(device, op: str) -> bool:
+    """FP8-E4M3 output kernels need ``float8e4nv`` (sm_89+); below that (Ampere, Volta, ...) dispatch to the torch reference."""
+    ok = _d.fp8_native(device)
+    if not ok:
+        _d.note_path(op, "reference (fp8e4nv store needs sm_89+)")
+    return ok
+
+
 def _tri(*tensors, min_sm: int = 70, op: str = "") -> bool:
     ok = _d.use_triton(*tensors, min_sm=min_sm, op=op)
     if ok:
@@ -86,7 +94,7 @@ def quantize_rowwise(x: torch.Tensor, qdtype: str = "fp8", group_size: int | Non
     """Symmetric row/group quantisation -> ``(q, scale)`` (``qdtype`` ``"fp8"`` E4M3 or ``"int8"``; scale = absmax / qmax)."""
     ok_dtype = x.dtype in (torch.float16, torch.bfloat16, torch.float32)
     if qdtype == "fp8":
-        triton_ok = ok_dtype and _d.fp8_native(x.device) and _tri(x, min_sm=89, op="quantize_rowwise")
+        triton_ok = ok_dtype and _fp8_store_ok(x.device, "quantize_rowwise") and _tri(x, min_sm=89, op="quantize_rowwise")
     else:
         triton_ok = ok_dtype and _tri(x, op="quantize_rowwise")
     if triton_ok:
@@ -134,7 +142,7 @@ def rmsnorm_quant(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6, qdty
     r2 = residual.reshape(-1, x.shape[-1]) if residual is not None else None
     ok_dtype = x.dtype in (torch.float16, torch.bfloat16, torch.float32) and x.shape[-1] <= 16384
     if qdtype == "fp8":
-        triton_ok = ok_dtype and _d.fp8_native(x.device) and _tri(x, min_sm=89, op="rmsnorm_quant")
+        triton_ok = ok_dtype and _fp8_store_ok(x.device, "rmsnorm_quant") and _tri(x, min_sm=89, op="rmsnorm_quant")
     else:
         triton_ok = ok_dtype and _tri(x, op="rmsnorm_quant")
     if triton_ok:

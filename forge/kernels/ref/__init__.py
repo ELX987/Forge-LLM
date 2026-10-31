@@ -28,7 +28,7 @@ from .gemm_fp8 import (
     quantize_fp8_ref,
     rmsnorm_act_quant_fp8_ref,
 )
-from .gemm_int8 import int8_gemm_ref, quantize_int8_ref
+from .gemm_int8 import int8_gemm_ref, int8_quant_agreement, quantize_int8_ref
 from .gemm_w4a16 import w4a16_gemm_ref, w4a16_gemm_ref_parts, w8a16_gemm_ref
 
 _SKIP = {"gemm_common", "gemm_fp4", "gemm_fp8", "gemm_int8", "gemm_w4a16", "gemm_w8a16"}
@@ -54,5 +54,5 @@ __all__ = [
     "dequantize_fp4_ref", "e2m1_decode", "e2m1_encode", "fp4_block_gemm_ref", "fp4_w4a4_gemm_ref",
     "quantize_fp4_ref", "quantize_mxfp4_ref", "quantize_nvfp4_ref",
     "dequantize_fp8_ref", "fp8_gemm_ref", "quantize_fp8_ref", "rmsnorm_act_quant_fp8_ref",
-    "int8_gemm_ref", "quantize_int8_ref", "w4a16_gemm_ref", "w4a16_gemm_ref_parts", "w8a16_gemm_ref",
+    "int8_gemm_ref", "int8_quant_agreement", "quantize_int8_ref", "w4a16_gemm_ref", "w4a16_gemm_ref_parts", "w8a16_gemm_ref",
 ]

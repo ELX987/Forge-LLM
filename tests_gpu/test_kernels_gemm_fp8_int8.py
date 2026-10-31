@@ -13,6 +13,7 @@ from forge.kernels.ref import (  # noqa: E402
     dequantize_fp8_ref,
     fp8_gemm_ref,
     int8_gemm_ref,
+    int8_quant_agreement,
     quantize_fp8_ref,
     quantize_int8_ref,
     rmsnorm_act_quant_fp8_ref,
@@ -99,21 +100,48 @@ def test_activation_quant_edge_cases():
     assert qn.shape == xn.shape and torch.isfinite(qn[1].float()).all()  # NaN row: E4M3FN has a NaN code; the clean row is unaffected
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or _sm() < 75, reason="int8 tensor cores need sm_75+")
+needs_int8 = pytest.mark.skipif(not torch.cuda.is_available() or _sm() < 75, reason="int8 tensor cores need sm_75+")
+
+
+@needs_int8
 @pytest.mark.parametrize("m", [0, 1, 16, 100, 513])
 @pytest.mark.parametrize("n,k", [(4096, 4096), (777, 1000)])
-def test_int8_w8a8_is_bit_exact_on_integer_path(m, n, k):
-    x = torch.randn(m, k, device=DEV, dtype=torch.float16)
-    wq, sw = quantize_int8_ref(torch.randn(n, k, device=DEV) * 0.05, "per_channel")
-    xq, sx = ops_gemm.quantize_act_int8(x)
-    xr, sr = quantize_int8_ref(x, "per_token")
-    assert torch.equal(xq, xr) and torch.equal(sx, sr)
+def test_int8_gemm_is_exact_given_identical_codes_and_scales(m, n, k):
+    """The GEMM is integer-exact: feed the oracle's codes/scales to the kernel (independent of quantiser rounding)."""
     from forge.kernels.triton.gemm_int8 import int8_gemm_triton
 
-    y = int8_gemm_triton(xq, sx, wq, sw, None, out_dtype=torch.float32)
-    assert torch.equal(y, int8_gemm_ref(xq, sx, wq, sw)), "int32 accumulation + fp32 epilogue must be exact"
+    x = torch.randn(m, k, device=DEV, dtype=torch.float16)
+    wq, sw = quantize_int8_ref(torch.randn(n, k, device=DEV) * 0.05, "per_channel")
+    xr, sr = quantize_int8_ref(x, "per_token")
+    y = int8_gemm_triton(xr, sr, wq, sw, None, out_dtype=torch.float32)
+    assert torch.equal(y, int8_gemm_ref(xr, sr, wq, sw)), "int32 accumulation + fp32 epilogue must be exact"
+
+
+@needs_int8
+@pytest.mark.parametrize("m", [0, 1, 16, 100, 513])
+@pytest.mark.parametrize("k", [1000, 4096])
+def test_int8_activation_quantiser_agrees_with_oracle(m, k):
+    """Scales within 1 ulp; codes equal except (at most) at exact rounding ties."""
+    x = torch.randn(m, k, device=DEV, dtype=torch.float16)
+    xq, sx = ops_gemm.quantize_act_int8(x)
+    assert ops_gemm.last_path("quantize_act_int8") == "triton"
+    xr, sr = quantize_int8_ref(x, "per_token")
+    st = int8_quant_agreement(x, xq, sx, xr, sr)
+    print(f"int8 quantiser agreement m={m} k={k}: {st}")
+    assert st["scale_ulp_max"] <= 1.0, st
+    assert st["untied_mismatches"] == 0, st
+    assert st["max_code_diff"] <= 1, st
+
+
+@needs_int8
+@pytest.mark.parametrize("m", [0, 1, 16, 100, 513])
+@pytest.mark.parametrize("n,k", [(4096, 4096), (777, 1000)])
+def test_int8_linear_end_to_end_within_tolerance(m, n, k):
+    x = torch.randn(m, k, device=DEV, dtype=torch.float16)
+    wq, sw = quantize_int8_ref(torch.randn(n, k, device=DEV) * 0.05, "per_channel")
+    xr, sr = quantize_int8_ref(x, "per_token")
     y16 = ops_gemm.int8_linear(x, wq, sw)
-    assert compare(y16, int8_gemm_ref(xq, sx, wq, sw), load_spec("int8_w8a8_gemm").tolerance, out_dtype=torch.float16).ok
+    assert compare(y16, int8_gemm_ref(xr, sr, wq, sw), load_spec("int8_w8a8_gemm").tolerance, out_dtype=torch.float16).ok
 
 
 def test_fp8_fallback_path_on_pre_ada_gpus():

@@ -112,7 +112,7 @@ Three levels, in increasing strength:
 | Kernel | CPU-tested (oracle, layouts, fallback) | Interpreter-checked | GPU-validated | Perf-validated | Hardware tried |
 |--------|----------------------------------------|---------------------|---------------|----------------|----------------|
 | K1 W4A16 / W8A16 (`triton/gemm_wq.py`) | yes | yes (fp16) | **no** | **no** | none |
-| K3 INT8 W8A8 + activation quantiser (`gemm_int8.py`) | yes | yes, bit exact | **no** (sm_120 run: quantiser was off-by-one vs oracle from approximate `/`; fixed with `div_rn`, awaiting re-run) | **no** | RTX PRO 6000 Blackwell (sm_120) |
+| K3 INT8 W8A8 + activation quantiser (`gemm_int8.py`) | yes | yes, bit exact | **no** (sm_120 run: quantiser mismatched the oracle; root cause 1: Triton approximate `/` (fixed with `div_rn`); root cause 2: the torch oracle's `amax / 127.0` is `amax * (1/127)` on CUDA (CPU-scalar divisor), 1 ulp off IEEE; oracle now divides by a tensor. GEMM exactness and quantiser agreement are separate tests; awaiting re-run) | **no** | RTX PRO 6000 Blackwell (sm_120) |
 | K3 FP8 GEMM (`gemm_fp8.py`, `torch._scaled_mm` fast path) | yes | yes; fp8 codes of the fused RMSNorm quantiser not checkable | **no** | **no** | none |
 | K2 NVFP4 / MXFP4 dequant GEMM, fused quantiser (`gemm_fp4.py`) | yes | yes (quantiser bit exact vs oracle) | **no** | **no** | none |
 | K2 native block-scaled MMA (`tl.dot_scaled`) | oracle | partly | **no (experimental, API changes between Triton releases)** | **no** | none |

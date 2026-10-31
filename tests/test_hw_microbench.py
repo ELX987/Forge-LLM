@@ -43,6 +43,11 @@ def test_runtime_errors_become_failed_results_not_exceptions(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=0: (9, 0), raising=False)
+
+    def _boom(*a, **k):  # a real GPU host would run the kernels, so force the runtime failure everywhere
+        raise RuntimeError("simulated CUDA runtime failure")
+
+    monkeypatch.setattr(torch.cuda, "device", _boom)
     for r in (mb.stream_copy_bw(), mb.mma_throughput("bf16"), mb.mma_throughput("fp8"), mb.launch_latency(),
               mb.p2p_bw(0, 0)):
         assert r.ok is False and r.value is None

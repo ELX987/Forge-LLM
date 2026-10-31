@@ -14,7 +14,7 @@ import torch
 
 from forge.kernels.ref.attn_kv import normalize_kv_dtype
 from forge.kernels.triton.attn_common import HAVE_TRITON
-from forge.kernels.triton.util_dispatch import next_pow2
+from forge.kernels.triton.util_dispatch import next_pow2, require_fp8_store
 
 if HAVE_TRITON:
     import triton
@@ -118,6 +118,8 @@ def rope_and_kv_write_triton(q, k, v, positions, cos_sin_cache, slot_mapping, k_
     kv = normalize_kv_dtype(kv_dtype)
     if kv == "int4":
         raise ValueError("INT4 fused write is reference-only")
+    if kv == "fp8_e4m3":
+        require_fp8_store(q.device, "rope_and_kv_write_triton")
     t, hq, d = q.shape
     hkv = k.shape[1]
     rd = d if rotary_dim is None else rotary_dim

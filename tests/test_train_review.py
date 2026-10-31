@@ -141,7 +141,7 @@ def _norm_worker(rank, world, init_file, cfg_json, ds_dir, run_dir, out_q):
     from forge.train.trainer import Trainer as TR
 
     try:
-        dist.init_process_group("gloo", init_method="file:///" + init_file.replace("\\", "/"), rank=rank, world_size=world)
+        dist.init_process_group("gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=world)
         cfg = TrainConfig.model_validate_json(cfg_json)
         dinfo = D.init_distributed(cfg.parallel)
         ds = SD([ds_dir], 16, seed=3, role="train", val_sequences=4)

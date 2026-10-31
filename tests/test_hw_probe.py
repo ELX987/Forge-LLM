@@ -38,7 +38,10 @@ def _isolate(monkeypatch):
 
 
 def no_cuda(monkeypatch):
+    """Pretend to be a GPU-less host: torch.cuda unusable AND nvidia-smi (cap.list_gpus) sees nothing, otherwise a
+    GPU host would take the smi-only datasheet path (vendor nvidia, matrix units) instead of the CPU descriptor."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(cap, "list_gpus", lambda: [])
 
 
 def fake_cuda(monkeypatch, name, major, minor, gib, sms, **extra):

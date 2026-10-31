@@ -137,14 +137,25 @@ stages:
 
 
 def test_rotation_equivalence_on_gpu():
+    """Rotated vs original logits.  Run at fp32 'highest' precision: with TF32 on (e.g. TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1) the
+    forward passes alone differ by ~1e-3 relative, which has nothing to do with the rotation.  ``rel`` is a *squared* relative error,
+    so 1e-10 means <= 1e-5 relative L2 error: fp32 rounding through a few layers of Hadamard-mixed matmuls (~1e-6) with margin."""
     from forge.compress.rotation import RotationConfig, rotate_model
     from forge.models.tiny import build_tiny_model
 
     dev = _dev()
-    m = build_tiny_model(0, dtype=torch.float32).to(dev).eval()
-    ids = torch.randint(0, 256, (2, 32), device=dev)
-    with torch.no_grad():
-        ref = m(ids).logits
-        rotate_model(m, RotationConfig())
-        out = m(ids).logits
-    assert rel(out, ref) < 1e-8
+    saved = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision())
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        m = build_tiny_model(0, dtype=torch.float32).to(dev).eval()
+        ids = torch.randint(0, 256, (2, 32), device=dev)
+        with torch.no_grad():
+            ref = m(ids).logits
+            rotate_model(m, RotationConfig())
+            out = m(ids).logits
+        assert rel(out, ref) < 1e-10
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = saved[0], saved[1]
+        torch.set_float32_matmul_precision(saved[2])

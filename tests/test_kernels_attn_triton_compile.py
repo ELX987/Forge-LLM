@@ -23,7 +23,6 @@ import kernels_attn_compile_harness as harness  # noqa: E402
 
 SMEM_LIMIT = {70: 96 * 1024, 75: 64 * 1024, 80: 163 * 1024, 86: 99 * 1024, 87: 163 * 1024, 89: 99 * 1024,
               90: 227 * 1024, 100: 227 * 1024, 103: 227 * 1024, 120: 99 * 1024, 121: 99 * 1024}
-FP8_STORE_KERNELS = {"_quant_rowwise_kernel", "_rmsnorm_quant_kernel", "_rope_kv_write_kernel"}  # fp8 variants need sm_89+
 TARGETS = [int(x) for x in os.environ.get("FORGE_COMPILE_TARGETS", "80,90").split(",") if x.strip()]
 
 
@@ -45,13 +44,19 @@ def _compiler_available():
         pytest.skip(f"offline Triton compilation unavailable: {e}")
 
 
+def _uses_fp8e4nv(rec) -> bool:
+    """True when any launch argument is an E4M3 tensor, i.e. the variant lowers to ``float8e4nv`` (hardware: sm_89+ only)."""
+    f8 = getattr(torch, "float8_e4m3fn", None)
+    return f8 is not None and any(isinstance(v, torch.Tensor) and v.dtype == f8
+                                  for v in (*rec.args, *rec.kwargs.values()))
+
+
 def _check(rec, sm):
+    if sm < 89 and _uses_fp8e4nv(rec):
+        return  # fp8e4nv does not exist on Ampere and older; the dispatchers never launch these variants there
     try:
         ck = harness.compile_record(rec, sm)
     except Exception as e:
-        # FP8-output variants legitimately need sm_89+ (the dispatchers gate them); anything else is a real failure
-        if rec.kernel.__name__ in FP8_STORE_KERNELS and sm < 89 and "requires .target sm_" in str(e):
-            return
         raise AssertionError(f"{rec.kernel.__name__} failed to compile for sm_{sm}: {str(e)[-800:]}") from e
     shared = getattr(ck.metadata, "shared", 0) or 0
     limit = SMEM_LIMIT.get(sm)

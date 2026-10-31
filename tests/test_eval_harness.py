@@ -75,7 +75,10 @@ def test_identical_models_pass_g_w4_and_report_is_persisted():
 def test_degraded_candidate_fails_gate_with_reasons():
     par = SolverProvider(1.0, name="parent")
     cand = SolverProvider(0.4, name="cand")
-    cand.table = par.table + 3.0 * __import__("torch").randn_like(par.table)  # also distort the logits
+    import torch
+
+    g = torch.Generator().manual_seed(1234)  # hermetic: never depend on the global RNG state left by other tests / devices
+    cand.table = par.table + 3.0 * torch.randn(par.table.shape, generator=g)  # also distort the logits
     rep = run_eval(cfg(gate="g-w4"), providers={"candidate": cand, "parent": par}, persist=False)
     assert rep.gate.verdict == "fail"
     assert any("longgen" in r or "longctx" in r or "kl_p99" in r or "top1_flip" in r for r in rep.gate.reasons)
