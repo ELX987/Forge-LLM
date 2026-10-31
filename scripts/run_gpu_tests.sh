@@ -33,7 +33,14 @@ step cpu_tests --allow-fail --timeout 1800 -- "$PY" -m pytest tests -q --no-head
     "--junitxml=$REPORT_DIR/junit_cpu.xml"
 
 # GPU suite: do not stop at first failure, collect everything. -rs shows skip reasons.
+# Per-test watchdog (pytest-timeout, part of the dev extra): a hung test dumps all thread stacks instead of
+# freezing the whole run silently. Disable with FORGE_TEST_TIMEOUT=0.
+TIMEOUT_ARGS=()
+if "$PY" -c "import pytest_timeout" 2>/dev/null && [ "${FORGE_TEST_TIMEOUT:-240}" != "0" ]; then
+    TIMEOUT_ARGS=("--timeout=${FORGE_TEST_TIMEOUT:-240}" "--timeout-method=thread")
+fi
 step gpu_tests --allow-fail --timeout 5400 -- "$PY" -m pytest tests_gpu -v -rs --no-header -p no:cacheprovider \
+    "${TIMEOUT_ARGS[@]}" -o faulthandler_timeout=200 \
     "--junitxml=$REPORT_DIR/junit_gpu.xml" "$@"
 
 if [ "${FORGE_SKIP_BENCH:-0}" != "1" ]; then
