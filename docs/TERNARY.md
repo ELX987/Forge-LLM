@@ -1,6 +1,11 @@
 # Ternary (1.58-bit) in Forge
 
-> Status: **phases P1 and P2 done (CPU path).** P2 adds: `precision.quant_aware = ternary` plug-in (`forge/ternary/qat.py`), health metrics
+> Status: **phases P1-P3 done (CPU path).** P3 adds: `ternarize` recipe stage and `ptq format=ternary` (`forge/ternary/convert.py`), `pack` validation,
+> gate `g-t158` (TARGET placeholders), recipes `ternary-ptq` / `ternary-convert`, LoRA-on-ternary test, planner Scheme `t158` + prior,
+> training simulator `forge/planner/trainsim.py` + `POST /planner/train-sim`, chip table fields (`tdp_w`, `pcie_gbs`, `int8_tc_fast`) + RTX PRO 6000 preset.
+> NOT in P3 (deferred): planner rule R-Q7-TERNARY and T158 claims (the claims-seed tests tie claims to rules), simulator UI panel (P6), HF conversion on
+> a pretrained HF model with SubLN (needs a ModelConfig switch; `ternary-convert` uses QAT + distillation on the existing model), a separate `ternary_qat` stage
+> (it is `finetune`/`distill` with `precision.quant_aware: ternary`). (P1/P2:) P2 adds: `precision.quant_aware = ternary` plug-in (`forge/ternary/qat.py`), health metrics
 > `ternary/*`, collapse abort, job type `ternary_train` + templates in `configs/ternary/`, `forge ternary` CLI shortcut, job-detail health panel,
 > and the `forge.methods` catalog. Not in P2: bf16-stochastic-rounded optimizer state, wd-to-zero schedule, sharded trainer, kernels. (P1:) Implemented and CPU-tested: numerics (`forge/formats/ternary.py`), layout `ternary2_row`, oracle,
 > `t158` / `fq_t158` linears, artifact save/load/serve, `.t158.safetensors` tensor-level import/export. Everything else below is planned. No GPU path exists or is validated. See `docs/adr/0007-ternary-and-method-layer.md`
@@ -35,3 +40,9 @@ Zero-weight fraction healthy 40-52%, warn 60%, stop 80%. Equilibrium flip rate p
 ## Provenance
 
 Derived from tern158 v0.1 (single-GPU sm_120 results only: RTX PRO 6000 Blackwell, CUDA 13.4).
+
+## Simulator vs the one measured run (informational, NOT a validation)
+
+tern158 trained a 125M model on 200M tokens on one RTX PRO 6000 Blackwell: ~170k tok/s, MFU ~22%, 9.0 GB, 19.7 min. The Forge simulator (same shape,
+uncalibrated) predicts: `ternary_native` ~214k tok/s / 15.6 min / 12.4 GB; `ternary_qat` ~170k tok/s / 19.6 min / 12.5 GB; `bf16` ~189k tok/s. The
+`ternary_qat` throughput match is a coincidence of guessed efficiency factors, and memory is over-estimated by ~38%. One data point cannot calibrate a model.

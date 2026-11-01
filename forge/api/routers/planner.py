@@ -4,9 +4,10 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
 
 from forge.api.common import NotImplementedYet, call_flexible, lazy_module, require_module
 from forge.api.deps import Services, get_services
@@ -14,6 +15,8 @@ from forge.api.schemas import ClaimUpdate, PlannerRequest, ServeSimulateRequest
 from forge.core.errors import ConfigError, NotFound
 from forge.jobs.modelinfo import model_local_path
 from forge.jobs.repo import to_jsonable
+from forge.planner import trainsim
+from forge.planner.trainsim import TrainSimConfig
 
 router = APIRouter(tags=["planner"])
 
@@ -116,6 +119,25 @@ def plan(body: PlannerRequest, svc: Services = Depends(get_services)) -> Any:
     if fn is None:
         raise NotImplementedYet("forge.planner.search.plan is not available")
     return to_jsonable(call_flexible(fn, _aliases(svc, body), **body.options))
+
+
+class TrainSimRequest(BaseModel):
+    """Body of ``POST /planner/train-sim``."""
+
+    config: TrainSimConfig = Field(default_factory=TrainSimConfig, description="Model + training scheme + batch settings.")
+    chip: str | dict[str, Any] = Field("h100-sxm-80g", description="Chip preset / alias / name, or a ChipSpec dict.")
+    n_gpu: int = Field(1, ge=1, le=4096, description="GPUs.")
+    price_per_gpu_hour: float = Field(0.0, ge=0, description="USD per GPU-hour (0 = unknown).")
+    link: Literal["auto", "nvlink", "pcie"] = "auto"
+    calibration: float = Field(1.0, gt=0, description="Throughput calibration factor from a measured run (see forge.planner.trainsim.calibrate).")
+
+
+@router.post("/planner/train-sim", summary="Training memory / time / cost estimate for a scheme (bf16, fp8, lora, qlora, ternary ...); first-order and uncalibrated")
+def train_sim(body: TrainSimRequest) -> Any:
+    try:
+        return to_jsonable(trainsim.simulate(body.config, body.chip, body.n_gpu, body.price_per_gpu_hour, body.link, body.calibration))
+    except ValueError as e:
+        raise ConfigError(str(e)) from e
 
 
 @router.post("/serve/simulate", summary="Capacity simulation (weights/KV/free memory, max concurrency, decode ceiling)")

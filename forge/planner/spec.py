@@ -271,6 +271,9 @@ class ChipSpec(_M):
     num_sms: int | None = Field(default=None, ge=1, description="Number of SMs.")
     interconnect_gbs: float | None = Field(default=None, ge=0, description="GPU-GPU bandwidth in GB/s.")
     two_four_sparse: bool = Field(default=False, description="2:4 structured sparsity in tensor cores.")
+    tdp_w: float | None = Field(default=None, gt=0, description="Board power (W) for energy estimates; None = unknown.")
+    pcie_gbs: float | None = Field(default=None, gt=0, description="Host-link bandwidth in GB/s used when there is no GPU-GPU interconnect; None = 25.")
+    int8_tc_fast: bool = Field(default=True, description="False when the INT8 tensor-core pipe is throttled (sm_103 B300/GB300: ~1/30 of FP8); int8 kernels should use the bf16 path.")
     provenance: Provenance = Field(default=Provenance.vendor, description="vendor (datasheet) or measured (probe).")
     fingerprint: str = Field(default="", description="Chip fingerprint for calibration storage.")
     notes: str = Field(default="", description="Caveats (e.g. approximate datasheet values).")
@@ -335,8 +338,10 @@ CHIP_PRESETS: dict[str, ChipSpec] = {c.name: c for c in [
     _chip("v100-32g", 70, 32, 900, {"fp16": 125}, 80, l2_mb=6, smem_kib=96, interconnect_gbs=300, notes=_V + "; no bf16 tensor cores"),
     _chip("b200", 100, 192, 8000, {"bf16": 2250, "fp16": 2250, "fp8": 4500, "int8": 4500, "fp4": 9000}, 148, l2_mb=126, smem_kib=228, interconnect_gbs=1800, two_four_sparse=True,
           notes=_V + "; verify with the probe"),
-    _chip("b300", 103, 288, 8000, {"bf16": 2500, "fp16": 2500, "fp8": 5000, "fp4": 15000}, 160, interconnect_gbs=1800, two_four_sparse=True,
+    _chip("b300", 103, 288, 8000, {"bf16": 2500, "fp16": 2500, "fp8": 5000, "fp4": 15000}, 160, interconnect_gbs=1800, two_four_sparse=True, int8_tc_fast=False,
           notes="P5 Table 11.2 vendor numbers for Blackwell Ultra: F4=15 PFLOP/s, F8=5 PFLOP/s, B=8 TB/s; bf16 and SM count are approximate"),
+    _chip("rtx-pro-6000-blackwell", 120, 96, 1792, {"bf16": 500, "fp16": 500, "int8": 1000}, 188, tdp_w=600,
+          notes="Datasheet-derived values taken from the tern158 GPU table; the int8 rate is NOT confirmed (tern158 measured 346-411 TOPS with its own kernel on this chip, RTX PRO 6000 Blackwell Server Edition, CUDA 13.4). Confirm with the probe."),
     _chip("rtx-5090", 120, 32, 1792, {"bf16": 210, "fp16": 210, "fp8": 419, "fp4": 838}, 170, l2_mb=96, smem_kib=100,
           notes="APPROXIMATE datasheet-derived values for consumer Blackwell; confirm block-scaled FP4 support and rates with the probe (ARCHITECTURE 3)"),
 ]}
@@ -485,11 +490,13 @@ def _base_schemes() -> dict[str, Scheme]:
         "mxfp4": S(name="mxfp4", weight_bits=4, weight_scale_bits=8, weight_group=32, act="fp4", method="mr_gptq", family="mxfp4"),
         "w3a16-g128": S(name="w3a16-g128", weight_bits=3, weight_scale_bits=16, weight_group=128, method="gptq", family="sub4"),
         "w2a16-vq": S(name="w2a16-vq", weight_bits=2.0, weight_scale_bits=0, method="vq", family="sub4", experimental=True),
+        # ternary {-1,0,+1}: 2 bits packed storage (ideal log2(3)=1.585) + fp32 scale per 128 weights, int8 activations (EXPERIMENTAL; docs/TERNARY.md)
+        "t158": S(name="t158", weight_bits=2.0, weight_scale_bits=32, weight_group=128, act="int8", method="qat", family="t158", experimental=True),
     }
 
 
 SCHEMES = _base_schemes()
-_SCHEME_ALIASES = {"w4a16": "w4a16-g128", "w4": "w4a16-g128", "w8a8-fp8": "fp8", "fp8-w8a8": "fp8", "w8a8": "int8", "w4a4": "nvfp4", "fp4": "nvfp4", "w8a16-int8": "w8a16"}
+_SCHEME_ALIASES = {"w4a16": "w4a16-g128", "w4": "w4a16-g128", "w8a8-fp8": "fp8", "fp8-w8a8": "fp8", "w8a8": "int8", "w4a4": "nvfp4", "fp4": "nvfp4", "w8a16-int8": "w8a16", "ternary": "t158", "bitnet": "t158", "bitnet158": "t158", "t158-g128": "t158"}
 
 
 def parse_scheme(text: str | Scheme | None) -> Scheme:

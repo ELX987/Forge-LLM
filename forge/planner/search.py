@@ -202,6 +202,8 @@ def _weight_prior(s: Scheme, model: ModelSpec) -> QualityPrior:
         return QualityPrior(0.995, 0.005, Provenance.paper_reported, "P1 F2: 8-bit is essentially lossless")
     if fam == "sub4":
         return QualityPrior(0.88, 0.06, Provenance.untested, "P1 F5: usable at 2 bits for large models only")
+    if fam == "t158":
+        return QualityPrior(0.85, 0.10, Provenance.untested, "ternary QAT: literature claims near-parity at scale after long training; nothing measured in Forge, wide placeholder")
     return QualityPrior(1.0, 0.0, Provenance.derived, "reference")
 
 
