@@ -26,6 +26,7 @@ little-endian int32 words and to `formats.packing.pack_bits(t & 3, 2)`; golden v
 | Kernels: Triton GEMM (planes + gather kernels) and tern158-exact activation quantiser; dispatcher `ops_gemm.ternary_linear` (used by `t158` layers); spec `ternary_w158a8_gemm`; chip flags `has_int8` / `int8_tc_fast` | `forge/kernels/triton/gemm_ternary.py`, `forge/kernels/ops_gemm.py` |
 | Optional native CUDA tier (renamed `forge_ternary_C`; type-checked with stub headers; NOT wired into dispatch) | `forge/native/ternary/` |
 | Training simulator `POST /planner/train-sim` (estimate, uncalibrated) and planner scheme `t158` | `forge/planner/trainsim.py` |
+| Sharded multi-GPU trainer `parallel.strategy: zero_ternary` (row-sharded optimiser state, packed-code all-gather, shard-aware checkpoints, OOM policy, collectives check); CPU/gloo-validated, NCCL unexecuted | `forge/ternary/zero.py`, `docs/ZERO_TERNARY.md` |
 | Method catalog `GET /methods`; UI pages Methods and Ternary Lab; job-detail "Ternary health" panel | `forge/methods/`, `forge/web/static/js/pages/` |
 | End-to-end smoke (CPU or GPU) and hardware ladder | `scripts/ternary_smoke.sh`, `scripts/ternary_validate.sh`, `scripts/bench_ternary.py` |
 

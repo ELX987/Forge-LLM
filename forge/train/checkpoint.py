@@ -93,13 +93,17 @@ class CheckpointManager:
 
     # -- save ---------------------------------------------------------------------------------------------
     def save(self, step: int, state: dict[str, Any], *, good: bool = True, best: bool = False, pre_anneal: bool = False,
-             final: bool = False, meta: dict[str, Any] | None = None) -> Path:
+             final: bool = False, meta: dict[str, Any] | None = None, attachments: dict[str, Path] | None = None) -> Path:
+        """``attachments`` maps a name to a directory that is *moved* into the checkpoint (e.g. ``{"shards": <staging dir>}`` for the
+        sharded ternary trainer) before the atomic rename, so the checkpoint is complete or absent."""
         self.root.mkdir(parents=True, exist_ok=True)
         d = _step_dir(self.root, step)
         tmp = self.root / f".tmp_step_{step:08d}_{int(time.time() * 1000)}"
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             torch.save(state, tmp / "state.pt")
+            for name, src in (attachments or {}).items():
+                shutil.move(str(src), str(tmp / name))
             m = {"step": int(step), "good": bool(good), "time": time.time(), "run_id": self.run_id, **(meta or {})}
             (tmp / "meta.json").write_text(json.dumps(m, indent=1, default=str), encoding="utf-8")
             if d.exists():
@@ -168,9 +172,13 @@ class CheckpointManager:
             raise NotFound(f"no checkpoint for {which!r} in {self.root}")
         return s
 
-    def load(self, which: str | int | Path = "latest") -> tuple[dict[str, Any], dict[str, Any]]:
+    def path_of(self, which: str | int | Path = "latest") -> Path:
+        """Directory of the checkpoint ``which`` (same names as :meth:`load`)."""
         r = self.resolve(which)
-        d = r if isinstance(r, Path) else _step_dir(self.root, r)
+        return r if isinstance(r, Path) else _step_dir(self.root, r)
+
+    def load(self, which: str | int | Path = "latest") -> tuple[dict[str, Any], dict[str, Any]]:
+        d = self.path_of(which)
         if not (d / "state.pt").exists():
             raise NotFound(f"checkpoint missing: {d}")
         state = torch.load(d / "state.pt", map_location="cpu", weights_only=False)

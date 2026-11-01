@@ -125,7 +125,11 @@ class FakeQuantTernaryLinear(_FakeQuantLinear):
     def quant_spec(self) -> dict[str, Any]:
         return {"group_size": self.group_size, "rule": self.rule, "iters": self.iters, "quant_acts": self.quant_acts}
 
+    def codes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Current ``(codes int8 [N, K], scales)`` of the latent weights (the sharded trainer overrides this with its synchronised codes)."""
+        return tn.quantize_ternary(self.weight.detach(), self.group_size, self.rule, self.iters)
+
     def stats(self) -> dict[str, float]:
         """Ternary health stats of the current latent weights: fractions of -1/0/+1."""
-        t, _ = tn.quantize_ternary(self.weight.detach(), self.group_size, self.rule, self.iters)
+        t, _ = self.codes()
         return tn.code_stats(t)
