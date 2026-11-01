@@ -10,6 +10,7 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.gpu
+pytest.importorskip("zstandard", reason="zstandard not installed in this interpreter (pip install -e \".[gpu,serve,parquet,dev]\")")
 
 
 @pytest.fixture()

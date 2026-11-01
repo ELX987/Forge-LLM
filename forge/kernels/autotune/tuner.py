@@ -10,6 +10,10 @@ Protocol implemented::
     4. correctness gate  : every candidate's output is compared with the oracle (``compare``: tolerance rules of the
                            spec; integer outputs bit-exact).  Failing/raising candidates are recorded in
                            ``rejected`` and NEVER cached.
+    4b. sweep economy    : optional early abort (``prune_factor``: after a cheap probe a candidate > factor x slower than the best so
+                           far is dropped without the full measurement), ``deadline`` (stop starting new candidates), and
+                           ``accept_throttled`` (cache a best that was measured under throttling, flagged in the entry --
+                           a power-capped card is "throttled" in steady state and would otherwise never cache anything)
     5. cache key         : (chip fingerprint, driver/compiler versions, op, dtype config, shape bucket, layout_id)
     6. regression check  : ``Autotuner.regression`` compares a fresh median to the stored baseline (> 5% slower)
 
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +37,8 @@ from forge.kernels.ref.gemm_common import compare
 from .cache import AutotuneCache, default_cache_path, environment_versions, make_key
 from .space import Config, enumerate_configs, normalise_shape, shape_bucket
 from .timing import default_telemetry, detect_throttle, make_l2_flusher, summarize, time_callable
+
+CLEAN_PREFERENCE = 0.03  # an un-throttled winner is preferred over a faster throttled one only if within this fraction
 
 log = logging.getLogger("forge.kernels.autotune")
 
@@ -48,6 +55,7 @@ class Measurement:
     throttled: list[str] = field(default_factory=list)
     error: str | None = None
     detail: str = ""
+    pruned: bool = False  # dropped by the early-abort probe (slower than prune_factor x the best so far)
 
     def to_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -64,6 +72,7 @@ class TuneResult:
     best_measurement: Measurement | None
     measurements: list[Measurement] = field(default_factory=list)
     rejected: list[Measurement] = field(default_factory=list)
+    pruned: list[Measurement] = field(default_factory=list)  # early-aborted candidates (probe only)
     from_cache: bool = False
     cached: bool = False  # True if this call wrote the cache
     notes: list[str] = field(default_factory=list)
@@ -73,7 +82,7 @@ class TuneResult:
             "key": self.key, "key_fields": self.key_fields, "shape": self.shape, "best": self.best,
             "best_median_ms": self.best_measurement.median_ms if self.best_measurement else None,
             "from_cache": self.from_cache, "cached": self.cached,
-            "n_measured": len(self.measurements), "n_rejected": len(self.rejected), "notes": self.notes,
+            "n_measured": len(self.measurements), "n_rejected": len(self.rejected), "n_pruned": len(self.pruned), "notes": self.notes,
             "rejected": [{"config": m.config, "error": m.error, "detail": m.detail} for m in self.rejected],
             "measurements": [m.to_dict() for m in self.measurements],
         }
@@ -144,8 +153,26 @@ class Autotuner:
             return list(self._timer(fn, cfg))
         return time_callable(fn, warmup=self.warmup, repeats=self.repeats, flush=self._get_flusher())
 
-    def _measure(self, run_fn: Callable, cfg: Config, shape: dict[str, int]) -> Measurement:
+    def _probe(self, fn: Callable[[], Any], cfg: Config) -> list[float]:
+        """A few cheap timings (early-abort test): the timer's own ``probe`` if it has one, else 3 plain calls."""
+        probe = getattr(self._timer, "probe", None)
+        if probe is not None:
+            return list(probe(fn, cfg))
+        if self._timer is not None:
+            return list(self._timer(fn, cfg))[:3]
+        return time_callable(fn, warmup=1, repeats=3, flush=self._get_flusher())
+
+    def _measure(self, run_fn: Callable, cfg: Config, shape: dict[str, int], *, best_ms: float | None = None,
+                 prune_factor: float | None = None) -> Measurement:
         m = Measurement(config=cfg)
+        if prune_factor and best_ms:
+            pt = self._probe(lambda: run_fn(cfg, shape), cfg)
+            if pt and summarize(pt).median > prune_factor * best_ms:
+                st = summarize(pt)
+                m.times_ms, m.n, m.median_ms, m.iqr_ms, m.min_ms = pt, st.n, st.median, st.iqr, st.min
+                m.pruned = True
+                m.detail = f"early abort: probe {st.median:.4g} ms > {prune_factor:g} x best {best_ms:.4g} ms"
+                return m
         for attempt in range(self.retries + 1):
             before = self._telemetry() if self._telemetry else {}
             times = self._time(lambda: run_fn(cfg, shape), cfg)
@@ -192,11 +219,21 @@ class Autotuner:
         force: bool = False,
         group: int = 128,
         raise_on_fail: bool = False,
+        prune_factor: float | None = None,
+        deadline: float | None = None,
+        accept_throttled: bool = False,
+        store: bool = True,
     ) -> TuneResult | list[TuneResult]:
-        """Tune one shape (dict / ``(M,N,K)``) -> :class:`TuneResult`, or a list of shapes -> list of results."""
+        """Tune one shape (dict / ``(M,N,K)``) -> :class:`TuneResult`, or a list of shapes -> list of results.
+
+        ``prune_factor``: early-abort candidates whose probe is more than this many times slower than the best so far.
+        ``deadline`` (``time.monotonic()`` value): stop starting new candidates after it (the result covers the candidates
+        measured so far, ``notes`` says so).  ``accept_throttled``: cache a best measured under throttling (entry flagged).
+        ``store=False``: never write the cache (the caller refines further and calls :meth:`commit` once with the final result)."""
         if isinstance(shapes, list):
             return [self.tune(spec, s, run_fn, ref_fn, dtype_cfg=dtype_cfg, layout_id=layout_id, candidates=candidates,
-                              rank_fn=rank_fn, exact=exact, force=force, group=group, raise_on_fail=raise_on_fail)
+                              rank_fn=rank_fn, exact=exact, force=force, group=group, raise_on_fail=raise_on_fail,
+                              prune_factor=prune_factor, deadline=deadline, accept_throttled=accept_throttled, store=store)
                     for s in shapes]  # type: ignore[misc]
         shape = normalise_shape(shapes)
         fields = self.key_fields(spec, shape, dtype_cfg=dtype_cfg, layout_id=layout_id)
@@ -215,7 +252,11 @@ class Autotuner:
         cands = self._select(cands, shape, rank_fn)
         ref = ref_fn(shape)
         good: list[Measurement] = []
+        best_ms: float | None = None
         for cfg in cands:
+            if deadline is not None and time.monotonic() > deadline:
+                res.notes.append(f"time budget reached: {len(good)} of {len(cands)} candidates measured")
+                break
             m = Measurement(config=cfg)
             try:
                 ok, detail = self._gate(spec, run_fn, ref, cfg, shape, exact)
@@ -230,27 +271,52 @@ class Autotuner:
                 log.warning("autotune: candidate %s rejected by correctness gate (%s)", cfg, detail)
                 continue
             try:
-                timed = self._measure(run_fn, cfg, shape)
+                timed = self._measure(run_fn, cfg, shape, best_ms=best_ms, prune_factor=prune_factor)
             except Exception as e:
                 m.error = f"{type(e).__name__}: {e}"
                 res.rejected.append(m)
                 continue
-            timed.correct, timed.detail = True, detail
+            timed.correct = True
+            if timed.pruned:
+                res.pruned.append(timed)
+                continue
+            timed.detail = detail
             res.measurements.append(timed)
             good.append(timed)
+            if timed.median_ms is not None and (best_ms is None or timed.median_ms < best_ms):
+                best_ms = timed.median_ms
         if not good:
             res.notes.append("every candidate failed the correctness gate or raised; nothing cached")
             if raise_on_fail and res.rejected and all(r.correct is False for r in res.rejected):
                 raise KernelCorrectnessError(f"all {len(res.rejected)} candidates failed for {spec.kernel} {shape}",
                                              details={"rejected": [r.error for r in res.rejected][:8]})
             return res
+        # global minimum median over every candidate that passed the gate; a clean (un-throttled) measurement is preferred only
+        # when it is within CLEAN_PREFERENCE of that minimum (throttled numbers are pessimistic, so a throttled winner is real)
+        overall = min(good, key=lambda g: (g.median_ms, g.iqr_ms or 0.0))
         clean = [g for g in good if not g.throttled]
-        pool = clean or good
-        best = min(pool, key=lambda g: (g.median_ms, g.iqr_ms or 0.0))
+        best = overall
+        if overall.throttled and clean:
+            best_clean = min(clean, key=lambda g: (g.median_ms, g.iqr_ms or 0.0))
+            if best_clean.median_ms <= overall.median_ms * (1.0 + CLEAN_PREFERENCE):
+                best = best_clean
         res.best, res.best_measurement = dict(best.config), best
-        if best.throttled:
-            res.notes.append("best candidate was measured under throttling: result NOT cached")
-        else:
-            self.cache.put(key, fields, res.best, {"median": best.median_ms, "iqr": best.iqr_ms, "n": best.n})
-            res.cached = True
+        if store:
+            self.commit(res, accept_throttled=accept_throttled)
         return res
+
+    def commit(self, res: TuneResult, *, accept_throttled: bool = False) -> bool:
+        """Write ``res.best`` to the cache (the one write of a tune / refine sequence).  A winner measured under throttling is
+        cached, flagged ``throttled``, only with ``accept_throttled``.  Returns whether the entry was written."""
+        best = res.best_measurement
+        if res.best is None or best is None:
+            return False
+        if best.throttled and not accept_throttled:
+            res.notes.append("best candidate was measured under throttling: result NOT cached")
+            return False
+        if best.throttled:
+            res.notes.append("best candidate was measured under throttling: cached anyway, flagged throttled (accept_throttled)")
+        self.cache.put(res.key, res.key_fields, res.best, {"median": best.median_ms, "iqr": best.iqr_ms, "n": best.n,
+                                                           "throttled": bool(best.throttled)})
+        res.cached = True
+        return True

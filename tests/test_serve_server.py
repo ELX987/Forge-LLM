@@ -5,13 +5,15 @@ import json
 import threading
 import time
 
-import httpx
 import pytest
-from fastapi.testclient import TestClient
 
-from forge.serve._testing import ByteTokenizer, make_engine, tiny_model
-from forge.serve.client import ForgeServeClient, ServeClientError
-from forge.serve.server import create_app
+httpx = pytest.importorskip("httpx", reason="httpx not installed in this interpreter (pip install -e \".[serve,dev]\")")
+pytest.importorskip("fastapi", reason="fastapi not installed in this interpreter (pip install -e \".[serve,dev]\")")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from forge.serve._testing import ByteTokenizer, make_engine, tiny_model  # noqa: E402
+from forge.serve.client import ForgeServeClient, ServeClientError  # noqa: E402
+from forge.serve.server import create_app  # noqa: E402
 
 
 @pytest.fixture()

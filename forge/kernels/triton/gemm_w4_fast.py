@@ -30,6 +30,7 @@ on a GPU.  Use ``scripts/bench_w4a16.py`` on the GPU host.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -259,7 +260,8 @@ _RESOLVED: dict[tuple, tuple[dict[str, Any], tuple]] = {}  # per-call Python ove
 
 def _resolve(m: int, n: int, k: int, config: dict[str, Any] | None, sm: int | None, num_sms: int, gsz: int) -> tuple[dict[str, Any], tuple]:
     ck = tuple(sorted(config.items())) if config else None
-    key = (m, n, k, sm, num_sms, gsz, ck)
+    # the resolved config depends on the environment too (the default routing reads FORGE_W4_DEQUANT_MIN_M): key on it
+    key = (m, n, k, sm, num_sms, gsz, ck, os.environ.get("FORGE_W4_DEQUANT_MIN_M", ""))
     hit = _RESOLVED.get(key)
     if hit is None:
         if len(_RESOLVED) > 4096:
@@ -299,6 +301,8 @@ def w4_fast_gemm(
     cfg, cfg_items = _resolve(m, n, k, config, sm, num_sms, gsz)
     if cfg["impl"] == "legacy":
         raise ValueError("impl='legacy' is launched by gemm_wq.wq_gemm, not by w4_fast_gemm")
+    if cfg["impl"] == "dequant_matmul":
+        raise ValueError("impl='dequant_matmul' is launched by gemm_w4_dequant.w4_dequant_matmul, not by w4_fast_gemm")
     n_groups = int(scales.shape[0])
     has_zeros = zeros is not None
     dummy = qweight

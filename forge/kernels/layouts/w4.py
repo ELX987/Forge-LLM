@@ -320,6 +320,8 @@ def sort_columns_by_group(p: PackedW4) -> tuple[PackedW4, torch.Tensor] | None:
     """
     if p.g_idx is None:
         return None
+    # PREPARE-TIME ONLY: this synchronises the device (``.cpu()`` / ``int(tensor)``).  Launch paths must go through
+    # :func:`cached_group_sort` and never call it inside CUDA graph capture.
     gs, g = effective_group(p.group_size, p.k), int(p.scales.shape[0])
     gi = p.g_idx.long().cpu()
     if gi.numel() != p.k or int(gi.min()) < 0 or int(gi.max()) >= g:
@@ -333,3 +335,42 @@ def sort_columns_by_group(p: PackedW4) -> tuple[PackedW4, torch.Tensor] | None:
     dev = q.device
     sorted_p = pack_w4(q[:, perm.to(dev)], s, z, p.group_size, p.layout, None)
     return sorted_p, perm.to(torch.int32).to(dev)
+
+
+_NO_SORT = object()
+GROUP_SORT_KEY = "_gsorted"
+
+
+def _stamp(*ts: torch.Tensor | None) -> tuple:
+    return tuple((t.data_ptr(), t._version, tuple(t.shape), str(t.device)) for t in ts if t is not None)
+
+
+def cached_group_sort(p: PackedW4, *, compute: bool = True) -> Any:
+    """``(sorted weight, perm)`` of an act-order weight from the cache in ``p.meta`` (stamped with the identity / version of
+    the source tensors), computing it once with :func:`sort_columns_by_group` when missing and ``compute`` is true.
+
+    Returns ``None`` if the groups are irregular (or ``p`` has no ``g_idx``), and :data:`MISSING_SORT` when the cache is
+    cold/stale and ``compute`` is false.  The computation synchronises the device, so call this at pack / load / prepare
+    time (``prepare_w4``, ``KernelW4A16Linear.prepare``); the launch path only reads the cache (hits are sync-free) and
+    uses ``compute=False`` while a CUDA graph is being captured."""
+    if p.g_idx is None:
+        return None
+    stamp = _stamp(p.qweight, p.scales, p.zeros, p.g_idx)
+    hit = p.meta.get(GROUP_SORT_KEY)
+    if hit is None or hit[0] != stamp:
+        if not compute:
+            return MISSING_SORT
+        res = sort_columns_by_group(p)
+        hit = p.meta[GROUP_SORT_KEY] = (stamp, _NO_SORT if res is None else res)
+    return None if hit[1] is _NO_SORT else hit[1]
+
+
+class _Missing:
+    def __repr__(self) -> str:
+        return "MISSING_SORT"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+MISSING_SORT = _Missing()

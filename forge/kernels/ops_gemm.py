@@ -48,7 +48,7 @@ from forge.kernels.layouts import (
     repack,
 )
 from forge.kernels.layouts.chip import ChipInfo, chip_info
-from forge.kernels.w4_tuning import DECODE_MAX_M, W4_TUNE_TAG, neighbor_buckets, nearest_entry
+from forge.kernels.w4_tuning import DECODE_MAX_M, neighbor_buckets, nearest_entry, w4_tune_tag
 from forge.kernels.ref import (
     dequantize_fp4_ref,
     dequantize_fp8_ref,
@@ -264,6 +264,19 @@ def _portable(packed: PackedW4) -> PackedW4:
     return hit[1]
 
 
+def prepare_w4(packed: PackedW4) -> PackedW4:
+    """Pre-compute the launch-time metadata of a W4 weight (portable repack of fragment layouts, act-order column sort +
+    permutation) so :func:`w4a16_linear` never has to synchronise the device or touch the host -- required for CUDA graph
+    capture with act-order weights.  Call after packing / loading / moving a weight, outside graph capture (it syncs).
+    Returns the portable_row weight the kernels will use (``packed`` itself when it already is one)."""
+    from forge.kernels.layouts import cached_group_sort
+
+    p = _portable(packed)
+    if p.g_idx is not None:
+        cached_group_sort(p, compute=True)
+    return p
+
+
 def _compute_dtype(x: torch.Tensor, chip: ChipInfo) -> torch.dtype:
     """bf16 has no tensor-core path before sm_80: compute in fp16 there."""
     if x.dtype == torch.bfloat16 and x.is_cuda and not chip.has_bf16:
@@ -291,7 +304,8 @@ def w4a16_linear(
             xc = x.to(_compute_dtype(x, chip))
             m = xc.reshape(-1, xc.shape[-1]).shape[0]
             cfg = config or tuned_config("w4a16_gemm", chip, m, p.n, p.k,
-                                         dtype_cfg_str=dtype_cfg("w4a16_gemm", xc.dtype, p.group_size, W4_TUNE_TAG),
+                                         dtype_cfg_str=dtype_cfg("w4a16_gemm", xc.dtype, p.group_size,
+                                                                     w4_tune_tag(p.g_idx is not None, p.zeros is None)),
                                          layout_id=p.layout_id)
             y = w4a16_gemm_triton(xc, p, bias, config=cfg, deterministic=deterministic, sm=chip.sm, num_sms=chip.num_sms,
                                   allow_fallback=True if (cfg and not config) else None)
@@ -681,6 +695,10 @@ class _KernelLinear(_PackedBase):  # type: ignore[misc,valid-type]
         return f"kind={self.kind}, in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
 
 
+def _w4_prepare_hook(module: Any, _incompatible: Any) -> None:  # module-level (not a lambda) so modules stay picklable
+    module.prepare()
+
+
 class KernelW4A16Linear(_KernelLinear):
     """4-bit weight-only linear backed by :func:`w4a16_linear` (portable_row or fragment layout)."""
 
@@ -697,6 +715,7 @@ class KernelW4A16Linear(_KernelLinear):
         self.register_buffer("zeros", torch.zeros(shapes["zeros"], dtype=torch.int32, device=device) if not sym else None)
         self.register_buffer("g_idx", torch.zeros(in_features, dtype=torch.int32, device=device) if has_g_idx else None)
         self._packed_meta: dict[str, Any] = {}  # holds the (stamped) portable-repack cache across forward calls
+        self.register_load_state_dict_post_hook(_w4_prepare_hook)
 
     @classmethod
     def from_packed(cls, packed: PackedW4, bias: torch.Tensor | None = None) -> KernelW4A16Linear:
@@ -711,7 +730,23 @@ class KernelW4A16Linear(_KernelLinear):
                 m.g_idx.copy_(packed.g_idx)
             if bias is not None:
                 m.bias.data = bias.detach().clone()
+        m.prepare()
         return m
+
+    def prepare(self) -> KernelW4A16Linear:
+        """Pre-compute the launch metadata (act-order column sort) so the forward pass is sync-free and CUDA-graph capturable.
+        Runs automatically after ``from_packed`` / ``load_state_dict`` / ``.to()``; call it by hand after editing buffers."""
+        if self.g_idx is not None:
+            try:
+                prepare_w4(self.packed())
+            except Exception as e:  # noqa: BLE001 - never break loading; the launch path computes lazily (outside graph capture)
+                log.debug("W4 prepare failed: %s", e)
+        return self
+
+    def _apply(self, fn, *args, **kwargs):  # noqa: ANN001
+        out = super()._apply(fn, *args, **kwargs)
+        out.prepare()  # buffers moved / cast: the identity-stamped caches are stale
+        return out
 
     @classmethod
     def from_dense(cls, linear: nn.Linear, *, group_size: int = 128, sym: bool = True, layout: str | Layout | None = None,
@@ -997,5 +1032,5 @@ __all__ = [
     "PACKED_LINEAR_CLASSES", "as_packed_fp4", "bench_cases", "chip_of", "clear_config_memo", "dtype_cfg", "force_ref",
     "fp4_linear", "fp8_linear", "int8_linear", "kernel_debug", "last_path", "make_packed_linear", "native_fp4_available",
     "quantize_act_fp4", "quantize_act_fp8", "quantize_act_int8", "quantize_weight_fp4", "quantize_weight_fp8",
-    "register_packed_linears", "reset_failure_memo", "triton_usable", "tuned_config", "w4a16_linear", "w8a16_linear",
+    "prepare_w4", "register_packed_linears", "reset_failure_memo", "triton_usable", "tuned_config", "w4a16_linear", "w8a16_linear",
 ]

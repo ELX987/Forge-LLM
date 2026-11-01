@@ -5,6 +5,8 @@
 #   bash scripts/run_gpu_tests.sh -k w4a16        # extra args are passed to pytest
 #   FORGE_SKIP_BENCH=1 bash scripts/run_gpu_tests.sh
 #
+# Needs: python -m pip install -e ".[gpu,serve,parquet,dev]"   (the preflight below checks this interpreter and says so)
+#
 # Output: ./gpu_report/{report.md,report.json,junit_*.xml,*.log} (override with REPORT_DIR).
 # Exit code is non-zero if any step or test failed. Skipped tests are reported, never counted as passes.
 set -euo pipefail
@@ -22,6 +24,11 @@ step() { "$PY" "$HELPER" step "$REPORT_DIR" "$@"; }
 
 "$PY" "$HELPER" env "$REPORT_DIR"
 
+# Environment preflight: the interpreter must have the project's hard dependencies (forge installed as a package, fastapi,
+# uvicorn, zstandard, pytest; pytest-timeout is optional). Prints a banner with the exact install command for THIS
+# interpreter when something is missing, then continues (affected tests are skipped with a reason, never collection errors).
+"$PY" "$HELPER" preflight "$REPORT_DIR" || true
+
 "$PY" -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' \
     || die "CUDA not available to torch - run scripts/vast_setup.sh first"
 
@@ -36,7 +43,7 @@ if "$PY" -c "import pytest_timeout" 2>/dev/null && [ "${FORGE_TEST_TIMEOUT:-240}
     CPU_TIMEOUT_ARGS=("--timeout=${FORGE_CPU_TEST_TIMEOUT:-180}" "--timeout-method=signal")
 fi
 step cpu_tests --allow-fail --timeout 3600 -- "$PY" -m pytest tests -v --no-header -p no:cacheprovider \
-    "${CPU_TIMEOUT_ARGS[@]}" -o faulthandler_timeout=170 \
+    ${CPU_TIMEOUT_ARGS[@]+"${CPU_TIMEOUT_ARGS[@]}"} -o faulthandler_timeout=170 \
     "--junitxml=$REPORT_DIR/junit_cpu.xml"
 
 # GPU suite: do not stop at first failure, collect everything. -rs shows skip reasons.
@@ -47,8 +54,8 @@ if "$PY" -c "import pytest_timeout" 2>/dev/null && [ "${FORGE_TEST_TIMEOUT:-240}
     TIMEOUT_ARGS=("--timeout=${FORGE_TEST_TIMEOUT:-240}" "--timeout-method=thread")
 fi
 step gpu_tests --allow-fail --timeout 5400 -- "$PY" -m pytest tests_gpu -v -rs --no-header -p no:cacheprovider \
-    "${TIMEOUT_ARGS[@]}" -o faulthandler_timeout=200 \
-    "--junitxml=$REPORT_DIR/junit_gpu.xml" "$@"
+    ${TIMEOUT_ARGS[@]+"${TIMEOUT_ARGS[@]}"} -o faulthandler_timeout=200 \
+    "--junitxml=$REPORT_DIR/junit_gpu.xml" ${@+"$@"}
 
 if [ "${FORGE_SKIP_BENCH:-0}" != "1" ]; then
     step kernel_bench_quick --allow-fail --timeout 1800 -- "$PY" -m forge.cli bench \

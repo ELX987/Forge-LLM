@@ -7,7 +7,12 @@ Subcommands
     Run a command, tee its output to ``<report_dir>/<name>.log`` and append a record
     (name, command, exit code, seconds, last lines) to ``<report_dir>/steps.json``.
 ``env <report_dir>``
-    Write ``<report_dir>/env.json`` (GPU, driver, torch, triton, python, forge versions).
+    Write ``<report_dir>/env.json`` (GPU, driver, torch, triton, python, forge versions, dependency status).
+``preflight <report_dir>``
+    Check that THIS interpreter has the project's hard dependencies (forge installed as a package, fastapi, uvicorn,
+    zstandard, pytest; pytest-timeout is optional), print a banner with the exact ``pip install -e ".[gpu,serve,parquet,dev]"``
+    command for this interpreter when something is missing, write ``<report_dir>/preflight.json``.  Always exits 0 (the
+    caller continues; tests that need a missing package are skipped with the reason).
 ``bench-export <report_dir>``
     Dump the newest ``kernel_bench`` rows from ``$FORGE_HOME/forge.db`` to ``<report_dir>/bench_summary.json``.
 ``finalize <report_dir>``
@@ -119,6 +124,108 @@ def cmd_step(argv: list[str]) -> int:
     return 0 if (code == 0 or allow_fail) else code
 
 
+INSTALL_EXTRAS = "gpu,serve,parquet,dev"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# (import name, distribution name, required)
+DEPENDENCIES = [
+    ("forge", "forge-llm", True),
+    ("fastapi", "fastapi", True),
+    ("uvicorn", "uvicorn", True),
+    ("zstandard", "zstandard", True),
+    ("pytest", "pytest", True),
+    ("pytest_timeout", "pytest-timeout", False),
+]
+
+
+def install_command(python: str | None = None) -> str:
+    """The exact command that installs everything the suite needs into the given interpreter."""
+    py = python or sys.executable
+    py = f'"{py}"' if " " in py else py
+    return f'{py} -m pip install -e ".[{INSTALL_EXTRAS}]"'
+
+
+def _source_tree_version() -> str:
+    try:
+        import re
+
+        text = (REPO_ROOT / "forge" / "__version__.py").read_text(encoding="utf-8")
+        m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)", text)
+        return m.group(1) if m else "?"
+    except OSError:
+        return "?"
+
+
+def dep_status(module: str, dist: str) -> str:
+    """Version string, or ``missing (<reason>)``.  ``forge`` that is only importable from the source tree (no installed
+    distribution) is reported as ``not installed (running from source tree)`` instead of ``missing (ModuleNotFoundError)``."""
+    import importlib.metadata as md
+    import importlib.util
+
+    try:
+        return md.version(dist)
+    except md.PackageNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001 - broken metadata: fall through to the import probe
+        pass
+    if module == "forge" and (REPO_ROOT / "forge" / "__init__.py").is_file():
+        return "not installed (running from source tree)"
+    try:
+        if importlib.util.find_spec(module) is not None:
+            m = __import__(module)
+            return str(getattr(m, "__version__", "?"))
+    except Exception as e:  # noqa: BLE001
+        return f"missing ({type(e).__name__})"
+    return "missing (ModuleNotFoundError)"
+
+
+def preflight_report() -> dict:
+    deps: dict[str, str] = {}
+    problems: list[str] = []
+    optional_missing: list[str] = []
+    for module, dist, required in DEPENDENCIES:
+        st = dep_status(module, dist)
+        deps[dist] = st
+        if st.startswith("missing"):
+            (problems if required else optional_missing).append(dist)
+        elif st.startswith("not installed") and required:
+            problems.append(dist)
+    return {"python": sys.executable, "deps": deps, "missing_required": problems, "missing_optional": optional_missing,
+            "install_command": install_command(), "ok": not problems}
+
+
+TORCH_WARNING = ("WARNING: do not let pip replace the NVIDIA/CUDA torch build already installed on this GPU host (a plain install can pull a\n"
+                 "CPU-only or mismatched torch from PyPI).  If torch is already the right build, pin it first, e.g.\n"
+                 "    python -m pip freeze | grep -i -E '^(torch|triton|nvidia-)' > /tmp/gpu-pins.txt  &&  <install command above> -c /tmp/gpu-pins.txt\n"
+                 "or install only the missing packages with --no-deps (e.g. python -m pip install --no-deps -e . ; python -m pip install fastapi uvicorn zstandard pytest).")
+
+
+def format_banner(rep: dict) -> str:
+    bar = "=" * 78
+    lines = [bar, "FORGE ENVIRONMENT PREFLIGHT: this Python is missing project dependencies", bar,
+             f"interpreter: {rep['python']}"]
+    for dist in rep["missing_required"]:
+        lines.append(f"  - {dist}: {rep['deps'][dist]}")
+    for dist in rep["missing_optional"]:
+        lines.append(f"  - {dist}: {rep['deps'][dist]}  (optional: per-test hang watchdog is disabled)")
+    lines += ["", "Install everything the suite needs into THIS interpreter (run from the repository root):", "",
+              f"    {rep['install_command']}", "",
+              TORCH_WARNING, "",
+              "Continuing anyway: tests that need a missing package are reported as skipped (with the reason), not as collection errors.", bar]
+    return "\n".join(lines)
+
+
+def cmd_preflight(argv: list[str]) -> int:
+    report_dir = Path(argv[0])
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rep = preflight_report()
+    if rep["missing_required"] or rep["missing_optional"]:
+        print(format_banner(rep), flush=True)
+    else:
+        print("[preflight] all dependencies present: " + ", ".join(f"{k} {v}" for k, v in rep["deps"].items()), flush=True)
+    (report_dir / "preflight.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
+    return 0
+
+
 def cmd_env(argv: list[str]) -> int:
     report_dir = Path(argv[0])
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -142,12 +249,22 @@ def cmd_env(argv: list[str]) -> int:
         env["nvidia_smi"] = out.stdout.strip().splitlines() if out.returncode == 0 else out.stderr.strip()
     except Exception as e:  # noqa: BLE001
         env["nvidia_smi"] = f"unavailable: {e}"
-    for mod in ("torch", "triton", "transformers", "safetensors", "pydantic", "fastapi", "numpy", "forge"):
+    for mod in ("torch", "triton", "transformers", "safetensors", "pydantic", "fastapi", "uvicorn", "zstandard", "numpy", "forge"):
+        if mod == "forge":  # running from the source tree is fine, but say so instead of reporting a ModuleNotFoundError
+            st = dep_status("forge", "forge-llm")
+            env[mod] = st
+            if st.startswith("not installed"):
+                env["forge_source_version"] = _source_tree_version()
+            continue
         try:
             m = __import__(mod)
             env[mod] = getattr(m, "__version__", "?")
         except Exception as e:  # noqa: BLE001
             env[mod] = f"missing ({type(e).__name__})"
+    pf = preflight_report()
+    env["missing_dependencies"] = pf["missing_required"]
+    if pf["missing_required"]:
+        env["install_command"] = pf["install_command"]
     try:
         import torch  # type: ignore
 
@@ -267,10 +384,12 @@ def cmd_finalize(argv: list[str]) -> int:
 
     md: list[str] = ["# Forge GPU report", "", f"Generated: {report['generated']}", f"Overall: **{overall}**", ""]
     md += ["## Environment", ""]
-    for k in ("python", "platform", "torch", "torch_cuda", "triton", "transformers", "forge", "cuda_available",
-              "fp32_matmul_precision", "allow_tf32_matmul", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "NVIDIA_TF32_OVERRIDE"):
+    for k in ("python", "platform", "torch", "torch_cuda", "triton", "transformers", "forge", "fastapi", "uvicorn", "zstandard",
+              "cuda_available", "fp32_matmul_precision", "allow_tf32_matmul", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "NVIDIA_TF32_OVERRIDE"):
         if k in env:
             md.append(f"- {k}: `{env[k]}`")
+    if env.get("missing_dependencies"):
+        md.append(f"- MISSING DEPENDENCIES: {', '.join(env['missing_dependencies'])} -> `{env.get('install_command', '')}`")
     smi = env.get("nvidia_smi")
     if smi:
         md.append("- nvidia-smi (index, name, mem, driver, cc, power limit, max sm clock):")
@@ -306,10 +425,11 @@ def cmd_finalize(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("step", "env", "finalize", "bench-export"):
+    if not argv or argv[0] not in ("step", "env", "preflight", "finalize", "bench-export"):
         print(__doc__)
         return 64
-    return {"step": cmd_step, "env": cmd_env, "finalize": cmd_finalize, "bench-export": cmd_bench_export}[argv[0]](argv[1:])
+    return {"step": cmd_step, "env": cmd_env, "preflight": cmd_preflight, "finalize": cmd_finalize,
+            "bench-export": cmd_bench_export}[argv[0]](argv[1:])
 
 
 if __name__ == "__main__":

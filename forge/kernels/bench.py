@@ -169,7 +169,7 @@ def _build_w4(shape: dict[str, int], dtype: torch.dtype, device: str, cfg: Bench
     from forge.kernels import ops_gemm
     from forge.kernels.layouts import pack_w4, quantize_w4_rtn
     from forge.kernels.ref import w4a16_gemm_ref
-    from forge.kernels.w4_tuning import W4_TUNE_TAG
+    from forge.kernels.w4_tuning import w4_tune_tag
 
     g = shape.get("group", cfg.group_size)
     w = _weights(shape, device, cfg.seed)
@@ -188,7 +188,7 @@ def _build_w4(shape: dict[str, int], dtype: torch.dtype, device: str, cfg: Bench
         "path": lambda: ops_gemm.last_path("w4a16_linear") or "?",
         "spec": "w4a16_gemm",
         "state": state,
-        "dtype_cfg": ops_gemm.dtype_cfg("w4a16_gemm", dtype, g, W4_TUNE_TAG),
+        "dtype_cfg": ops_gemm.dtype_cfg("w4a16_gemm", dtype, g, w4_tune_tag(p.g_idx is not None, p.zeros is None)),
     }
 
     def run_cfg(c: dict[str, Any]) -> torch.Tensor:

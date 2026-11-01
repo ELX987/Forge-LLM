@@ -48,7 +48,9 @@ from .layout import (
 )
 from .rtn import quantize_w4_rtn, quantize_w8_rtn
 from .w4 import (
+    MISSING_SORT,
     PackedW4,
+    cached_group_sort,
     dequantize_parts,
     effective_group,
     fragment_tile_perm,

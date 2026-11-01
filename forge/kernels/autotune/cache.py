@@ -1,7 +1,9 @@
 """JSON autotune cache (Plan 6.6 steps 5-6).  Default location ``<FORGE_HOME>/autotune/<chip fingerprint>.json``.
 
 Cache key = hash of ``(chip fingerprint, driver/compiler versions, op, dtype config, shape bucket, layout_id)``.
-Only configs that passed the correctness gate and were measured un-throttled are ever stored.
+Only configs that passed the correctness gate are ever stored.  A winner measured under throttling (power-capped card) is stored
+only when the caller accepts it (``accept_throttled``) and is then flagged ``"throttled": true`` in the entry (ranking valid, absolute
+times pessimistic).
 """
 from __future__ import annotations
 
@@ -117,6 +119,8 @@ class AutotuneCache:
             "n": stats["n"],
             "tuned_at": time.time(),
         }
+        if stats.get("throttled"):
+            entry["throttled"] = True  # measured on a throttled / power-capped device: ranking is valid, absolute times are pessimistic
         with self._lock:
             self._load()
             self._entries[key] = entry

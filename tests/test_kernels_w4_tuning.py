@@ -55,10 +55,11 @@ def test_chip_families():
 def test_default_config_is_valid_feasible_and_idempotent(sm, sms, m, n, k):
     c = default_w4_config(m, n, k, sm=sm, num_sms=sms)
     assert normalise_w4_config(c, m) == c
-    assert c["impl"] in ("dot", "gemv") and c["tile_k"] >= MIN_TILE_K[c["impl"]] and c["tile_m"] >= 16
+    assert c["impl"] in ("dot", "gemv", "dequant_matmul") and c["tile_k"] >= MIN_TILE_K[c["impl"]]
+    assert c["tile_m"] >= 16 or c["impl"] == "gemv"  # gemv derives tile_m from M
     assert c["tile_k"] % 128 == 0 and c["split_k"] >= 1
     assert w4_feasible(c, sm=sm), c
-    if sm < 80:
+    if sm < 80 and c["impl"] != "dequant_matmul":
         assert c["stages"] <= 2
     if m > 64:
         assert c["split_k"] == 1
@@ -87,7 +88,8 @@ def test_split_k_decode_rules():
 
 def test_legacy_style_and_odd_configs_are_repaired():
     c = resolve_w4_config(3, 40, 100, {"tile_m": 16, "tile_n": 32, "tile_k": 32, "split_k": 3}, sm=89, num_sms=128)
-    assert c["impl"] == "dot" and c["tile_k"] == 128 and c["tile_n"] == 32 and c["split_k"] == 3
+    assert c["impl"] == "dot" and c["tile_k"] == 128 and c["tile_n"] == 32 and c["split_k"] == 3  # no impl named -> dot, even at M=3
+    assert resolve_w4_config(1024, 4096, 4096, {"tile_m": 64, "tile_n": 64, "tile_k": 64}, sm=90)["impl"] == "dot"  # ... and at large M
     g = resolve_w4_config(32, 4096, 4096, {"impl": "gemv"}, sm=90)
     assert g["impl"] == "dot"  # gemv is decode only
     g1 = resolve_w4_config(3, 4096, 4096, {"impl": "gemv", "tile_k": 32}, sm=90)
@@ -205,5 +207,7 @@ def test_bench_script_plans_without_a_gpu(capsys):
     assert mod.ring_size(1 << 20, 96 << 20, 3.0, 1 << 30) <= 32
     rows = mod.plan(mod.parse_shapes("1024:5120"), [1, 16], 128, "quick", 120, 188)
     assert [r["bucket"] for r in rows] == [1, 16] and all(r["n_candidates"] > 0 for r in rows)
+    capped = mod.plan(mod.parse_shapes("1024:5120"), [1, 16], 128, "quick", 120, 188, max_candidates=4)
+    assert all(r["n_candidates"] <= 4 for r in capped)
     assert mod.main(["--dry-run", "--m", "1", "--shapes", "64:128"]) == 0
     assert "candidates=" in capsys.readouterr().out

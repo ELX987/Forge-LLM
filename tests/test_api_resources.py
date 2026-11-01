@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("fastapi", reason="fastapi not installed in this interpreter (pip install -e \".[serve,dev]\")")
+
 sys.path.insert(0, str(Path(__file__).parent))
 from test_api_fixtures import client, home, make_client, wait_status  # noqa: E402,F401
 

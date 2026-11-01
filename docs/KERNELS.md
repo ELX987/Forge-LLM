@@ -224,17 +224,125 @@ dense bf16 weight, cuBLAS), both timed **eagerly** (one call between two CUDA ev
   measurements.
 * *Autotune keying.* The cache key still buckets M to powers of two; the dispatcher (`ops_gemm.tuned_config`) now also borrows
   the nearest tuned bucket of the same regime (decode <= 16 / prefill >= 32) and, for decode, the closest tuned (N, K) of the same
-  chip (split-K recomputed). Configs tuned for the legacy kernel are ignored (`dtype_cfg` carries the tag `k2`).
-* *Fallbacks.* `config={'impl': 'legacy'}` or `FORGE_W4_IMPL=legacy` (also `dot` / `gemv`) selects a kernel explicitly. If the
+  chip (split-K recomputed). Configs tuned for the legacy kernel or without the `dequant_matmul` candidate are ignored (`dtype_cfg` carries the tag `k4|ao=<act-order>|sym=<symmetric>`).
+* *Fallbacks.* `config={'impl': 'legacy'}` or `FORGE_W4_IMPL=legacy` (also `dot` / `gemv` / `dequant_matmul`) selects a kernel explicitly. If the
   nibble-split kernel raises and the caller did not pin an `impl`, the launcher logs once and uses the legacy Triton kernel
   for that (sm, dtype) instead of dropping to the torch reference. Explicit candidates (the autotuner, tests) never fall back.
   The pure-torch oracle `w4a16_gemm_ref` and all tolerances (`w4a16_gemm.yaml`) are unchanged.
+
+### 7b.1 After the redesign: sm_120 measurements (GPU report 6) and the large-M path
+
+**Measured** (same RTX PRO 6000 Blackwell Max-Q, sm_120, 300 W cap, torch 2.14, Triton 3.8.0). GPU suite on that host: 894 passed,
+1 failed (the interpreter had no `zstandard`: an environment problem, not a kernel one), 46 skipped, so `dot` and `gemv` are
+numerically validated on sm_120. Quick bench W4A16 4096x4096 (default heuristic, vs bf16 `F.linear`): M=1 1.56x, M=16 1.70x
+(legacy was 0.35x / 0.40x), **M=256 0.31x**. (Probably flattering the W4 side: an 8 MiB W4 weight fits the 96 MiB L2 unless the bench flushes it; the
+sweep below uses the L2-defeating ring.) `scripts/bench_w4a16.py --act-order` on Qwen3-14B shapes, graph timing, microseconds
+(bf16 / legacy / default / tuned) and tuned speed-up vs bf16:
+
+| shape (N x K) | M | bf16 | legacy | dflt | tuned | tuned vs bf16 |
+|---|---|---|---|---|---|---|
+| down_proj 5120 x 17408 | 1 | 113.8 | 167.8 | 72.7 | 52.6 | 2.16x (883 GB/s, 60% of peak) |
+| | 4 | 112.3 | 167.9 | 96.9 | 63.3 | 1.78x |
+| | 8 | 112.7 | 170 | 147.8 | 66.5 | 1.69x |
+| | 16 | 115.6 | 173.5 | 254.4 | 89.5 | 1.29x |
+| | 32 | 124 | 433 | 444 | 161 | 0.77x |
+| | 64 | 140.6 | 451 | 889 | 431 | 0.33x |
+| | 128 | 135 | 943 | 2154 | 850 | 0.16x |
+| | 256 | 241 | 968 | 2957 | 1567 | 0.15x |
+| | 1024 | 967 | 3726 | 12161 | 6240 | 0.15x |
+| lm_head 151936 x 5120 | 1 | 1107 | 1283 | 500 | 446 | 2.48x |
+| | 16 | 1069 | 1300 | 2305 | 818 | 1.31x |
+| | 32 | 1630 | 3470 | 3861 | 1320 | 1.23x |
+| | 64 | 1592 | 3653 | 7312 | 3713 | 0.43x |
+| | 256 | 1960 | 8222 | 26087 | 13966 | 0.14x |
+
+**Reading the table (reasoned from these numbers and from the offline PTX, not re-measured).**
+
+* Decode (M <= 8) is solved: 1.7-2.5x, and the tuned time at M=1 is already 60% of the copy bandwidth.
+* The default (`dflt`, the `dot` kernel) grows almost linearly with M at the *same* tile (72.7 / 96.9 / 147.8 / 254.4 us at
+  M = 1 / 4 / 8 / 16): the tile does not change, only the number of valid activation rows does. That is the cost of the
+  stride-8 activation gather, one scalar 16-bit load per element per nibble slice. Offline PTX for sm_120 (bf16, tile_k 128, 4
+  warps; `tests/test_kernels_w4_dequant_compile.py`): the `dot` kernel issues 16-18 scalar `ld.global.b16` per thread per K tile
+  for tile_n = 64 / 128 / 256 while the `mma.sync` count is 16 / 32 / 64, i.e. a wider N tile amortises the gather over
+  proportionally more tensor-core work. The default for 9 <= M < 32 therefore moved from tile_n 64 to 128 (tile_n 256 stays an
+  autotune candidate: it under-fills the SMs for the 1024-wide k/v projections). Not measured.
+* For M >= 32 the fused kernels cannot win: even the tuned `dot` is 0.15x of bf16 at M >= 128, and the default is *worse than the
+  legacy kernel* from M = 16 (254 vs 173 us) on down_proj. Every M tile re-dequantises the same weights (docs 7b item 7).
+
+**Routing (`w4_tuning.default_w4_config`, per chip in `_PROFILES[...]["dequant_min_m"]`, env `FORGE_W4_DEQUANT_MIN_M`):**
+
+| M | impl | notes |
+|---|---|---|
+| 1-8 | `gemv` | fp32 FMA, `tile_m = next_pow2(M)`, `tile_n` 32 (M <= 4) / 16, `tile_k` 128, split-K to fill the SMs (sm_120: gemv only at M = 1, measured tiles; `dot` t16x128x128 at M 2-4, t16x256x128 at M 5-16) |
+| 9-63 | `dot` | tensor cores, `tile_n` 128 (sm_120: t16x256x128 up to M = 16, t32x256x128 at M 17-32) |
+| >= 64 | `dequant_matmul` | Triton dequantisation to bf16/fp16 + cuBLAS (below); the threshold is per chip and overridable (`<= 0` disables) |
+
+The autotune cache still wins over the heuristic per (chip, M bucket, N, K), so the *effective* threshold is moved by the sweep: every
+bucket >= 8 now has `dequant_matmul` (and, from M = 9, the legacy kernel) among its candidates and the measured winner is cached.
+`bench_w4a16.py` prints `suggested_dequant_min_m` (smallest M from which `dequant_matmul` wins on every swept shape). The cache tag is
+now `k4` (act-order and symmetry are part of the key): entries from earlier sweeps (`k2`/`k3`) are ignored; re-run `--quick`.
+The default threshold is 64 (32 only on a chip whose measured dot speed is below the dequant cost model at M = 32; the sm_120 sweep measured dot at x0.74-0.80 of bf16 at M = 32, x0.33-0.44 at M = 64).
+Explicitly configured kernels are untouched: `config={'impl': ...}` and a hand-written config without `impl` still mean the `dot`
+kernel, `FORGE_W4_IMPL=legacy|dot|gemv|dequant_matmul` forces one everywhere.
+
+**`dequant_matmul`** (`triton/gemm_w4_dequant.py`). A memory-bound kernel expands the packed weight to a dense bf16/fp16 tile and
+cuBLAS (`F.linear`) does the GEMM, so the cost is `W4 read + dense write + cuBLAS(M, N, K)` and no longer grows with the number of M tiles.
+
+* One program = a `[BLOCK_N, BLOCK_K]` tile of the output weight (default 32 x 128). It loads `[BLOCK_N, KW]` packed words (KW = BLOCK_K/8,
+  contiguous along the word axis), expands the 8 nibbles along a new innermost axis `[BLOCK_N, KW, 8]` and stores
+  `out[n, 8c + j]`: the flattened `(c, j)` axis *is* the contiguous K axis, so stores are coalesced. Compiled offline for sm_80/89/90/120: one
+  `ld.global.v4.b32` (16 bytes of packed words) and `st.global.v4.b32` (8 output elements) per thread, no scalar 16-bit stores.
+* `(q - zero) * scale` in fp32, rounded once to the output dtype (what the legacy kernel did per element). Symmetric weights use zero 8.
+  Scale access: one `[BLOCK_N]` vector per tile when the tile lies in one group (g128), a `[BLOCK_N, KW]` gather per word for g32/g64, and
+  a per-element gather for act-order. K not a multiple of 8 and N not a multiple of the tile are masked (pad nibbles are never stored).
+* **Act-order**: the original-order columns are dequantised straight from `g_idx` (per-element scale/zero gather). No column sort, no
+  activation permutation, irregular groups work, and nothing needs to be prepared.
+* **Memory.** The dequantised weight is a *temporary* of `rows x K x itemsize`. It is produced in row chunks bounded by
+  `FORGE_W4_DEQUANT_MB` (or `config['chunk_mb']`; default **1024 MiB**; `w4_tuning.plan_dequant_chunks`, chunk starts multiples of 64 rows), one
+  buffer reused by all chunks. The 151936 x 5120 lm_head (1.45 GiB in bf16) is therefore done in 2 chunks and peaks at ~1 GiB + the output;
+  a 5120 x 17408 down_proj (170 MiB) is one chunk. Budget this next to the KV cache when sizing `gpu_memory_fraction`. The buffer comes from
+  the torch caching allocator (also what CUDA graph capture uses), so the path is graph-capturable; with several layers captured in one graph the
+  graph's private pool holds one such buffer per concurrently-live chunk (not per layer).
+* **Expected cost (a model, to be confirmed by `bench_w4a16.py --quick`):** down_proj = 44.6 MB read + 178 MB written at 0.9-1.4 TB/s = ~160-250 us for
+  the dequantisation plus the bf16 cuBLAS time of the table (135-241 us at M = 128-256, ~1 ms at M = 1024), i.e. roughly 3x faster than the legacy
+  kernel and 2.5-5x faster than the tuned `dot` at M >= 128 (850 / 1567 / 6240 us vs a modelled ~335 / ~440 / ~1170 us), but still slower than bf16 `F.linear` on a pre-dequantised weight (that is the price of keeping
+  the weight 4-bit: 0.15-0.2x becomes ~0.4-0.5x at M = 128-256 and approaches 0.8-0.9x at M = 1024). It does not beat the tuned `dot` at M = 32
+  (161 us vs a modelled ~320 us), which is why the sweep, not the default, decides that bucket (the default there is a floor: it is not slower than legacy or the old default).
+
+**Launch path is host-sync free (CUDA graph capture with act-order).** The `--act-order` sweep logged `CUDA graph capture failed ... Cannot copy between
+CPU and CUDA tensors` and fell back to eager timing: `sort_columns_by_group` (a `.cpu()` and `int(tensor)` calls) ran lazily on the first launch of every
+ring copy. Now `layouts.cached_group_sort` is the only launch-path entry (a stamped cache lookup, no sync); the sort itself runs at prepare time:
+`ops_gemm.prepare_w4` / `KernelW4A16Linear.prepare()` (called by `from_packed`, after `load_state_dict` and after `.to()` / `.half()`), and by the bench before
+capture. A cold cache while a CUDA graph is being captured uses the legacy `g_idx` kernel (sync-free) and logs once instead of failing. The
+`dequant_matmul` path never needs the sort. Guarded by `tests/test_kernels_w4_dequant_policy.py` (AST scan of every launch function for
+`.cpu/.item/.tolist/.numpy/synchronize`, plus a run with those methods monkeypatched to raise) and, on the GPU, by
+`tests_gpu/test_kernels_w4_dequant_gpu.py::test_actorder_cuda_graph_capture_without_host_sync`.
+
+**Sweep cost.** The full sweep takes hours on a 300 W card because every candidate is timed to completion, a throttled candidate is timed twice and a
+throttled winner was never cached. `scripts/bench_w4a16.py --quick` runs M in {1, 8, 16, 64, 256, 1024} on q/o (5120 x 5120) and down_proj (5120 x 17408) with <= 8 candidates per bucket, no
+refinement and fewer repeats; `--time-budget-min N` stops gracefully; the JSON and the autotune cache are written after every row, so a killed run leaves usable
+configs; a candidate whose cheap probe is > 2x slower than the best so far is dropped (`--prune-factor`, `--no-prune`); a throttled candidate is re-measured at
+most once and the row is marked `throttled` (the winner is still cached, flagged in the entry, because a power-capped card is "throttled" in steady state and
+the ranking stays valid; `--strict-throttle` refuses to cache such rows). The summary prints the best impl per M, the decode (M <= 16) geometric mean, the
+prefill (M >= 32) ratio vs bf16 and the suggested `dequant_min_m`.
+
+**Status of 7b.1 (HONEST).** Verified without a GPU: the dequantisation kernel and the chunked `dequant_matmul` in the Triton CPU interpreter against the
+fp32 oracle (group sizes 8..K, per-channel, odd N/K, sym/asym, act-order, row chunks, fp16 and bf16, routing and `FORGE_W4_IMPL`); offline compilation for sm_80/89/90/120
+with the PTX structure above; the routing policy, chunk planner, candidate lists, early abort / deadline / throttle handling in the tuner, the bench plan, budget and
+incremental report, and the absence of host syncs in the launch path. **Not verified:** any speed of `dequant_matmul`, the tuned threshold, the `gemv` default tiles
+at M = 1-8 (the table's tuned winner at M <= 8 is unknown, and `dflt` there was `dot`), the `dot` tile_n = 128 default at M = 9-31, the cuBLAS behaviour on
+the chunked `[M, rows]` outputs, bf16 weight rounding against the GPU tolerance (`tests_gpu/test_kernels_w4_dequant_gpu.py` is the gate), the temp-memory peak under
+graph capture. Not done: a rewrite of the `dot` kernel (a contiguous activation load plus an in-register nibble split with `tl.split` would remove the gather, but it
+cannot be validated without hardware).
 
 **How to measure on the GPU host**
 
 ```bash
 pytest tests_gpu/test_kernels_w4a16_fast.py -q -s      # compile + numerics + a printed legacy-vs-new speed table
+python scripts/bench_w4a16.py --quick                  # minutes: M {1,8,16,64,256,1024} on 2 shapes, <= 8 candidates/bucket
+python scripts/bench_w4a16.py --quick --time-budget-min 30   # same, stops gracefully after 30 minutes (partial results kept)
 python scripts/bench_w4a16.py                          # full Qwen3-14B x M sweep, writes the autotune cache + w4a16_bench.json
+pytest tests_gpu/test_kernels_w4_dequant_gpu.py -q -s  # dequant kernel + dequant_matmul + graph capture + temp-memory gate
 python scripts/bench_w4a16.py --act-order --m 1,8,16   # external GPTQ desc_act layout (shuffled g_idx); Forge's own artifacts use static groups
 python scripts/bench_w4a16.py --dry-run                # plan only, works without a GPU
 ```
