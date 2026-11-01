@@ -8,6 +8,7 @@
   | Job type | Config model |
   |----------|--------------|
   | `train` | `forge.train.config.TrainConfig` |
+  | `ternary_train` | `forge.ternary.config.TernaryTrainConfig` (experimental) |
   | `finetune` | `forge.train.config.FinetuneConfig` |
   | `distill` | `forge.train.config.DistillConfig` |
   | `dataset_ingest` | `forge.train.data.IngestConfig` |
@@ -50,6 +51,13 @@ nesting level). "Validated" here means *parses and passes the model's checks*, n
 | `llama-8b-full-bf16` | Continued pre-training, all weights, R0 BF16 | FSDP over 8 GPUs by default; ~100 GB state; gated model |
 | `qwen-fp8` | Rung R1 FP8 mixed precision | Real speed-up only on sm_89+; emulated otherwise |
 | `nvfp4-pilot` | Rung R2 NVFP4 pilot | **Experimental, gated**: needs `allow_unvalidated_fp4`; emulated except on Blackwell; healing phase + diagnostics |
+
+### configs/ternary (job type `ternary_train`, EXPERIMENTAL)
+
+| Template | Purpose | Notes |
+|----------|---------|-------|
+| `tiny-smoke` | CPU smoke test of ternary QAT | Tiny model, group 32, dataset `tiny-corpus`; watch `ternary/*` metrics |
+| `scratch-125m` | 125M model from scratch with ternary QAT | **Not validated on GPU through Forge.** Emulated fake-quant path: no speed-up; thresholds are TARGET values from tern158 |
 
 ### configs/finetune (job type `finetune`)
 

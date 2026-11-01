@@ -1,6 +1,8 @@
 # Ternary (1.58-bit) in Forge
 
-> Status: **phase P1 done (CPU path).** Implemented and CPU-tested: numerics (`forge/formats/ternary.py`), layout `ternary2_row`, oracle,
+> Status: **phases P1 and P2 done (CPU path).** P2 adds: `precision.quant_aware = ternary` plug-in (`forge/ternary/qat.py`), health metrics
+> `ternary/*`, collapse abort, job type `ternary_train` + templates in `configs/ternary/`, `forge ternary` CLI shortcut, job-detail health panel,
+> and the `forge.methods` catalog. Not in P2: bf16-stochastic-rounded optimizer state, wd-to-zero schedule, sharded trainer, kernels. (P1:) Implemented and CPU-tested: numerics (`forge/formats/ternary.py`), layout `ternary2_row`, oracle,
 > `t158` / `fq_t158` linears, artifact save/load/serve, `.t158.safetensors` tensor-level import/export. Everything else below is planned. No GPU path exists or is validated. See `docs/adr/0007-ternary-and-method-layer.md`
 > and `plan-and-docs/Forge_Ternary_Merge_Plan.pdf` for the design and phased roadmap.
 

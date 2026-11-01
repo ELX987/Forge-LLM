@@ -35,7 +35,7 @@ from forge.train.config import CommonTrainConfig
 from forge.train.data import StepPrefetcher
 from forge.train.losses import IGNORE_INDEX, ce_loss_sum
 from forge.train.optim import anneal_start_step, build_optimizer, lr_factor, set_lr
-from forge.train.precision import PrecisionManager
+from forge.train.precision import make_precision_manager
 from forge.train.stability import SpikeDetector, TrainingDiverged
 
 log = logging.getLogger("forge.train.trainer")
@@ -411,7 +411,7 @@ class Trainer:
         self.total_steps = self._resolve_total_steps()
         self.global_batch = c.micro_batch_size * c.grad_accum_steps * self.dinfo.world
         self.raw.to(self.device)
-        self.precision = PrecisionManager(c.precision, device=self.device, total_steps=self.total_steps, seed=c.seed, rank=self.dinfo.rank)
+        self.precision = make_precision_manager(c.precision, device=self.device, total_steps=self.total_steps, seed=c.seed, rank=self.dinfo.rank)
         summ = self.precision.prepare(self.raw)
         self.ctx.log(f"precision: {json.dumps({k: v for k, v in summ.items() if k != 'exempt_names'})}")
         if c.activation_checkpointing:
@@ -640,6 +640,10 @@ class Trainer:
                 res["diag"] = self.precision.diagnostics(self.raw)
             except Exception as e:  # noqa: BLE001
                 self.ctx.log(f"diagnostics failed: {e!r}", "warning")
+            for level, msg in self.precision.drain_events():
+                self.ctx.log(msg, "error" if level == "error" else "warning")
+                if level == "error":
+                    raise TrainingDiverged(msg, details={"step": step + 1})
         if want_gap and finite and first_mb_loss is not None:
             with torch.no_grad(), self.precision.high_precision(), self.precision.autocast():
                 self.model.eval()
@@ -830,8 +834,8 @@ class Trainer:
                 done = step_idx + 1
                 is_log = done % c.logging.log_every == 0
                 prec = c.precision
-                want_diag = prec.rung != "R0" and prec.diagnostics_every > 0 and done % prec.diagnostics_every == 0 and self.precision.phase == "main"
-                want_gap = prec.rung != "R0" and prec.loss_gap_every > 0 and done % prec.loss_gap_every == 0 and self.precision.phase == "main" and self.precision.quantised
+                want_diag = self.precision.wants_diagnostics and prec.diagnostics_every > 0 and done % prec.diagnostics_every == 0 and self.precision.phase == "main"
+                want_gap = self.precision.wants_loss_gap and prec.loss_gap_every > 0 and done % prec.loss_gap_every == 0 and self.precision.phase == "main" and self.precision.quantised
                 want_ratio = is_log and c.logging.update_ratio_max_numel > 0
                 try:
                     _, batches = next(self._prefetch)  # type: ignore[arg-type]

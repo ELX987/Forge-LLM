@@ -353,12 +353,15 @@ def cmd_job_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+_SHORTCUT_JOB_TYPES = {"ternary": "ternary_train"}  # CLI command -> job type when they differ
+
+
 def cmd_shortcut(args: argparse.Namespace) -> int:
     params = load_params(getattr(args, "config", None), getattr(args, "set", None))
     if args.command == "probe":
         if args.quick:
             params["quick"] = True
-    return _submit_and_maybe_follow(args, args.command, params)
+    return _submit_and_maybe_follow(args, _SHORTCUT_JOB_TYPES.get(args.command, args.command), params)
 
 
 def cmd_store(args: argparse.Namespace) -> int:
@@ -654,7 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, helptext in (
         ("train", "pre-train / continue training"), ("finetune", "fine-tune (full or LoRA)"), ("distill", "distillation"),
         ("compress", "compress / quantise"), ("eval", "evaluate and gate"), ("serve", "start an inference engine"),
-        ("bench", "kernel benchmarks"), ("probe", "hardware probe"),
+        ("bench", "kernel benchmarks"), ("probe", "hardware probe"), ("ternary", "train ternary 1.58-bit (experimental)"),
     ):
         p = sub.add_parser(name, help=helptext)
         _add_job_opts(p)

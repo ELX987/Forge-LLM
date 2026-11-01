@@ -13,6 +13,7 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from forge.core.errors import ConfigError
 from forge.formats import ternary as tn
@@ -95,6 +96,12 @@ class FakeQuantTernaryLinear(_FakeQuantLinear):
             raise ConfigError(f"unknown ternary rule {rule!r}; expected one of {tn.RULES}")
         self.group_size, self.rule, self.iters = int(group_size), rule, int(iters)
         self.lam = 1.0
+        self.enabled = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not getattr(self, 'enabled', True):  # high-precision shadow/eval forward
+            return F.linear(x, self.weight, self.bias)
+        return super().forward(x)
 
     def set_lam(self, lam: float) -> None:
         """Warm-up blend in [0, 1]: 0 = full precision, 1 = fully quantised."""

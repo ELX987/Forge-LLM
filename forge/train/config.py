@@ -30,7 +30,7 @@ __all__ = [
     "EvalConfig", "FinetuneConfig", "GenerationConfig", "LoggingConfig", "LogitCacheConfig", "LoraConfig",
     "ModelSourceConfig", "OnPolicyConfig", "OptimConfig", "ParallelConfig", "PrecisionConfig", "PreferenceConfig",
     "PretrainDataConfig", "PromptSourceConfig", "QLoraConfig", "SFTDataConfig", "ScheduleConfig", "StabilityConfig",
-    "TeacherConfig", "TrainConfig",
+    "TeacherConfig", "TernaryQATConfig", "TrainConfig",
 ]
 
 
@@ -163,9 +163,25 @@ class ScheduleConfig(_Cfg):
     total_steps: int | None = F(None, "Override the schedule horizon (needed when only a time budget bounds the run).", "Schedule", True, ge=1)
 
 
+class TernaryQATConfig(_Cfg):
+    """Ternary (1.58-bit) quantisation-aware training settings (used when ``precision.quant_aware = ternary``; EXPERIMENTAL, CPU-validated only)."""
+
+    group_size: int = F(128, "Scale group along K (>0), -1 = one scale per output row, 0 = one per tensor. Converted models need 128; scratch runs may use rows.", "Ternary", ge=-1)
+    rule: Literal["absmean", "twn", "lloyd"] = F("lloyd", "Weight quantiser: absmean, TWN, or Lloyd (absmean start + refinement steps; the default).", "Ternary")
+    iters: int = F(1, "Lloyd refinement steps per quantisation.", "Ternary", True, ge=1, le=16)
+    quant_acts: bool = F(True, "Per-token int8 activation quantisation (BitNet-style A8).", "Ternary")
+    warmup_steps: int = F(0, "Quantisation warm-up: W_eff = W + lam*(Q(W)-W) with lam = min(1, step/warmup). 0 = quantise from step 0 (scratch). Use ~500 when converting.", "Ternary", ge=0, unit="steps")
+    collapse_warn: float = F(0.60, "Warn when the fraction of zero weights exceeds this (healthy range 0.40-0.52, TARGET from the tern158 report).", "Ternary", gt=0.0, le=1.0)
+    collapse_stop: float = F(0.80, "Abort the run when the zero fraction exceeds this ('zero-density collapse').", "Ternary", gt=0.0, le=1.0)
+    stop_on_collapse: bool = F(True, "Raise (abort) instead of only warning on collapse.", "Ternary")
+    flip_warn: float = F(0.05, "Warn when more than this fraction of codes flip per step (noise-dominated updates).", "Ternary", True, gt=0.0, le=1.0)
+
+
 class PrecisionConfig(_Cfg):
     """Precision ladder (TR-1): R0 BF16 reference, R1 FP8 mixed precision, R2 NVFP4 (gated, experimental)."""
 
+    quant_aware: Literal["none", "ternary"] = F("none", "Quantisation-aware training mode, independent of the rung: ternary = latent-weight 1.58-bit QAT (EXPERIMENTAL; uses the `ternary` section; requires rung R0).", "Precision")
+    ternary: TernaryQATConfig = FF(TernaryQATConfig, "Ternary QAT settings (only used when quant_aware = ternary).", "Ternary")
     rung: Literal["R0", "R1", "R2"] = F("R0", "R0 = BF16 autocast (reference). R1 = FP8 GEMMs (torchao / TransformerEngine, else emulated fake-quant with a warning). R2 = NVFP4 training pilot (EXPERIMENTAL, emulated).", "Precision")
     compute_dtype: Literal["auto", "bfloat16", "float16", "float32"] = F("auto", "Autocast dtype. auto = bfloat16 on CUDA sm>=80 (float16 + grad scaler on older GPUs), float32 on CPU.", "Precision")
     exempt_patterns: list[str] = F(["embed", "lm_head", "head", "norm", "router", "gate.weight"], "Module-name substrings kept in high precision on R1/R2 (embeddings, output head, norms, MoE routers).", "Precision")

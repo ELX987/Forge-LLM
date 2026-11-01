@@ -22,6 +22,7 @@ CONFIGS = ROOT / "configs"
 # configs/<dir> -> (job type for the registry, direct-import fallbacks "module:Class")
 JOB_DIRS: dict[str, tuple[str, list[str]]] = {
     "train": ("train", ["forge.train.config:TrainConfig"]),
+    "ternary": ("ternary_train", ["forge.ternary.config:TernaryTrainConfig"]),
     "finetune": ("finetune", ["forge.train.config:FinetuneConfig"]),
     "distill": ("distill", ["forge.train.config:DistillConfig"]),
     "dataset": ("dataset_ingest", ["forge.train.data:IngestConfig"]),

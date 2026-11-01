@@ -156,6 +156,14 @@ def _register_all() -> None:
     )
     register_job_type(
         J(
+            "ternary_train", "Train ternary (1.58-bit) - experimental",
+            "Latent-weight quantisation-aware training with ternary {-1,0,+1} weights and int8 activations (EXPERIMENTAL, CPU-validated only).",
+            ["forge.ternary.config:TernaryTrainConfig"],
+            "forge.ternary.run:run_ternary_train", needs_gpu=True, group="training", template_dirs=("ternary",), experimental=True,
+        )
+    )
+    register_job_type(
+        J(
             "finetune", "Fine-tune (full / LoRA)",
             "Supervised fine-tuning with full weights or LoRA adapters.",
             ["forge.train.config:FinetuneConfig", "forge.train.run:FinetuneConfig"],
