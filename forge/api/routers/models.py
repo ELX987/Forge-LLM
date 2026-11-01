@@ -5,15 +5,15 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Body, Depends, Query, Response
 
 from forge.api.deps import Services, get_services
 from forge.api.jobsvc import submit
 from forge.api.schemas import ModelCreate, ModelDownloadRequest, ModelPatch, RegisterLocal
 from forge.core.errors import ConfigError
-from forge.core.paths import models_dir
+from forge.core.paths import forge_home, models_dir
 from forge.core.util import new_id, now
-from forge.jobs.modelinfo import inspect_model_dir, model_local_path, register_local_model
+from forge.jobs.modelinfo import import_artifacts, inspect_model_dir, model_local_path, register_local_model
 
 router = APIRouter(prefix="/models", tags=["models"])
 
@@ -39,20 +39,58 @@ def _public(row: dict[str, Any]) -> dict[str, Any]:
     row["downloaded"] = bool(row["local_path"] and Path(row["local_path"]).exists())
     if row.get("distill_allowed") is not None:
         row["distill_allowed"] = bool(row["distill_allowed"])
+    info = row.get("info") or {}
+    q = info.get("quantization") if isinstance(info.get("quantization"), dict) else None
+    row["kind"] = "quantized" if (q and q.get("is_quantized")) or info.get("kind") == "quantized" else "base"  # picker grouping
+    row["quantization"] = (q or {}).get("label")  # badge text, e.g. "W4A16 g128"
+    row["quant_summary"] = q
+    row["weight_gb"] = round(row["size_bytes"] / 1e9, 3) if row.get("size_bytes") else info.get("weight_gb")
+    row["base_model"] = info.get("base_model")
+    row["servable"] = bool(row["downloaded"] or row.get("source") == "hf")  # an HF repo is downloaded by the engine on start
     return row
+
+
+_IMPORTED: set[str] = set()
+
+
+def _auto_import(svc: Services) -> None:
+    """Once per process and FORGE_HOME: register compress outputs found under runs/ (jobs that finished before models were registered
+    automatically, or on another machine and copied over). Failures never break the listing."""
+    key = str(forge_home())
+    if key in _IMPORTED:
+        return
+    _IMPORTED.add(key)
+    try:
+        import_artifacts(models=svc.models, jobs=svc.jobs_repo)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @router.get("", summary="List models")
 def list_models(
     response: Response, source: str | None = None, q: str | None = Query(None, description="Substring of name / path"),
+    kind: str | None = Query(None, pattern="^(base|quantized)$", description="base = dense models, quantized = packed compress outputs"),
     limit: int = Query(500, ge=1, le=5000), svc: Services = Depends(get_services),
 ) -> list[dict[str, Any]]:
+    _auto_import(svc)
     rows = svc.models.list({"source": source}, limit=limit)
     if q:
         ql = q.lower()
         rows = [r for r in rows if ql in r["name"].lower() or ql in (r["path_or_repo"] or "").lower()]
-    response.headers["X-Total-Count"] = str(len(rows))
-    return [_public(r) for r in rows]
+    out = [_public(r) for r in rows]
+    if kind:
+        out = [r for r in out if r["kind"] == kind]
+    response.headers["X-Total-Count"] = str(len(out))
+    return out
+
+
+@router.post("/import-artifacts", summary="Register compress outputs (runs/*/artifact and succeeded compress jobs) as selectable models")
+def import_artifacts_endpoint(body: dict[str, Any] | None = Body(None, description='Optional {"paths": ["/dir/of/an/artifact", ...]} in addition to the scan'),
+                              svc: Services = Depends(get_services)) -> dict[str, Any]:
+    paths = [str(p) for p in ((body or {}).get("paths") or [])]
+    res = import_artifacts(models=svc.models, jobs=svc.jobs_repo, extra_dirs=paths)
+    _IMPORTED.add(str(forge_home()))
+    return {"imported": [_public(r) for r in res["imported"]], "updated": res["updated"], "skipped": res["skipped"], "scanned": res["scanned"]}
 
 
 @router.post("", status_code=201, summary="Add a model entry (HF repo id, local path or artifact hash)")

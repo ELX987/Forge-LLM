@@ -1,8 +1,11 @@
 """Model reference resolution shared by every job type that takes a model, plus HF repo-id checks and token lookup.
 
-``resolve_model_ref`` order: an explicit path (absolute, ``./``, ``~``, drive/backslash) -> registered model id / name
-(``models`` table) -> an existing directory relative to the CWD -> a directory under ``FORGE_HOME/models`` -> a Hugging Face repo id, but only when the string
-looks like ``org/name``. Anything else is an error that says what was tried, instead of a Hub 404 from a bare name."""
+``resolve_model_ref`` order: an explicit path (absolute, ``./``, ``~``, drive/backslash) -> a content digest of the artifact store
+(``blake3:...``; looked up in the ``models`` table first, otherwise materialised from the store) -> registered model id / name
+(``models`` table; includes compress outputs registered as quantised artifacts) -> an existing directory relative to the CWD -> a directory under
+``FORGE_HOME/models`` -> a Hugging Face repo id, but only when the string looks like ``org/name``. Anything else is an error that says what was tried,
+instead of a Hub 404 from a bare name. Every local hit also carries ``ResolvedModel.artifact`` (the quantisation summary read from the directory's
+own metadata, ``None`` for a plain model) so callers can detect a packed W4A16 artifact without guessing from names."""
 from __future__ import annotations
 
 import os
@@ -71,10 +74,97 @@ def validate_repo_id(repo_id: str, token: str | None = None, suggest: bool = Tru
 
 @dataclass
 class ResolvedModel:
-    kind: str  # local | registry | models_dir | hf
+    kind: str  # local | registry | models_dir | artifact | hf
     path: Path | None = None
     repo_id: str | None = None
     row: dict[str, Any] | None = None
+    artifact: dict[str, Any] | None = None  # forge.core.artifactmeta.read_artifact_summary(path); None for plain models / hub repos
+
+    @property
+    def is_quantized(self) -> bool:
+        return bool(self.artifact and self.artifact.get("is_quantized"))
+
+
+def _with_summary(r: ResolvedModel) -> ResolvedModel:
+    if r.path is not None and r.artifact is None:
+        try:
+            from forge.core.artifactmeta import read_artifact_summary
+
+            r.artifact = read_artifact_summary(r.path)
+        except Exception:  # noqa: BLE001 - metadata is advisory here; the loader verifies what it really builds
+            r.artifact = None
+    return r
+
+
+def _digest_lookup(ref: str, repo: Any = None) -> ResolvedModel | None:
+    """A store digest -> the registered artifact row (by ``hash``) or, failing that, a directory materialised from the artifact store."""
+    try:
+        if repo is None:
+            from forge.jobs.repo import ModelsRepo
+
+            repo = ModelsRepo()
+        row = repo.find_by_hash(ref) if hasattr(repo, "find_by_hash") else None
+    except sqlite3.OperationalError:
+        row = None
+    if row:
+        from forge.jobs.modelinfo import model_local_path
+
+        lp = model_local_path(row)
+        if lp and Path(lp).is_dir():
+            return ResolvedModel("registry", path=Path(lp), row=row)
+    try:
+        from forge.core.paths import models_dir
+        from forge.jobs.repo import open_store
+
+        st = open_store()
+        if not st.has(ref):
+            return None
+        dest = models_dir() / "artifacts" / ref.split(":", 1)[-1][:24]
+        _materialize_digest(st, ref, dest)
+        return ResolvedModel("artifact", path=dest, row=row)
+    except Exception as e:  # noqa: BLE001
+        raise NotFound(f"artifact {ref} is in neither the model registry nor a loadable directory of the artifact store ({type(e).__name__}: {e})",
+                       details={"artifact": ref}) from e
+
+
+_DIGEST_MARK = ".forge_digest"
+
+
+def _materialize_digest(st: Any, ref: str, dest: Path) -> None:
+    """Make ``dest`` a verified, complete materialisation of artifact ``ref``. An existing ``dest`` is reused only when its marker names exactly this
+    digest and it still has a config.json; otherwise it is replaced (a stale / foreign / half-written directory is removed first, because
+    renaming a directory over an existing one fails on Windows)."""
+    import shutil
+
+    mark = dest / _DIGEST_MARK
+    try:
+        if (dest / "config.json").is_file() and mark.is_file() and mark.read_text(encoding="utf-8").strip() == ref:
+            return
+    except OSError:
+        pass
+    if not st.verify(ref):
+        raise NotFound(f"artifact {ref} failed verification in the artifact store; it is not materialised", details={"artifact": ref})
+    tmp = dest.with_name(dest.name + ".partial")
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    st.materialize_artifact(ref, tmp)
+    (tmp / _DIGEST_MARK).write_text(ref, encoding="utf-8")
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+        if dest.exists():
+            raise ConfigError(f"cannot replace the stale artifact directory {dest}; remove it and retry")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp.replace(dest)
+
+
+def _local_hit(p: Path, kind: str = "local") -> ResolvedModel:
+    """A resolved filesystem location. A directory without config.json that has a model in ``<dir>/artifact`` (a job run directory) is refused with a
+    pointer to that sub-directory instead of failing later in the loader; any other directory is returned as is (the loader reports what is missing)."""
+    if p.is_dir() and not (p / "config.json").is_file() and (p / "artifact" / "config.json").is_file():
+        hint = p / "artifact"
+        raise NotFound(f"{str(p)!r} is not a model directory (no config.json); the model is in {str(hint)!r} - use that path",
+                       details={"path": str(p), "suggestion": str(hint)})
+    return _with_summary(ResolvedModel(kind, path=p))
 
 
 def _safe_dir(name: str) -> str | None:
@@ -104,15 +194,22 @@ def resolve_model_ref(ref: str | os.PathLike, *, repo: Any = None) -> ResolvedMo
     path_like = p.is_absolute() or s.startswith((".", "~")) or "\\" in s or bool(re.match(r"^[A-Za-z]:", s))
     if path_like:  # explicit filesystem paths never consult the registry
         if p.exists():
-            return ResolvedModel("local", path=p)
+            return _local_hit(p)
         raise NotFound(f"model path {s!r} does not exist")
+    from forge.core.hashing import is_digest
+
+    if is_digest(s):
+        hit = _digest_lookup(s, repo)
+        if hit is not None:
+            return _with_summary(hit)
+        raise NotFound(f"artifact {s} not found in the model registry or the artifact store", details={"artifact": s})
     row = _registry_lookup(s, repo)
     if row:
         from forge.jobs.modelinfo import model_local_path
 
         lp = model_local_path(row)
         if lp and Path(lp).is_dir():
-            return ResolvedModel("registry", path=Path(lp), row=row)
+            return _with_summary(ResolvedModel("registry", path=Path(lp), row=row))
         if row.get("source") == "hf":
             raise NotFound(
                 f"model {row.get('name')!r} ({row.get('id')}) is registered but not downloaded; run its Download first",
@@ -120,7 +217,7 @@ def resolve_model_ref(ref: str | os.PathLike, *, repo: Any = None) -> ResolvedMo
             )
         raise NotFound(f"model {row.get('name')!r} ({row.get('id')}) has no local files", details={"model_id": row.get("id")})
     if p.exists():  # a bare name / org/name: a registered model wins over a same-named directory in the CWD
-        return ResolvedModel("local", path=p)
+        return _local_hit(p)
     d = _safe_dir(s)
     if d:
         try:
@@ -128,7 +225,7 @@ def resolve_model_ref(ref: str | os.PathLike, *, repo: Any = None) -> ResolvedMo
 
             cand = models_dir() / d
             if cand.is_dir():
-                return ResolvedModel("models_dir", path=cand)
+                return _with_summary(ResolvedModel("models_dir", path=cand))
         except Exception:  # noqa: BLE001
             pass
     if not looks_like_repo_id(s):

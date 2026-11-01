@@ -85,7 +85,10 @@ class ServeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # ---- model --------------------------------------------------------------------------
-    model: str = Field("", description="Model directory, Hugging Face repo id, or Forge artifact reference to serve.",
+    model: str = Field("", description="What to serve: a registered model id / name (base models and quantised compress outputs), a model or "
+                                       "compress-artifact directory, an artifact-store digest (blake3:...) or a Hugging Face repo id. A quantised "
+                                       "artifact is loaded packed (W4A16: int4 codes + scales); if that is impossible the deployment fails, "
+                                       "it never falls back to another model.",
                        json_schema_extra=ui(group="Model"))
     tokenizer: str | None = Field(None, description="Tokenizer path/repo (defaults to the model).",
                                   json_schema_extra=ui(group="Model", advanced=True))
@@ -97,8 +100,13 @@ class ServeConfig(BaseModel):
         "auto", description="Activation/compute dtype. auto = bf16 on sm>=80, fp16 on older GPUs, fp32 on CPU.",
         json_schema_extra=ui(group="Model"))
     quant: str | None = Field(None, description="Quantisation backend for weights that are not already packed "
-                                                "(None = use whatever the artifact contains, e.g. w4a16, w8a16, fp8, nvfp4).",
+                                                "(None = use whatever the artifact contains, e.g. w4a16, w8a16, fp8, nvfp4). "
+                                                "Must stay empty for an already-quantised artifact.",
                               json_schema_extra=ui(group="Model"))
+    kernel_linears: Literal["auto", "off"] = Field(
+        "auto", description="CUDA + packed W4A16 weights: auto = convert the portable int4 modules to the kernel layout at load time (frees the duplicate "
+                            "copy the lazy repack would keep and removes the first-request stall); off = keep the portable modules.",
+        json_schema_extra=ui(group="Model", advanced=True))
     device: str = Field("auto", description="Device: auto, cuda, cuda:N or cpu.", json_schema_extra=ui(group="Model"))
     tp_size: int = Field(1, ge=1, le=16, description="Tensor-parallel size. Only 1 is implemented; >1 is rejected at engine start.",
                          json_schema_extra=ui(group="Model", advanced=True))
@@ -112,8 +120,17 @@ class ServeConfig(BaseModel):
                             "(int4 KV exists in the capacity planner only).",
         json_schema_extra=ui(group="KV cache"))
     block_size: int = Field(16, ge=1, le=256, description="Tokens per KV block (page).", json_schema_extra=ui(group="KV cache", unit="tokens"))
-    gpu_mem_util: float = Field(0.90, gt=0.05, le=0.99, description="Fraction of GPU memory the engine may use (weights + KV + activations).",
+    gpu_mem_util: float = Field(0.85, gt=0.05, le=0.99, description="Fraction of total GPU memory the engine may occupy in all (weights + KV pool + "
+                                                                    "activation reserve). The rest stays free for the CUDA context, kernels and other processes.",
                                 json_schema_extra=ui(group="KV cache"))
+    kv_pool: Literal["fit_workload", "fill"] = Field(
+        "fit_workload", description="KV pool size policy. fit_workload = only as many blocks as max_num_seqs x max_model_len can use, capped at kv_pool_cap_tokens (never more than "
+                                    "gpu_mem_util allows); fill = every block the memory budget allows (maximises the prefix cache, occupies the card).",
+        json_schema_extra=ui(group="KV cache"))
+    kv_pool_cap_tokens: int = Field(32768, ge=0, description="With kv_pool=fit_workload: upper bound of the default KV pool in tokens (never below one "
+                                                              "max_model_len sequence); 0 = no cap, so the pool is sized by max_num_seqs x max_model_len alone. "
+                                                              "Raise it (or use kv_pool=fill / num_gpu_blocks) for heavy concurrency.",
+                                    json_schema_extra=ui(group="KV cache", unit="tokens"))
     num_gpu_blocks: int | None = Field(None, ge=2, description="Override the number of KV blocks instead of sizing from free memory.",
                                        json_schema_extra=ui(group="KV cache", advanced=True))
     activation_reserve_gb: float = Field(1.0, ge=0.0, description="Memory reserved for activations/logits when sizing the KV pool "
@@ -130,7 +147,7 @@ class ServeConfig(BaseModel):
 
     # ---- scheduler ----------------------------------------------------------------------
     max_model_len: int = Field(4096, ge=8, description="Maximum prompt+output length per request.", json_schema_extra=ui(group="Scheduler", unit="tokens"))
-    max_num_seqs: int = Field(64, ge=1, description="Maximum concurrently running sequences.", json_schema_extra=ui(group="Scheduler"))
+    max_num_seqs: int = Field(16, ge=1, description="Maximum concurrently running sequences.", json_schema_extra=ui(group="Scheduler"))
     max_num_batched_tokens: int = Field(2048, ge=1, description="Token budget per engine step (decode + prefill chunk tokens).",
                                         json_schema_extra=ui(group="Scheduler", unit="tokens"))
     chunked_prefill: bool = Field(True, description="Split long prompts across steps and mix them with decode (SV-1).", json_schema_extra=ui(group="Scheduler"))

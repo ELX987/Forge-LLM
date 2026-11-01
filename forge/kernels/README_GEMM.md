@@ -22,6 +22,7 @@ conventions and scale handling, not that the kernel compiles for sm_80/89/90/100
 | Oracles (W4/W8/FP8/INT8/FP4 + compare()) | `ref/gemm_*.py` | yes, edge-case list of 6.7 | n/a | -- |
 | Autotuner (gate, cache, throttle, IQR) | `autotune/` | yes, fake run_fn / clock | n/a | real-kernel test written, not run |
 | Triton W4A16 / W8A16 GEMM (+split-K) | `triton/gemm_wq.py` | -- | **yes** (fp16; groups, zeros, g_idx, per-channel, odd N, K tail, split-K det./atomic) | written, **not run** |
+| Triton W4A16 nibble-split GEMM (`impl=dot` / `gemv`, replaces the legacy W4 kernel as default) | `triton/gemm_w4_fast.py`, `w4_tuning.py` | -- | **yes** (fp16/bf16/fp32; all groups, zeros, act-order via column sort, odd N/K, split-K) + offline-compiled for sm_80/89/90/120 | written, **not run on a GPU**; legacy kernel measured 0.23-0.40x of bf16 on sm_120, see docs/KERNELS.md 7b |
 | Triton INT8 W8A8 GEMM + act quantiser | `triton/gemm_int8.py` | -- | **yes**, bit exact | written, **not run** |
 | Triton FP8 GEMM (3 scale modes) | `triton/gemm_fp8.py` | -- | **yes** (fp8 loads/dot work in the interpreter) | written, **not run** (needs sm_89+) |
 | Triton fused RMSNorm+absmax->FP8 quantiser | `triton/gemm_fp8.py` | -- | scales yes; **fp8 codes not checked** (interpreter's fp32->fp8 cast is wrong) | written, **not run** |

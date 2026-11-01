@@ -140,6 +140,7 @@ class CompressJobConfig(BaseModel):
     use_store: bool = Field(True, description="Register intermediate and final artifacts in the artifact store (when one is available).")
     register_input: bool = Field(True, description="Ingest the input model into the artifact store first (lineage root, stable digest) when it did not come from the store.")
     persist_intermediate: bool = Field(True, description="Write every model-producing stage to the store (required for stage caching across processes). Disable for very large models to save disk.")
+    register_model: bool = Field(True, description="When run as a job: also register the output directory in the model registry (source 'artifact', with quantisation / base-model metadata) so the Inference page can select it.")
     save_dir: str | None = Field(None, description="Also write the final model directory here (default: <run_dir>/artifact).")
     fail_on_gate: bool = Field(True, description="Mark the job failed (after registering the artifact) when a gate verdict is 'fail'.")
     copy_below_gb: float = Field(2.0, ge=0, description="Stages copy the model when it is smaller than this (keeps earlier digests usable); larger models are modified in place.")

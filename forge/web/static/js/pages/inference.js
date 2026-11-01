@@ -41,8 +41,9 @@ export default async function render(ctx) {
       if (!st.deployments.length) { host.appendChild(emptyState('No deployments', 'Start the serving engine on a model or artifact. It runs as a serve job and exposes an OpenAI-compatible API.', h('button', { class: 'btn primary', onclick: () => startDialog() }, 'Start deployment'))); return; }
       host.appendChild(dataTable({ columns: [
         { key: 'name', label: 'Deployment', render: (d) => h('div', h('b', d.name || d.id), h('div', { class: 'small muted mono' }, d.id)) },
-        { key: 'artifact_ref', label: 'Model / artifact', render: (d) => h('code', String(d.artifact_ref || '-').slice(0, 40)) },
+        { key: 'artifact_ref', label: 'Model (loaded)', render: (d) => loadedModelCell(d) },
         { key: 'status', label: 'Status', render: (d) => statusBadge(d.status) },
+        { key: 'memory', label: 'GPU memory', noSort: true, render: (d) => memoryCell(d) },
         { key: 'cfg', label: 'Config', noSort: true, render: (d) => h('span', { class: 'small muted' }, ['kv_dtype', 'max_model_len', 'max_num_seqs'].filter((k) => d.serve_config && d.serve_config[k] !== undefined).map((k) => `${k}=${d.serve_config[k]}`).join(' ') || '-') },
         { key: 'port', label: 'Port', num: true, render: (d) => d.port ?? '-' },
         { key: 'created_at', label: 'Started', render: (d) => fmtRel(d.created_at) },
@@ -56,34 +57,127 @@ export default async function render(ctx) {
     const p = poll(ctx, async () => { await loadDeps(); if (st.tab === 'deployments') draw(); }, 4000);
     cleanup.push(p);
   }
+  function loadedModelCell(d) {
+    const lm = d.loaded_model; const ex = d.expected_model;
+    if (!lm) return h('div', h('code', String(d.artifact_ref || '-').slice(0, 40)), ex && ex.label ? h('div', { class: 'small' }, badge(ex.label, 'info'), ' requested') : null, d.status === 'starting' ? h('div', { class: 'small muted' }, 'loading...') : null);
+    return h('div', h('b', lm.name || '-'), h('div', { class: 'small row tight' }, badge(lm.quantized ? (lm.label || 'quantised') : `dense ${lm.dtype || ''}`.trim(), lm.quantized ? 'ok' : 'dim'), badge(`${fmtNum(lm.weight_gb, 3)} GB weights`, 'dim')),
+      d.identity_warning ? h('div', { class: 'small' }, badge('wrong model?', 'bad'), ' ', d.identity_warning) : null,
+      ...(d.warnings || []).map((w) => h('div', { class: 'small' }, badge('warning', 'warn'), ' ', w)));
+  }
+  function memoryCell(d) {
+    const mem = d.memory; if (!mem) return h('span', { class: 'muted small' }, '-');
+    return h('div', { class: 'small' }, `weights ${fmtNum(mem.weights_gb, 3)} GB`, h('br'), `KV pool ${fmtNum(mem.kv_pool_gb, 3)} GB`, h('br'), mem.free_gb != null ? `free ${fmtNum(mem.free_gb, 3)} GB` : 'CPU', isNum(mem.kv_pool_gb) && isNum(mem.weights_gb) && mem.kv_pool_gb > 2 * mem.weights_gb ? h('div', null, badge('pool > 2x weights', 'warn')) : null);
+  }
   async function stop(d) {
     if (!(await confirmDialog({ title: 'Stop deployment?', message: `Stops the serve job for "${d.name}" and frees the GPU memory.`, confirmLabel: 'Stop', danger: true }))) return;
     try { await api.del(`/deployments/${encodeURIComponent(d.id)}`); toast('Deployment stopped', 'ok'); await loadDeps(); paint(); } catch (e) { toastError(e); }
   }
 
+  // Model picker entries: base models and quantised compress outputs from the registry (badges: W4A16 g128, size), then loose store artifacts.
+  function modelOption(m) {
+    const q = m.quantization ? ` [${m.quantization}]` : '';
+    const sz = isNum(m.weight_gb) && m.weight_gb > 0 ? `, ${fmtNum(m.weight_gb, 3)} GB` : '';
+    const state = m.servable === false ? ' - files missing' : (!m.downloaded && m.source === 'hf' ? ' - downloads on start' : '');
+    return { value: m.id, label: `${m.name || m.id}${q}${sz}${state}`, disabled: m.servable === false, m };
+  }
+  async function loadPickerData() {
+    const [models, arts] = await Promise.all([tryGet('/models'), tryGet('/artifacts', { kind: 'quantized' })]);
+    const rows = models.ok ? listOf(models.data, 'models') : [];
+    const registeredHashes = new Set(rows.map((m) => m.hash).filter(Boolean));
+    const quant = rows.filter((m) => m.kind === 'quantized').map(modelOption);
+    const base = rows.filter((m) => m.kind !== 'quantized').map(modelOption);
+    const loose = (arts.ok ? listOf(arts.data, 'artifacts') : []).filter((a) => a.hash && !registeredHashes.has(a.hash))
+      .map((a) => ({ value: a.hash, label: `${a.hash.slice(0, 22)}... (store artifact, not registered${isNum(a.size) ? `, ${fmtNum(a.size / 1e9, 3)} GB` : ''})` }));
+    return { quant, base, loose, ok: models.ok };
+  }
+
   async function startDialog() {
-    const [models, arts, types] = await Promise.all([tryGet('/models'), tryGet('/artifacts', { kind: 'model' }), fetchJobTypes().catch(() => [])]);
-    const refs = [];
-    if (models.ok) for (const m of listOf(models.data, 'models')) refs.push({ value: m.id, label: `${m.name || m.id} (model)` });
-    if (arts.ok) for (const a of listOf(arts.data, 'artifacts')) refs.push({ value: a.hash, label: `${a.name || a.hash.slice(0, 18)} (artifact)` });
+    const [pick0, types] = await Promise.all([loadPickerData(), fetchJobTypes().catch(() => [])]);
     const serve = types.find((t) => t.type === 'serve');
     const nameEl = h('input', { type: 'text', placeholder: 'my-deployment', style: 'width:100%', 'aria-label': 'Deployment name' });
-    const refSel = h('select', { 'aria-label': 'Model or artifact', style: 'width:100%' }, refs.length ? refs.map((r) => h('option', { value: r.value }, r.label)) : [h('option', { value: '' }, '(no models registered)')]);
-    const refTxt = h('input', { type: 'text', placeholder: 'or type a model id / artifact hash / path', style: 'width:100%', 'aria-label': 'Model reference' });
+    const refSel = h('select', { 'aria-label': 'Model or artifact', style: 'width:100%' });
+    const refTxt = h('input', { type: 'text', placeholder: 'or type a model id / name, a directory path, or an artifact digest (blake3:...)', style: 'width:100%', 'aria-label': 'Model reference' });
+    const importMsg = h('div', { class: 'small muted', role: 'status' });
+    const overrideMsg = h('div', { class: 'small', role: 'status', 'aria-live': 'polite' });
+    // typed text always wins over the dropdown: say so, and grey the dropdown out while it is overridden
+    function syncOverride() {
+      const t = refTxt.value.trim(); clear(overrideMsg);
+      refSel.style.opacity = t ? '0.5' : ''; refSel.setAttribute('aria-disabled', t ? 'true' : 'false');
+      if (t) overrideMsg.append(badge('typed reference used', 'warn'), ' ', `The text field overrides the dropdown: "${t.length > 60 ? t.slice(0, 60) + '...' : t}" will be deployed. Clear the text field to use the dropdown selection.`);
+    }
+    const fillPicker = (d) => {
+      clear(refSel);
+      const grp = (label, items) => { if (items.length) refSel.append(h('optgroup', { label }, items.map((o) => h('option', { value: o.value, disabled: !!o.disabled }, o.label)))); };
+      grp('Quantised artifacts (compress outputs)', d.quant); grp('Base models', d.base); grp('Store artifacts', d.loose);
+      if (!refSel.children.length) refSel.append(h('option', { value: '' }, '(no models registered - type a path, or Import artifacts)'));
+      else {
+        // a finished compress job is usually what you want to try next; never preselect a disabled (files missing) entry
+        const first = [...d.quant, ...d.base, ...d.loose].find((o) => !o.disabled);
+        const anyEnabled = Array.from(refSel.querySelectorAll('option')).find((o) => !o.disabled);
+        refSel.value = first ? first.value : (anyEnabled ? anyEnabled.value : '');
+      }
+      syncOverride();
+    };
+    fillPicker(pick0);
+    const importBtn = h('button', { class: 'btn sm', type: 'button', title: 'Scan runs/*/artifact and finished compress jobs and register their outputs as models', onclick: async () => {
+      importBtn.disabled = true; importMsg.textContent = 'Scanning...';
+      try {
+        const r = await api.post('/models/import-artifacts', {});
+        importMsg.textContent = `${r.imported.length} imported, ${r.updated} refreshed, ${r.skipped.length} skipped (of ${r.scanned} found)`;
+        fillPicker(await loadPickerData()); scheduleEstimate();
+      } catch (e) { importMsg.textContent = 'Import failed: ' + e.message; } finally { importBtn.disabled = false; }
+    } }, 'Import artifacts');
     const formHost = h('div'); let form = null; let rawEl = null;
+    const estHost = h('div', { class: 'small', role: 'status', 'aria-live': 'polite' });
+    let estTimer = null; let estSeq = 0;
+    const currentRef = () => refTxt.value.trim() || refSel.value;
+    const currentCfg = () => { try { return form ? form.getValue() : (rawEl && rawEl.value.trim() ? JSON.parse(rawEl.value) : {}); } catch (e) { return null; } };
+    async function estimate() {
+      const ref = currentRef(); const cfg = currentCfg(); const my = ++estSeq;
+      if (!ref || cfg == null) { clear(estHost); return; }
+      try {
+        const r = await api.post('/deployments/estimate', { artifact_ref: ref, serve_config: cfg });
+        if (my !== estSeq) return;
+        clear(estHost);
+        const m = r.model || {};
+        const rows = [['Model', `${m.label ? m.label + ' - ' : 'dense - '}${m.path || ''}`], ['Weights on GPU', `${fmtNum(r.weights_gb, 3)} GB`]];
+        if (r.fits === false) { estHost.append(notice('error', 'Does not fit', r.error), kv(rows)); return; }
+        rows.push(['KV pool', `${fmtNum(r.kv_pool_gb, 3)} GB next to ${fmtNum(r.weights_gb, 3)} GB weights (${fmtNum(r.num_blocks)} blocks x ${r.block_size} tokens, limited by ${r.limited_by})`]);
+        if (r.draft) rows.push(['Draft model', `${fmtNum(r.draft.weight_gb, 3)} GB weights + ${fmtNum(r.draft.kv_pool_gb, 3)} GB KV pool`]);
+        if (r.free_gb != null) rows.push(['Free after load', `${fmtNum(r.free_gb, 3)} GB of ${fmtNum(r.gpu_total_gb, 3)} GB (gpu_mem_util ${r.gpu_mem_util})`]);
+        else rows.push(['GPU', 'not detected on this server - sizes only (KV pool shown for the CPU cap)']);
+        rows.push(['KV per max-length sequence', `${fmtNum(r.kv_gb_per_max_len_seq, 3)} GB (${r.kv_dtype})`], ['Concurrent max-length sequences', fmtNum(r.max_concurrent_at_full_len)]);
+        estHost.append(kv(rows));
+        if (isNum(r.kv_pool_gb) && isNum(r.weights_gb) && r.kv_pool_gb > 2 * r.weights_gb) estHost.append(notice('warn', 'Large KV pool', `The KV pool (${fmtNum(r.kv_pool_gb, 3)} GB) is more than twice the model weights (${fmtNum(r.weights_gb, 3)} GB). Lower max_num_seqs, max_model_len or kv_pool_cap_tokens, or quantise the KV cache, if that is not intended.`));
+        [...(r.kv_warnings || []), ...(r.warnings || [])].forEach((w) => estHost.append(notice('info', '', w)));
+      } catch (e) { if (my === estSeq) { clear(estHost); estHost.append(h('span', { class: 'muted' }, 'Estimate unavailable: ' + e.message)); } }
+    }
+    function scheduleEstimate() { clearTimeout(estTimer); estTimer = setTimeout(estimate, 350); }
+    refSel.addEventListener('change', () => { if (refTxt.value.trim()) refTxt.value = ''; syncOverride(); scheduleEstimate(); }); refTxt.addEventListener('input', () => { syncOverride(); scheduleEstimate(); });
     if (serve) {
-      form = new SchemaForm(formHost, { schema: serve.schema, defaults: serve.defaults, value: serve.defaults });
-    } else { rawEl = h('textarea', { rows: 8, 'aria-label': 'ServeConfig JSON', placeholder: '{"max_model_len": 8192}' }); formHost.append(h('p', { class: 'muted small' }, 'Serve schema unavailable - enter ServeConfig as JSON.'), rawEl); }
+      // the model is chosen above (single source of truth): do not offer a second, conflicting `model` field in the generated form
+      const schema = deepClone(serve.schema); const defaults = deepClone(serve.defaults || {});
+      const sd = (schema.$defs && (schema.$defs.ServeConfig || schema.$defs.Serve)) || schema;
+      for (const s of [schema, sd]) { if (s && s.properties) delete s.properties.model; if (s && Array.isArray(s.required)) s.required = s.required.filter((k) => k !== 'model'); }
+      delete defaults.model;
+      form = new SchemaForm(formHost, { schema, defaults, value: defaults, onChange: scheduleEstimate });
+    } else { rawEl = h('textarea', { rows: 8, 'aria-label': 'ServeConfig JSON', placeholder: '{"max_model_len": 8192}', oninput: scheduleEstimate }); formHost.append(h('p', { class: 'muted small' }, 'Serve schema unavailable - enter ServeConfig as JSON.'), rawEl); }
     const err = h('div', { class: 'sf-err', role: 'alert' });
     const go = h('button', { class: 'btn primary', onclick: async () => {
       let cfg;
       try { cfg = form ? form.getValue() : (rawEl.value.trim() ? JSON.parse(rawEl.value) : {}); } catch (e) { err.textContent = 'Invalid JSON: ' + e.message; return; }
-      const artifact_ref = refTxt.value.trim() || refSel.value;
+      delete cfg.model;
+      const artifact_ref = currentRef();
       if (!artifact_ref) { err.textContent = 'Choose a model or artifact.'; return; }
       go.disabled = true;
       try { const d = await api.post('/deployments', { name: nameEl.value.trim() || `serve-${Date.now() % 100000}`, artifact_ref, serve_config: cfg }); toast('Deployment starting...', 'ok'); m.close(); st.dep = d.id; await loadDeps(); paint(); } catch (e) { go.disabled = false; if (form && e.fieldErrors) form.setErrors(e.fieldErrors); err.textContent = e.message; }
     } }, 'Start');
-    const m = modal({ title: 'Start deployment', wide: true, body: h('div', { class: 'stack' }, h('div', { class: 'grid cols-2' }, h('div', h('label', { class: 'small muted' }, 'Name'), nameEl), h('div', h('label', { class: 'small muted' }, 'Model / artifact'), refSel, refTxt)), h('h3', 'Serve configuration'), formHost, err), footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), go] });
+    const m = modal({ title: 'Start deployment', wide: true, body: h('div', { class: 'stack' },
+      h('div', { class: 'grid cols-2' }, h('div', h('label', { class: 'small muted' }, 'Name'), nameEl),
+        h('div', h('div', { class: 'row' }, h('label', { class: 'small muted' }, 'Model / artifact'), h('span', { class: 'grow' }), importBtn), refSel, refTxt, overrideMsg, importMsg)),
+      h('h3', 'Memory plan'), estHost,
+      h('h3', 'Serve configuration'), h('p', { class: 'small muted' }, 'GPU memory use is set by gpu_mem_util (share of the whole card), max_model_len and max_num_seqs (KV pool size) - see the KV cache and Scheduler groups.'), formHost, err), footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), go] });
+    scheduleEstimate();
   }
 
   // ------------------------------------------------------------------ playground
@@ -168,6 +262,8 @@ export default async function render(ctx) {
         h('div', { class: 'grid cols-2' }, card('', stat('Running', isNum(running) ? String(running) : '-', 'sequences')), card('', stat('Waiting', isNum(waiting) ? String(waiting) : '-', 'queued'))),
         h('div', { class: 'mt-s' }, h('div', { class: 'row' }, h('span', { class: 'small muted' }, 'KV cache usage'), h('span', { class: 'grow' }), h('b', isNum(kvu) ? fmtPct(kvu, 0) : '-')), progressBar(isNum(kvu) ? kvu : 0, isNum(kvu) && kvu > 0.9 ? 'bad' : isNum(kvu) && kvu > 0.75 ? 'warn' : '')),
         h('div', { class: 'row mt-s' }, h('div', { class: 'grow' }, h('div', { class: 'small muted' }, 'Tokens / s'), h('b', { style: 'font-size:1.3rem' }, isNum(tps) ? fmtNum(tps) : '-')), sparkline(hist.tps, { width: 110, height: 34 })),
+        ...(s.model ? [kv([['Model', `${s.model.name || '-'}${s.model.label ? ' [' + s.model.label + ']' : ''}`], ['Weights', `${fmtNum(s.model.weight_gb, 3)} GB (${s.model.dtype || '?'})`], ['Loaded from', s.model.path || s.model.requested || '-']])] : []),
+        ...(s.memory ? [kv([['KV pool', `${fmtNum(s.memory.kv_pool_gb, 3)} GB (${s.memory.num_blocks} blocks, ${s.kv_dtype || ''})`], ['Free on card (plan)', s.memory.free_gb != null ? `${fmtNum(s.memory.free_gb, 3)} GB` : '-'], ['Allocated now', isNum(s.gpu_mem_gb) ? `${fmtNum(s.gpu_mem_gb, 3)} GB` : '-']])] : []),
         kv([['TTFT p50 / p99', `${fmtNum(pctl(s, 'ttft', 'p50'))} / ${fmtNum(pctl(s, 'ttft', 'p99'))} ms`], ['ITL p50 / p99', `${fmtNum(pctl(s, 'itl', 'p50'))} / ${fmtNum(pctl(s, 'itl', 'p99'))} ms`], ['Prefix hit rate', isNum(phr) ? fmtPct(phr, 0) : '-'], ['Spec mode', pick(s, ['spec_mode', 'speculation'], '-')], ['Requests', pick(s, ['requests_total'], '-')], ['Uptime', isNum(s.uptime_s) ? fmtDuration(s.uptime_s) : '-']]));
       if (Array.isArray(spec) && spec.length) {
         const holder = h('div', { class: 'mt-s' }); statsHost.appendChild(holder);

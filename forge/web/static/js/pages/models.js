@@ -1,6 +1,6 @@
 // Models: registry of local / Hugging Face models, inspect, download, delete. Licence + distillation gate shown.
 
-import { h, listOf, fmtNum, fmtRel, fmtBytes } from '../util.js';
+import { h, listOf, fmtNum, fmtRel, fmtBytes, isNum } from '../util.js';
 import { api } from '../api.js';
 import { pageHead, loadInto, dataTable, badge, statusBadge, hashLabel, confirmDialog, modal, objectView, toast, toastError, emptyState, kv, help } from '../components/ui.js';
 import { formDialog, runAction } from '../components/dialogs.js';
@@ -15,6 +15,7 @@ export default async function render(ctx) {
   const searchEl = h('input', { type: 'search', placeholder: 'Search models...', 'aria-label': 'Search models', oninput: (e) => { search = e.target.value.toLowerCase(); paint(); } });
   ctx.root.append(
     pageHead('Models', 'Registered base models, checkpoints and compressed variants available to jobs.',
+      h('button', { class: 'btn', title: 'Register compress outputs (runs/*/artifact) as selectable models', onclick: () => importArtifacts() }, 'Import artifacts'),
       h('button', { class: 'btn', onclick: () => registerLocal() }, 'Register local path'),
       h('button', { class: 'btn primary', onclick: () => addHf() }, '+ Hugging Face model')),
     h('div', { class: 'toolbar' }, searchEl), host);
@@ -36,7 +37,7 @@ export default async function render(ctx) {
     tableEl = dataTable({
       columns: [
         { key: 'name', label: 'Name', render: (m) => h('div', h('b', m.name || m.id), h('div', { class: 'small muted mono' }, m.path_or_repo || '')) },
-        { key: 'source', label: 'Source', render: (m) => badge(m.source || '-', 'dim') },
+        { key: 'source', label: 'Source', render: (m) => h('div', badge(m.source || '-', 'dim'), m.quantization ? badge(m.quantization, 'ok', { tip: `Packed weights: ${m.quant_summary && m.quant_summary.n_quantized_layers} layers${m.base_model ? ', compressed from ' + m.base_model : ''}` }) : null, isNum(m.weight_gb) && m.weight_gb > 0 ? badge(fmtNum(m.weight_gb, 3) + ' GB', 'dim') : null) },
         { key: 'params_b', label: 'Params', num: true, render: (m) => (m.params_b != null ? fmtNum(m.params_b) + 'B' : '-') },
         { key: 'licence', label: 'Licence', render: (m) => h('div', h('div', m.licence || '-'), distillBadge(m)) },
         { key: 'hash', label: 'Weights hash', render: (m) => hashLabel(m.hash) },
@@ -47,6 +48,7 @@ export default async function render(ctx) {
         { key: 'act', label: '', noSort: true, render: (m) => h('div', { class: 'row tight' },
           h('button', { class: 'btn sm', onclick: () => inspect(m) }, 'Inspect'),
           m.source === 'hf' && m.status !== 'ready' && m.status !== 'downloading' ? h('button', { class: 'btn sm', onclick: () => download(m) }, 'Download') : null,
+          m.servable ? h('a', { class: 'btn sm', href: `#/inference` }, 'Serve') : null,
           h('a', { class: 'btn sm', href: `#/finetune?model=${encodeURIComponent(m.id)}` }, 'Fine-tune'),
           h('button', { class: 'btn sm danger', 'aria-label': `Delete ${m.name}`, onclick: () => del(m) }, 'Delete')) },
       ], rows: all, sort: { key: 'created_at', dir: 'desc' },
@@ -93,6 +95,13 @@ export default async function render(ctx) {
         toast('Model added', 'ok'); reload();
         if (v.download && m && m.id) { try { const job = await api.post(`/models/${encodeURIComponent(m.id)}/download`, {}); if (job && job.id) navigate(`/jobs/${job.id}`); } catch (e) { toastError(e, 'Download'); } }
       } });
+  }
+  async function importArtifacts() {
+    try {
+      const r = await api.post('/models/import-artifacts', {});
+      toast(`${r.imported.length} artifact(s) imported, ${r.updated} refreshed${r.skipped.length ? `, ${r.skipped.length} skipped` : ''}`, r.skipped.length && !r.imported.length ? 'info' : 'ok');
+      reload();
+    } catch (e) { toastError(e, 'Import artifacts'); }
   }
   function registerLocal() {
     formDialog({ title: 'Register local model', submitLabel: 'Register',

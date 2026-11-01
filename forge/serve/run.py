@@ -31,6 +31,10 @@ def metrics_from_stats(st: dict[str, Any]) -> dict[str, float]:
         "serve/tokens_per_s": float(st["tokens_per_s"]),
         "serve/gpu_mem_gb": float(st["gpu_mem_gb"]),
     }
+    mem = st.get("memory") or {}
+    if mem.get("weights_gb") is not None:
+        out["serve/weights_gb"] = float(mem["weights_gb"])
+        out["serve/kv_pool_gb"] = float(mem["kv_pool_gb"])
     for src, dst in (("ttft_ms_p50", "serve/ttft_ms_p50"), ("itl_ms_p50", "serve/itl_ms_p50"),
                      ("spec_accept_rate", "serve/spec_accept_rate")):
         if st.get(src) is not None:
@@ -51,6 +55,16 @@ def run_server(cfg: ServeConfig, ctx: Any, *, engine: Any | None = None) -> dict
     ctx.progress(0.0, "loading model")
     eng = engine or LLMEngine(cfg)
     ctx.log(f"engine ready: {eng.pool.num_blocks} KV blocks x {eng.pool.block_size} tokens ({eng.kv_name}), device {eng.device}")
+    ident = dict(getattr(eng, "identity", None) or {})
+    mem = getattr(eng, "memory", None)
+    ctx.log(f"loaded model: {ident.get('name')} [{ident.get('label') or ('dense ' + str(ident.get('dtype')))}] "
+            f"{ident.get('weight_gb')} GB weights from {ident.get('path') or ident.get('requested')}")
+    if mem is not None:
+        ctx.log("memory: " + mem.summary())
+        for w in mem.warnings:
+            ctx.log(w, "warning")
+        ctx.set_output("memory", mem.to_dict())
+    ctx.set_output("model_identity", ident)
     if not cfg.api_key and cfg.host not in ("127.0.0.1", "localhost", "::1"):
         ctx.log(f"WARNING: serving on {cfg.host} without an api_key: anyone who can reach the port can use (and abort) requests; "
                 "set ServeConfig.api_key or tunnel over SSH", "warning")

@@ -11,7 +11,8 @@ quant: null                             # null = use whatever packed format the 
 device: auto
 kv_dtype: fp8_e4m3                      # halves KV bytes vs bf16; accuracy impact is workload-dependent -> run the long-context eval
 block_size: 16
-gpu_mem_util: 0.90
+gpu_mem_util: 0.85                      # share of the WHOLE card the engine may occupy: weights + KV pool + 1 GB activation reserve
+kv_pool: fit_workload                   # KV pool sized to max_num_seqs x max_model_len (never above gpu_mem_util); 'fill' = take the whole budget
 max_model_len: 8192
 max_num_seqs: 32
 max_num_batched_tokens: 4096

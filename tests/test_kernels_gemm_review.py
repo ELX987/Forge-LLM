@@ -166,7 +166,13 @@ def test_failed_triton_launch_is_memoised_and_skipped():
     ops_gemm.reset_failure_memo()
     x = torch.zeros(3, 8, dtype=torch.float16)
     fk = ops_gemm._fkey("w4a16_linear", x, 16, 8)
-    ops_gemm._fail("w4a16_linear", RuntimeError("compile error"), fk)
+
+    class CompilationError(Exception):  # triton.compiler.errors.CompilationError (deterministic -> memoised)
+        pass
+
+    ops_gemm._fail("w4a16_linear", RuntimeError("transient"), fk)  # transient errors are not memoised
+    assert fk not in ops_gemm._FAILED and ops_gemm.triton_usable(x, fk)[1] != "x" and "failed earlier" not in ops_gemm.triton_usable(x, fk)[1]
+    ops_gemm._fail("w4a16_linear", CompilationError("compile error"), fk)
     ok, why = ops_gemm.triton_usable(x, fk)
     assert not ok and "failed earlier" in why
     assert ops_gemm._fkey("w4a16_linear", torch.zeros(4, 8, dtype=torch.float16), 16, 8) == fk  # same pow2 row bucket (3 and 4 rows)

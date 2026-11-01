@@ -13,6 +13,10 @@
   ``to_empty`` on the target device and tensors are streamed shard by shard from ``safe_open``.
 * ``config.json`` written by :func:`save_model` is HF-compatible and additionally carries a ``forge`` block with the exact
   :class:`ModelConfig` and the quantisation manifest (needed to rebuild packed linears before loading their buffers).
+* Packed (compress) artifacts load as packed: :func:`load_model` rebuilds every manifest linear (``w4a16`` -> int4 codes + group scales, ~0.5 byte per
+  weight), loads the buffers, verifies that the built model really contains all of them (a quantised artifact that would come out dense raises, it is
+  never silently replaced by another model) and records what it built in ``model.forge_load_info`` (path, quantisation, weight bytes).
+  :func:`convert_packed_for_kernels` (CUDA serving) turns the portable W4A16 modules into kernel-layout modules and frees the duplicate copy.
 """
 from __future__ import annotations
 
@@ -317,13 +321,91 @@ def load_hf_tensors(model: ForgeLM, tensors: Iterator[tuple[str, torch.Tensor]],
     return rep
 
 
+def model_weight_bytes(model: nn.Module) -> dict[str, int]:
+    """Bytes held by ``model``'s parameters + buffers (shared / tied storage counted once; meta tensors count as 0).
+
+    ``{"total", "packed", "dense", "n_tensors"}``: ``packed`` = buffers/params of weight-compressed linears (``kind`` != dense/lora)."""
+    seen: set[tuple[int, str]] = set()
+    packed_mod: dict[int, str] = {}
+    for _n, m in model.named_modules():
+        if getattr(m, "kind", None) not in (None, "dense", "lora") and hasattr(m, "quant_spec"):
+            packed_mod[id(m)] = m.kind
+    total = packed = n = 0
+    for _n, m in model.named_modules():
+        is_packed = id(m) in packed_mod
+        for t in list(m.parameters(recurse=False)) + list(m.buffers(recurse=False)):
+            if t is None or t.is_meta:
+                continue
+            key = (t.data_ptr(), str(t.device))
+            if t.numel() and key in seen:
+                continue
+            seen.add(key)
+            nb = t.numel() * t.element_size()
+            total += nb
+            n += 1
+            if is_packed:
+                packed += nb
+    return {"total": total, "packed": packed, "dense": total - packed, "n_tensors": n}
+
+
+def convert_packed_for_kernels(model: nn.Module, *, require_cuda: bool = True) -> dict[str, Any]:
+    """CUDA serving: swap portable ``w4a16`` modules (``forge.compress.packed.IntLinear``, 4-bit, no input transform) for
+    :class:`forge.kernels.ops_gemm.KernelW4A16Linear` holding the kernel layout directly.
+
+    Without this, the first forward of every layer repacks the codes into the kernel layout and caches that copy *next to* the portable
+    tensors (about 2x the packed bytes on the GPU, plus a stall on the first request).  Per-layer failures keep the portable module (correct, slower).
+    ``require_cuda=False`` also converts CPU modules (tests exercise the kernel module's torch-oracle path that way).
+    Each portable module is released as soon as its replacement is installed, so the peak is the packed bytes plus one layer, not twice the packed bytes.
+    Returns ``{"converted", "kept", "errors", "avoided_duplicate_bytes"}``; ``avoided_duplicate_bytes`` = bytes of the kernel-layout buffers that now
+    *replace* the portable ones (the lazy repack would have cached them in addition to the portable copy). Layers whose conversion fails (including OOM)
+    stay portable and are logged with the layer name."""
+    out: dict[str, Any] = {"converted": 0, "kept": 0, "errors": [], "avoided_duplicate_bytes": 0}
+    try:
+        from forge.compress.packed import IntLinear
+        from forge.kernels.ops_gemm import KernelW4A16Linear
+    except Exception as e:  # noqa: BLE001 - kernels not importable: keep the portable modules
+        out["errors"].append(f"kernel linears unavailable: {type(e).__name__}: {e}")
+        return out
+    # snapshot only the names: holding the module objects (a ``dict(named_modules())``) would keep every replaced portable module alive until the
+    # end and make the peak ~2x the packed bytes; here each old module is unreferenced (and freed) as soon as its replacement is installed
+    names = [n for n, m in model.named_modules() if isinstance(m, IntLinear) and m.bits == 4 and getattr(m, "kind", "") == "w4a16"]
+    for name in names:
+        m = model.get_submodule(name)
+        if m.has_input_scale or m.rot_block or (require_cuda and not m.qweight.is_cuda):
+            out["kept"] += 1
+            continue
+        try:
+            pk = m._kernel_packed()
+            new = KernelW4A16Linear.from_packed(pk, m.bias.detach() if m.bias is not None else None)
+            del pk
+            parent_name, _, leaf = name.rpartition(".")
+            setattr(model.get_submodule(parent_name) if parent_name else model, leaf, new)
+            m._kernel_cache = None
+            out["converted"] += 1
+            out["avoided_duplicate_bytes"] += sum(b.numel() * b.element_size() for b in new.buffers())
+            del new
+        except Exception as e:  # noqa: BLE001 - includes CUDA OOM: the layer stays portable, loudly
+            out["kept"] += 1
+            log.warning("kernel-layout conversion of %s failed (%s: %s); keeping the portable module for this layer", name, type(e).__name__, e)
+            if len(out["errors"]) < 5:
+                out["errors"].append(f"{name}: {type(e).__name__}: {e}")
+        finally:
+            m = None  # noqa: F841 - drop the last reference to the old portable module so its tensors are freed now
+    if out["converted"]:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 def _ensure_kind(kind: str) -> None:
     try:
         get_linear_cls(kind)
         return
     except ConfigError:
         pass
-    for mod in ("forge.compress", "forge.compress.ptq", "forge.kernels", "forge.kernels.ops_gemm"):
+    for mod in ("forge.compress", "forge.compress.packed", "forge.compress.ptq", "forge.kernels", "forge.kernels.ops_gemm"):
         try:
             importlib.import_module(mod)
         except Exception:
@@ -353,23 +435,53 @@ def load_model(
     dev = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     dev = torch.device(dev) if not isinstance(dev, torch.device) else dev
     path = resolve_model_path(path_or_repo, revision)
+    try:
+        from forge.core.artifactmeta import read_artifact_summary
+
+        summ = read_artifact_summary(path)
+    except Exception:  # noqa: BLE001
+        summ = None
+    packed = bool(summ and summ.get("is_quantized"))
     tok = load_tokenizer(path) if with_tokenizer else None
     if backend == "hf":
+        if packed:
+            raise ConfigError(f"{path} is a Forge-packed artifact ({summ['label']}); backend='hf' cannot load it - use backend='forge'")
         return _load_hf_backend(path, dt, dev), tok
     if backend != "forge":
         raise ConfigError("backend must be 'forge' or 'hf'")
+    if packed and quant:
+        raise ConfigError(f"{path} is already quantised ({summ['label']}); `quant` ({quant!r}) must be empty - it would re-quantise the dense remainder, "
+                          "not the packed layers")
+    if packed and summ.get("writer") == "forge.compress.serialize":  # compress-only modules (low-rank / BitDelta ...): its own reader
+        from forge.compress.serialize import load_quantized
+
+        model, _meta = load_quantized(path, dtype=dt, device=dev)
+        _record_load_info(model, path, summ)
+        return model, tok
     cfg, raw = read_config(path)
-    model = ForgeLM(cfg, dtype=dt, device="meta", init_weights=False)
     qm = (raw.get("forge") or {}).get("quantization")
+    if not qm and raw.get("quantization_config") and not (raw.get("forge") or {}).get("model_config"):
+        method = (raw["quantization_config"] or {}).get("quant_method", "unknown")
+        raise ConfigError(f"{path} is a Hugging Face '{method}' quantised checkpoint, which Forge's own model code cannot load; "
+                          "quantise the bf16 model with a Forge compress job and serve that artifact")
+    model = ForgeLM(cfg, dtype=dt, device="meta", init_weights=False)
     if qm:
         for ent in qm.values():
             _ensure_kind(ent["kind"])
+        missing_mods = [n for n in qm if n not in dict(model.named_modules())]
+        if missing_mods:
+            raise ConfigError(f"{path}: the quantisation manifest names {len(missing_mods)} modules the architecture does not have, e.g. {missing_mods[:3]}")
         apply_quantization_manifest(model, qm, dt)
     if dev.type == "meta":
         return model, tok
     model.to_empty(device=dev)
     model.tie_weights()
-    load_hf_tensors(model, iter_checkpoint(path), strict=strict)
+    rep = load_hf_tensors(model, iter_checkpoint(path), strict=strict)
+    if packed or qm:
+        bad = [n for n in rep.unexpected if n.endswith((".qweight", ".scales", ".zeros", ".g_idx", ".payload", ".block_scales"))]
+        if bad:
+            raise ConfigError(f"{path}: {len(bad)} packed tensors were not consumed by any module (e.g. {bad[:3]}); refusing to serve a model that would "
+                              "silently run without them")
     model.tie_weights()
     model.eval()
     if quant:
@@ -377,7 +489,43 @@ def load_model(
         kind = spec.pop("kind")
         _ensure_kind(kind)
         quantize_linears(model, kind, **spec)
+    _record_load_info(model, path, summ)
     return model, tok
+
+
+def describe_loaded_model(model: nn.Module) -> dict[str, Any]:
+    """What is really in ``model``: ``forge_load_info`` (set by :func:`load_model`) completed/overridden by a scan of the live modules, so an
+    injected or converted model is described truthfully too. Keys: ``quantized``, ``layer_kinds``, ``label``, ``weight_bytes``, ``packed_bytes``, ``dense_bytes``, ..."""
+    info = dict(getattr(model, "forge_load_info", None) or {})
+    wb = model_weight_bytes(model)
+    kinds: dict[str, int] = {}
+    for _n, m in model.named_modules():
+        k = getattr(m, "kind", None)
+        if k not in (None, "dense", "lora") and hasattr(m, "quant_spec"):
+            kinds[k] = kinds.get(k, 0) + 1
+    info.update(quantized=bool(kinds), layer_kinds=kinds, weight_bytes=wb["total"], packed_bytes=wb["packed"], dense_bytes=wb["dense"])
+    if kinds and not info.get("label"):
+        info["label"] = " + ".join(k.upper() for k in sorted(kinds, key=lambda k: -kinds[k]))
+    return info
+
+
+def _record_load_info(model: nn.Module, path: Path, summ: dict[str, Any] | None) -> None:
+    """Attach ``model.forge_load_info`` (what was actually built) and verify a packed artifact really came out packed."""
+    wb = model_weight_bytes(model)
+    kinds: dict[str, int] = {}
+    for _n, m in model.named_modules():
+        k = getattr(m, "kind", None)
+        if k not in (None, "dense", "lora") and hasattr(m, "quant_spec"):
+            kinds[k] = kinds.get(k, 0) + 1
+    if (summ or {}).get("is_quantized") and sum(kinds.values()) < int(summ.get("n_quantized_layers") or 0):
+        raise ConfigError(f"{path} declares {summ['n_quantized_layers']} packed layers ({summ['label']}) but the loaded model has only "
+                          f"{sum(kinds.values())}; refusing to serve a dense stand-in")
+    model.forge_load_info = {  # type: ignore[attr-defined]
+        "path": str(path), "quantized": bool(kinds), "layer_kinds": kinds, "label": (summ or {}).get("label"),
+        "bits": (summ or {}).get("bits"), "group_size": (summ or {}).get("group_size"), "layout_id": (summ or {}).get("layout_id"),
+        "kv": (summ or {}).get("kv"), "base_model": (summ or {}).get("base_model"), "weight_bytes": wb["total"], "packed_bytes": wb["packed"],
+        "dense_bytes": wb["dense"],
+    }
 
 
 def _load_hf_backend(path: Path, dt: torch.dtype, dev: torch.device):

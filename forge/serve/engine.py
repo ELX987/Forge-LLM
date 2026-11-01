@@ -21,13 +21,16 @@ from typing import Any
 from forge.core.errors import ConfigError
 from forge.serve.config import ServeConfig
 from forge.serve.kv import KVBlockManager
+from forge.serve.memory import artifact_kv_choice, draft_pool_blocks
 from forge.serve.runner import (
     KVPool,
     ModelAdapter,
     ModelRunner,
     SeqInput,
+    kv_bytes_per_block,
     normalize_kv_name,
     plan_num_blocks,
+    plan_kv_pool,
     resolve_device,
     resolve_dtype,
 )
@@ -48,6 +51,7 @@ from forge.serve.spec import (
     NgramDrafter,
     SpecController,
     StepCostModel,
+    _module_bytes,
     rejection_sample,
 )
 
@@ -124,11 +128,38 @@ class LLMEngine:
             if prefix_caching:
                 log.info("prefix caching disabled: hybrid (conv) models need the conv state at the cached-prefix boundary")
                 prefix_caching = False
+        from forge.models.loader import describe_loaded_model
+
+        info = describe_loaded_model(model)
         self.kv_name = normalize_kv_name(cfg.kv_dtype, self.compute_dtype)
-        num_blocks = plan_num_blocks(dims=d, block_size=cfg.block_size, kv_name=self.kv_name, device=self.device,
-                                     gpu_mem_util=cfg.gpu_mem_util, activation_reserve_gb=cfg.activation_reserve_gb,
-                                     max_num_seqs=cfg.max_num_seqs, max_model_len=cfg.max_model_len,
-                                     num_gpu_blocks=cfg.num_gpu_blocks)
+        chosen_kv, self.kv_warnings = artifact_kv_choice(cfg.kv_dtype, info.get("kv"))
+        if chosen_kv:
+            self.kv_name = chosen_kv  # the artifact was compressed (and gated) with this KV scheme: serve it that way
+            log.info("kv_dtype=auto -> %s (the artifact's recipe quantised the KV cache with this scheme)", self.kv_name)
+        for w in self.kv_warnings:
+            log.warning("%s", w)
+        draft_extra = self._prepare_draft(draft_model, drafter)
+        if self._draft_model is not None:
+            draft_model = self._draft_model
+        # explicit memory budget: weights are measured on the loaded model, the KV pool is what is left of gpu_mem_util (see forge.serve.memory)
+        self.memory = plan_kv_pool(dims=d, block_size=cfg.block_size, kv_name=self.kv_name, device=self.device,
+                                   gpu_mem_util=cfg.gpu_mem_util, activation_reserve_gb=cfg.activation_reserve_gb,
+                                   max_num_seqs=cfg.max_num_seqs, max_model_len=cfg.max_model_len, weight_bytes=int(info["weight_bytes"]),
+                                   packed_weight_bytes=int(info["packed_bytes"]), num_gpu_blocks=cfg.num_gpu_blocks, kv_pool=cfg.kv_pool,
+                                   kv_pool_cap_tokens=cfg.kv_pool_cap_tokens, extra_bytes=draft_extra)
+        num_blocks = self.memory.num_blocks
+        for w in self.memory.warnings:
+            log.warning("%s", w)
+        log.info("memory plan: %s", self.memory.summary())
+        self.identity = {
+            "name": cfg.display_name(), "requested": cfg.model, "path": info.get("path"), "quantized": info["quantized"], "label": info.get("label"),
+            "layer_kinds": info.get("layer_kinds"), "bits": info.get("bits"), "group_size": info.get("group_size"), "layout_id": info.get("layout_id"),
+            "base_model": info.get("base_model"), "weight_gb": round(info["weight_bytes"] / 1e9, 3), "packed_gb": round(info["packed_bytes"] / 1e9, 3),
+            "weight_bytes": int(info["weight_bytes"]), "packed_bytes": int(info["packed_bytes"]),
+            "dtype": str(self.compute_dtype).replace("torch.", ""), "kv_dtype": self.kv_name, "device": str(self.device),
+            "kernel_convert": info.get("kernel_convert"),
+            "warnings": list(self.kv_warnings), "artifact_kv": info.get("kv"),
+        }
         self.pool = KVPool(num_blocks, cfg.block_size, d.num_kv_layers, d.num_kv_heads, d.head_dim, self.compute_dtype,
                            self.kv_name, self.device)
         bpb = self.pool.bytes_per_block
@@ -201,25 +232,56 @@ class LLMEngine:
         dt = resolve_dtype(cfg.dtype, dev)
         dtype_name = {"torch.bfloat16": "bfloat16", "torch.float16": "float16", "torch.float32": "float32"}[str(dt)]
         model, tok = loader.load_model(cfg.model, dtype=dtype_name, device=str(dev), revision=cfg.revision, quant=cfg.quant)
+        li = getattr(model, "forge_load_info", None)
+        if li and li.get("quantized"):
+            log.info("loaded %s as packed %s: %s layers, %.2f GB weights (%.2f GB packed) from %s", cfg.display_name(), li.get("label"),
+                     sum((li.get("layer_kinds") or {}).values()), li["weight_bytes"] / 1e9, li["packed_bytes"] / 1e9, li.get("path"))
+            if cfg.kernel_linears == "auto" and dev.type == "cuda":
+                conv = loader.convert_packed_for_kernels(model)
+                li["kernel_convert"] = {k: conv[k] for k in ("converted", "kept", "avoided_duplicate_bytes")} | ({"errors": conv["errors"]} if conv["errors"] else {})
+                log.info("kernel-layout W4A16 modules: %d converted (%.2f GB kernel layout replacing the portable copies; no lazy duplicate is cached), %d kept portable",
+                         conv["converted"], conv["avoided_duplicate_bytes"] / 1e9, conv["kept"])
+                for e in conv["errors"]:
+                    log.warning("kernel conversion: %s", e)
         if cfg.tokenizer:
             tok = loader.load_tokenizer(cfg.tokenizer)
         return model, tok
+
+    def _prepare_draft(self, draft_model: Any | None, drafter: Any | None) -> int:
+        """Load the draft model (if one will be used) *before* the target KV pool is sized and return the bytes it reserves on the device
+        (weights + its private KV pool), so the plan accounts for them instead of discovering the shortfall after the pool is allocated."""
+        self._draft_model: Any | None = None
+        self._draft_blocks = 0
+        sc = self.cfg.speculation
+        if drafter is not None or sc.mode not in ("draft", "auto") or (draft_model is None and not sc.draft_model):
+            return 0
+        if draft_model is None:
+            from forge.models import loader
+
+            draft_model, _ = loader.load_model(sc.draft_model, dtype=str(self.compute_dtype).replace("torch.", ""),
+                                               device=str(self.device), quant=sc.draft_quant)
+        draft_model.eval()
+        draft_model.to(self.device)
+        self._draft_model = draft_model
+        dd = ModelAdapter(draft_model, None).dims
+        cfg = self.cfg
+        self._draft_blocks = draft_pool_blocks(max_num_seqs=cfg.max_num_seqs, max_model_len=cfg.max_model_len, block_size=cfg.block_size,
+                                               kv_pool=cfg.kv_pool, kv_pool_cap_tokens=cfg.kv_pool_cap_tokens)
+        per = kv_bytes_per_block(dd.num_layers, dd.num_kv_heads, dd.head_dim, cfg.block_size, self.kv_name)
+        return _module_bytes(draft_model) + (self._draft_blocks + 1) * per
 
     def _build_drafter(self, sc: Any, draft_model: Any | None) -> Any:
         mode = sc.mode
         ngram = NgramDrafter(sc.ngram_max, sc.ngram_min, sc.ngram_window)
         model_drafter = None
         if mode in ("draft", "auto") and (draft_model is not None or sc.draft_model):
-            if draft_model is None:
-                from forge.models import loader
-
-                draft_model, _ = loader.load_model(sc.draft_model, dtype=str(self.compute_dtype).replace("torch.", ""),
-                                                   device=str(self.device), quant=sc.draft_quant)
+            if draft_model is None:  # defensive: _prepare_draft normally loaded it before the pool was sized
+                draft_model = self._draft_model
             draft_model.eval()
             draft_model.to(self.device)
             model_drafter = DraftModelDrafter(
                 draft_model, device=self.device, compute_dtype=self.compute_dtype, kv_name=self.kv_name,
-                block_size=self.cfg.block_size, num_blocks=max(16, self.pool.num_blocks // 4),
+                block_size=self.cfg.block_size, num_blocks=self._draft_blocks or max(16, self.pool.num_blocks // 4),
                 max_model_len=self.cfg.max_model_len, kernel_attention=self.cfg.kernel_attention,
                 expect_vocab=self.dims.vocab_size)
         elif mode == "draft":
@@ -684,6 +746,8 @@ class LLMEngine:
             "spec_verify_ms_avg": (sum(self.spec_step_ms) / len(self.spec_step_ms)) if self.spec_step_ms else None,
             "plain_decode_step_ms_avg": (sum(self.plain_decode_step_ms) / len(self.plain_decode_step_ms)) if self.plain_decode_step_ms else None,
             "gpu_mem_gb": gpu_gb,
+            "model": dict(self.identity),
+            "memory": self.memory.to_dict(),
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_generated_tokens": self.total_generated_tokens,
             "total_finished": self.total_finished,

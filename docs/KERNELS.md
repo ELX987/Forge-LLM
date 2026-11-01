@@ -111,7 +111,8 @@ Three levels, in increasing strength:
 
 | Kernel | CPU-tested (oracle, layouts, fallback) | Interpreter-checked | GPU-validated | Perf-validated | Hardware tried |
 |--------|----------------------------------------|---------------------|---------------|----------------|----------------|
-| K1 W4A16 / W8A16 (`triton/gemm_wq.py`) | yes | yes (fp16) | **no** | **no** | none |
+| K1 W8A16 and the legacy W4A16 kernel (`triton/gemm_wq.py`) | yes | yes (fp16) | compiled + ran on sm_120 (correct; **0.23x-0.40x of bf16**, see section 10) | **no, slow** | RTX PRO 6000 Blackwell (sm_120) |
+| K1 W4A16 nibble-split kernels (`triton/gemm_w4_fast.py`, `impl=dot` / `impl=gemv`) | yes (config policy, act-order sort) | yes (fp16 dot, fp16/bf16/fp32 gemv; all group sizes, zeros, act-order, odd N/K, split-K) | **no** (offline-compiled for sm_80/89/90/120 only; `tests_gpu/test_kernels_w4a16_fast.py` not run) | **no** (`scripts/bench_w4a16.py` not run) | none |
 | K3 INT8 W8A8 + activation quantiser (`gemm_int8.py`) | yes | yes, bit exact | **no** (sm_120 run: quantiser mismatched the oracle; root cause 1: Triton approximate `/` (fixed with `div_rn`); root cause 2: the torch oracle's `amax / 127.0` is `amax * (1/127)` on CUDA (CPU-scalar divisor), 1 ulp off IEEE; oracle now divides by a tensor. GEMM exactness and quantiser agreement are separate tests; awaiting re-run) | **no** | RTX PRO 6000 Blackwell (sm_120) |
 | K3 FP8 GEMM (`gemm_fp8.py`, `torch._scaled_mm` fast path) | yes | yes; fp8 codes of the fused RMSNorm quantiser not checkable | **no** | **no** | none |
 | K2 NVFP4 / MXFP4 dequant GEMM, fused quantiser (`gemm_fp4.py`) | yes | yes (quantiser bit exact vs oracle) | **no** | **no** | none |
@@ -154,6 +155,104 @@ FORGE_FORCE_REF=1 python -m pytest tests_gpu -q     # the reference path only (s
 
 Tests in `tests_gpu/` are auto-skipped when CUDA is unavailable (`conftest.py`). Capability-gated tests skip with a
 reason on chips that lack the feature (e.g. FP8 on `sm_86`); a skip is not a pass.
+
+## 7b. W4A16 decode GEMM (K1): measured problem, diagnosis, redesign
+
+**What was measured** (RTX PRO 6000 Blackwell Max-Q, sm_120, Triton 3.8, `gpu_report` bench, bf16, N=K=4096, group 128): the
+legacy kernel took 88.6 us at M=1 and 86.0 us at M=16 (identical, i.e. not scaling with work), 199 us at M=256, achieving
+~98 GB/s = 6.7% of the measured copy bandwidth; `path: triton` (not the reference fallback), results correct. The
+"speed-up" column is `baseline_ms / kernel_ms` with `baseline = F.linear(x, p.dequantize(bf16))` (a fair bf16 baseline:
+dense bf16 weight, cuBLAS), both timed **eagerly** (one call between two CUDA events, L2 flushed). That is 0.34x / 0.40x /
+0.23x at M = 1 / 16 / 256.
+
+**Diagnosis** (static, from the code and from compiling the kernels offline with Triton for sm_120 and reading the PTX):
+
+1. *Scalar, redundant weight loads.* The legacy kernel loads, for every `(k, n)` element of the tile, the int32 word that
+   contains it (`offs_k // 8` addresses; 8 identical 4-byte loads per word, 2.5 KiB stride between channels). Triton cannot
+   vectorise that pattern (constancy 8, no contiguity). In the sm_120 PTX of the legacy kernel: **384 four-byte
+   `cp.async.ca` weight loads per tile body vs 6 sixteen-byte `cp.async.cg`** in the new kernel (asserted by
+   `tests/test_kernels_w4_fast_compile.py`).
+2. *Per-element scale and zero-point loads* inside the K loop (`s_ptr + g[:, None] * stride + offs_n[None, :]`, plus a zero
+   word load and shift per element), and a scale multiply on every weight before the MMA. For g128 and `tile_k=128` the
+   scale/zero are constant over the tile: one `[BLOCK_N]` vector load is enough, and the scale can multiply the
+   `[BM, BN]` partial sum instead of the `[BN, BK]` weights.
+3. *act-order (`g_idx`)*: an external GPTQ checkpoint quantised with `desc_act` carries a `g_idx`. The legacy kernel then
+   also gathers `g_idx[k]` and a scale/zero **per element**: the worst case of (2). Artifacts produced by Forge's own
+   recipe `w4a16-gptq-g128` (`act_order: true`) do **not** carry a `g_idx`: Forge's GPTQ uses static groups (group
+   parameters computed up-front, so the stored layout is the plain `k // group_size` rule). The `g_idx` / group-sorted
+   path is for externally produced GPTQ weights.
+4. *Integer to float*: shift, mask, `int32 -> f32`, subtract, multiply, `f32 -> bf16` per weight element. Not the
+   bottleneck at 4-bit (estimate: a few us of ALU per 4096x4096 layer vs ~6 us of DRAM time) once the loads are fixed.
+5. *Split-K at decode*: legacy `default_wq_config` only splits to fill the SMs with a 64-wide N tile; reasonable, but the
+   fp32 workspace + second reduce kernel are two extra launches, which matters for the next point.
+6. *Host overhead and how the number is measured.* An eager Triton launch costs 15-50 us of host time (argument
+   processing, `torch.empty` for the workspace, the split-K reduce launch, the Python dispatcher in `ops_gemm`). A 4096x4096
+   W4 decode GEMM needs ~7 us of device time at the measured bandwidth, so **an eager benchmark cannot show more than
+   ~0.5-1x no matter how good the kernel is**: bf16 `F.linear` is one cuBLAS launch. Real decode loops hide launch cost
+   with CUDA graphs; `scripts/bench_w4a16.py` therefore times CUDA-graph replays over a ring of weight copies larger than L2
+   (and also prints the eager numbers). The built-in `bench` job (`forge/kernels/bench.py`) is still eager and keeps
+   under-reporting the speed-up until it adopts the same method.
+7. *Prefill (M = 256)*: with in-kernel dequant every M tile re-dequantises its weights, so large M is compute/ALU bound;
+   dequantising once (cached bf16 weight + cuBLAS) wins there. Not changed here; the decode regime is what 4-bit buys.
+
+**Redesign** (`forge/kernels/triton/gemm_w4_fast.py`, policy in `forge/kernels/w4_tuning.py`, launcher/fallback in
+`triton/gemm_w4a16.py`):
+
+* *Nibble-split loads.* The packed words are loaded as a `[KW, BLOCK_N]` (dot) or `[BLOCK_N, KW]` (gemv) tile, `KW = BLOCK_K/8`,
+  contiguous along the word axis: one 16-byte vector per thread, each word read once. Slice `j` of the tile is
+  `(word >> 4j) & 15` and pairs with the activations `x[:, k0 + 8c + j]` (stride-8 gather of the tiny activation tile,
+  L1-resident), so the K sum is eight independent products and no nibble interleaving is needed (the portable_row layout is
+  unchanged; no repack).
+* *Hoisted scale / zero.* `SINGLE_GROUP` (g128 with `tile_k <= 128`, or per-channel): one `[BLOCK_N]` scale and zero vector per K
+  tile; the MMA multiplies the exact integers `q - z` (|.| <= 15) and the scale is applied once to the partial sum, so the
+  result is *at least as accurate* as before (the old kernel rounded `(q - z) * s` to 16 bit). Multi-group tiles (g32/g64, or
+  `tile_k > group`) gather one `[KW, BN]` scale tile per K tile, hoisted out of the 8-slice loop.
+* *`EVEN_K` / `EVEN_N` specialisation.* The offline PTX showed that a K-axis mask on the word loads (`wcol < nwords`) kills
+  vectorisation unless the compiler can prove the divisibility; the host passes constexpr `EVEN_K` / `EVEN_N` (`K % BLOCK_K`,
+  `N % BLOCK_N`) and the kernels use unmasked loads for full tiles. All Qwen3-14B shapes are even for the default tiles.
+* *act-order.* `sort_columns_by_group` (layouts/w4.py) permutes the K columns once at first use so that every group is a
+  contiguous run (`x @ W^T == x[:, perm] @ W_sorted^T`), cached in `packed.meta`; the kernel gathers `x` through `perm`.
+  Irregular `g_idx` (unequal groups) falls back to the legacy per-column kernel.
+* *Two implementations.* `impl=dot`: tensor cores (`mma.sync m16n8k16`, BLOCK_M >= 16, works for every M).
+  `impl=gemv` (M <= 8): fp32 FMA, all M rows in one program, the K reduction deferred to a single `tl.sum` after the loop; no
+  tensor cores and no 16-row padding. Which is faster per chip is a measurement, not a derivation: both are autotune candidates.
+* *Split-K for decode* targets `num_sms * ctas_per_sm` programs (chip profile table in `w4_tuning.py`; 2-3 CTAs/SM) and never
+  gives a slice fewer than two K tiles. The deterministic fixed-order reduction is unchanged.
+* *Chip profiles* (`w4_tuning.chip_family`): `pre_ampere` (sm<80, 2 stages), `ampere_dc` (sm_80/87: 163 KiB smem, 4 stages),
+  `ampere_consumer` (sm_86), `ada` (sm_89: ~99 KiB, 3 stages), `hopper` (sm_90: 227 KiB, 4 stages), `blackwell_dc` (sm_100/103),
+  `blackwell_consumer` (sm_120/121: ~99 KiB, GDDR7, `mma.sync`, 3 stages). These numbers are first-principles defaults, not
+  measurements.
+* *Autotune keying.* The cache key still buckets M to powers of two; the dispatcher (`ops_gemm.tuned_config`) now also borrows
+  the nearest tuned bucket of the same regime (decode <= 16 / prefill >= 32) and, for decode, the closest tuned (N, K) of the same
+  chip (split-K recomputed). Configs tuned for the legacy kernel are ignored (`dtype_cfg` carries the tag `k2`).
+* *Fallbacks.* `config={'impl': 'legacy'}` or `FORGE_W4_IMPL=legacy` (also `dot` / `gemv`) selects a kernel explicitly. If the
+  nibble-split kernel raises and the caller did not pin an `impl`, the launcher logs once and uses the legacy Triton kernel
+  for that (sm, dtype) instead of dropping to the torch reference. Explicit candidates (the autotuner, tests) never fall back.
+  The pure-torch oracle `w4a16_gemm_ref` and all tolerances (`w4a16_gemm.yaml`) are unchanged.
+
+**How to measure on the GPU host**
+
+```bash
+pytest tests_gpu/test_kernels_w4a16_fast.py -q -s      # compile + numerics + a printed legacy-vs-new speed table
+python scripts/bench_w4a16.py                          # full Qwen3-14B x M sweep, writes the autotune cache + w4a16_bench.json
+python scripts/bench_w4a16.py --act-order --m 1,8,16   # external GPTQ desc_act layout (shuffled g_idx); Forge's own artifacts use static groups
+python scripts/bench_w4a16.py --dry-run                # plan only, works without a GPU
+```
+
+The sweep prints, per (shape, M): bf16, legacy, default-heuristic and tuned device times, speed-up vs bf16, achieved GB/s and
+% of the measured copy bandwidth, the winning config, and whether the dispatcher actually picks the cached config up. The
+cache is `<FORGE_HOME>/autotune/<chip fingerprint>.json`, the file `ops_gemm.tuned_config` reads.
+
+**Status of this change (HONEST).** Verified without a GPU: the kernel logic in the Triton CPU interpreter against the fp32
+oracle (all group sizes, sym/asym, act-order, odd N/K, split-K deterministic and atomic, fp16/fp32 dot, fp16/bf16/fp32 gemv);
+offline compilation to PTX/cubin for sm_80, 89, 90 and 120 (fp16 and bf16, all config shapes in the sweep); the memory-access
+structure in the generated PTX (16-byte weight vectors, shared-memory use 5-75 KiB, zero local-memory spills at sm_120);
+the config policy, M bucketing and cache fallbacks on CPU. **Not verified:** that any of this is *faster* on hardware, the
+achieved bandwidth, the gemv-vs-dot winner on any chip, register spills of the gemv kernel at runtime, the tuned split-K, the
+sm_120 behaviour of Triton 3.8 (the user's version) vs the 3.9 used offline, and every number the sweep will print. The
+expectation "approaches 3-4x at small M" is the Plan target (spec KPI 3.2x), not a result; with CUDA-graph timing the ceiling is
+roughly the traffic ratio (16 / 4.19 bits per weight incl. scales and zeros, i.e. ~3.8x for the user's artifact) times
+the achieved-bandwidth ratio of the two kernels.
 
 ## 8. Adding a kernel
 

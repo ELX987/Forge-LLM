@@ -5,7 +5,7 @@ Logical input of the packer (the contract of ``docs/ARCHITECTURE.md``):
 * ``q``      ``uint8 [N, K]`` values ``0..15`` (unsigned code)
 * ``scales`` ``[N, G]`` (fp16 / bf16 / fp32), ``G = ceil(K / group_size)`` (``group_size = -1`` -> one group = per channel)
 * ``zeros``  ``uint8 [N, G]`` values ``0..15`` or ``None`` (``None`` means the symmetric zero-point 8)
-* ``g_idx``  optional ``int32 [K]`` (GPTQ act-order: group id of every input column)
+* ``g_idx``  optional ``int32 [K]`` (external GPTQ desc_act checkpoints: group id of every input column; Forge's own act-order GPTQ uses static groups and stores none)
 
 Dequantised weight: ``W[n, k] = (q[n, k] - zero[n, g(k)]) * scale[n, g(k)]`` with ``g(k) = k // group_size``
 (or ``g_idx[k]``).
@@ -303,3 +303,33 @@ def dequantize_parts(
     s = scales.float()[:, gi]
     z = 8.0 if zeros is None else zeros.float()[:, gi]
     return (q.float() - z) * s
+
+
+def sort_columns_by_group(p: PackedW4) -> tuple[PackedW4, torch.Tensor] | None:
+    """Make an act-order (``g_idx``) weight regular: stable-sort the K columns by group id.
+
+    GPTQ ``act_order`` stores a permuted column order, so the group of column ``k`` is ``g_idx[k]`` (non-monotonic).
+    Sorting the columns by group makes every group a contiguous run, i.e. the plain ``k // group_size`` rule holds
+    again and kernels can use a vector scale per K tile.  Returns ``(sorted_packed, perm)`` with
+    ``perm[j]`` = original column stored at sorted position ``j`` (int32 ``[K]``), so that
+
+        ``x @ W^T == x[:, perm] @ W_sorted^T``      (exact in real arithmetic; fp32 sums are re-ordered)
+
+    or ``None`` when ``p`` has no ``g_idx`` or the groups are irregular (not exactly ``group_size`` columns each, last
+    group the remainder) -- callers then use the per-column ``g_idx`` kernel.  Pure permutation, no re-quantisation.
+    """
+    if p.g_idx is None:
+        return None
+    gs, g = effective_group(p.group_size, p.k), int(p.scales.shape[0])
+    gi = p.g_idx.long().cpu()
+    if gi.numel() != p.k or int(gi.min()) < 0 or int(gi.max()) >= g:
+        return None
+    want = torch.full((g,), gs, dtype=torch.int64)
+    want[-1] = p.k - gs * (g - 1)
+    if int(want[-1]) <= 0 or not torch.equal(torch.bincount(gi, minlength=g), want):
+        return None
+    perm = torch.argsort(gi, stable=True)
+    q, s, z = unpack_w4(p)
+    dev = q.device
+    sorted_p = pack_w4(q[:, perm.to(dev)], s, z, p.group_size, p.layout, None)
+    return sorted_p, perm.to(torch.int32).to(dev)

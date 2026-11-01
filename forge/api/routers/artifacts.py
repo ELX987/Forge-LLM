@@ -66,6 +66,22 @@ def lineage(h: str, depth: int | None = Query(None, ge=1, le=50), direction: str
         return to_jsonable(st.lineage(h, depth))
 
 
+@router.post("/{h}/register-model", status_code=201, summary="Make a stored model artifact selectable as a model (materialises it from the store)")
+def register_model(h: str, name: str | None = None) -> dict[str, Any]:
+    """For artifacts whose run directory is gone: rebuild the loadable directory from the store, then register it like a compress output."""
+    from forge.api.routers.models import _public
+    from forge.core.modelref import resolve_model_ref
+    from forge.jobs.modelinfo import register_artifact_dir
+
+    st = store_or_501()
+    if not st.has(h):
+        raise NotFound(f"artifact {h!r} not found")
+    r = resolve_model_ref(h)  # registered row, else materialised into FORGE_HOME/models/artifacts/<digest>
+    if r.path is None:
+        raise ConfigError(f"artifact {h} has no loadable model directory")
+    return _public(register_artifact_dir(r.path, artifact_hash=h, name=name))
+
+
 @router.post("/{h}/pin")
 def pin(h: str, body: PinRequest | None = None) -> dict[str, Any]:
     st = store_or_501()

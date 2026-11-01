@@ -267,14 +267,15 @@ def _finish(cfg, ctx, store, recipe, result, lm, base_digest, final_digest, byte
             ctx.log(f"registered artifact {artifact}")
         except Exception as e:
             ctx.log(f"could not register the artifact in the store: {e}", "warning")
+    model_id = _register_model_row(cfg, ctx, out_dir, artifact, name, bytes_in)
     after = model_nbytes(lm.model)
     summary = {
-        "artifact": artifact, "model_dir": str(out_dir), "name": name, "recipe": recipe.name, "recipe_hash": result["recipe_hash"],
+        "artifact": artifact, "model_id": model_id, "model_dir": str(out_dir), "name": name, "recipe": recipe.name, "recipe_hash": result["recipe_hash"],
         "bytes_input": bytes_in, "bytes_output": after, "compression": bytes_in / max(after, 1), "params_output": count_params(lm.model),
         "gate": gate, "gate_failed": gate_failed, "gate_reasons": (gate or {}).get("reasons"), "kv": kv, "layout_id": layout, "stages": stages,
         "cache_hits": result.get("cache_hits", 0), "cancelled": bool(result.get("cancelled")), "seconds": round(time.perf_counter() - t0, 2),
     }
-    for k in ("artifact", "recipe_hash", "bytes_input", "bytes_output", "compression", "gate", "kv", "layout_id", "cache_hits"):
+    for k in ("artifact", "model_id", "recipe_hash", "bytes_input", "bytes_output", "compression", "gate", "kv", "layout_id", "cache_hits"):
         try:
             ctx.set_output(k, summary[k])
         except Exception:
@@ -282,6 +283,27 @@ def _finish(cfg, ctx, store, recipe, result, lm, base_digest, final_digest, byte
     ctx.set_output("summary", _clean(summary))
     ctx.progress(1.0, "compress done")
     return summary
+
+
+def _register_model_row(cfg: CompressJobConfig, ctx: RunContext, out_dir: Path, artifact: str | None, name: str, bytes_in: int) -> str | None:
+    """Job runs only (not scripts / tests with a NullContext): make the output a selectable model (``models`` table, source 'artifact')."""
+    if not getattr(cfg, "register_model", True):
+        return None
+    try:
+        from forge.jobs.context import WorkerContext
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(ctx, WorkerContext):
+        return None
+    try:
+        from forge.jobs.modelinfo import register_artifact_dir
+
+        row = register_artifact_dir(out_dir, artifact_hash=artifact, name=name, job_id=str(ctx.run_id), bytes_input=bytes_in)
+        ctx.log(f"registered model {row['id']} ({row['name']}, {(row.get('info') or {}).get('quantization', {}).get('label') or 'dense'}) - selectable on the Inference page")
+        return row["id"]
+    except Exception as e:  # noqa: BLE001 - registration is a convenience; `POST /models/import-artifacts` backfills it
+        ctx.log(f"could not register the output as a model ({type(e).__name__}: {e}); use Models -> Import artifacts", "warning")
+        return None
 
 
 def _clean(obj: Any) -> Any:

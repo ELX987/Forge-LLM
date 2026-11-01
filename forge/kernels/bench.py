@@ -169,6 +169,7 @@ def _build_w4(shape: dict[str, int], dtype: torch.dtype, device: str, cfg: Bench
     from forge.kernels import ops_gemm
     from forge.kernels.layouts import pack_w4, quantize_w4_rtn
     from forge.kernels.ref import w4a16_gemm_ref
+    from forge.kernels.w4_tuning import W4_TUNE_TAG
 
     g = shape.get("group", cfg.group_size)
     w = _weights(shape, device, cfg.seed)
@@ -187,7 +188,7 @@ def _build_w4(shape: dict[str, int], dtype: torch.dtype, device: str, cfg: Bench
         "path": lambda: ops_gemm.last_path("w4a16_linear") or "?",
         "spec": "w4a16_gemm",
         "state": state,
-        "dtype_cfg": ops_gemm.dtype_cfg("w4a16_gemm", dtype, g),
+        "dtype_cfg": ops_gemm.dtype_cfg("w4a16_gemm", dtype, g, W4_TUNE_TAG),
     }
 
     def run_cfg(c: dict[str, Any]) -> torch.Tensor:
@@ -672,8 +673,13 @@ def _autotune(cfg: BenchConfig, spec: Any, chip: Any, shape: dict[str, int], ins
     from forge.kernels.autotune import Autotuner
 
     tuner = Autotuner(chip=chip, repeats=cfg.autotune_repeats, max_candidates=cfg.autotune_max_candidates)
+    cands = None
+    if spec.kernel == "w4a16_gemm":  # the nibble-split kernels have their own search space (impl / tile / split-K)
+        from forge.kernels.w4_tuning import w4_candidates
+
+        cands = w4_candidates(shape["M"], shape["N"], shape["K"], sm=chip.sm, num_sms=chip.num_sms, group=shape.get("group", cfg.group_size))
     res = tuner.tune(spec, shape, lambda c, s: inst["run_cfg"](c), lambda s: inst["ref"](),
-                     dtype_cfg=inst.get("dtype_cfg", ""), layout_id=inst.get("layout_id") or "")
+                     dtype_cfg=inst.get("dtype_cfg", ""), layout_id=inst.get("layout_id") or "", candidates=cands)
     ctx.log(f"autotune {spec.kernel} {shape}: best={res.best} cached={res.cached} rejected={len(res.rejected)}")
     return {"best": res.best, "cached": res.cached, "from_cache": res.from_cache, "n_measured": len(res.measurements),
             "n_rejected": len(res.rejected), "notes": res.notes}

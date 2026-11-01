@@ -747,25 +747,28 @@ class ModelRunner:
 # --------------------------------------------------------------------------------------------------
 # memory planning
 # --------------------------------------------------------------------------------------------------
+def plan_kv_pool(*, dims: ModelDims, block_size: int, kv_name: str, device: Any, gpu_mem_util: float,
+                 activation_reserve_gb: float, max_num_seqs: int, max_model_len: int, weight_bytes: int = 0, packed_weight_bytes: int = 0,
+                 num_gpu_blocks: int | None = None, kv_pool: str = "fit_workload", cpu_cap_blocks: int = 2048,
+                 kv_pool_cap_tokens: int = 0, extra_bytes: int = 0) -> Any:
+    """The explicit memory plan (:class:`forge.serve.memory.MemoryPlan`): weights vs KV pool vs reserve vs free. On CUDA the KV pool is
+    ``total * gpu_mem_util - allocated - activation reserve`` capped at what ``max_num_seqs x max_model_len`` can use (``kv_pool='fit_workload'``);
+    on CPU: enough for the configured concurrency but capped (so a laptop does not allocate gigabytes)."""
+    from forge.serve.memory import device_memory, plan_kv_memory
+
+    per = kv_bytes_per_block(dims.num_kv_layers, dims.num_kv_heads, dims.head_dim, block_size, kv_name)
+    total, free, allocated = device_memory(device)
+    return plan_kv_memory(device=str(getattr(device, "type", device)), bytes_per_block=per, block_size=block_size, weight_bytes=weight_bytes,
+                          packed_weight_bytes=packed_weight_bytes, gpu_mem_util=gpu_mem_util, activation_reserve_gb=activation_reserve_gb,
+                          max_num_seqs=max_num_seqs, max_model_len=max_model_len, total_bytes=total, free_bytes=free, allocated_bytes=allocated,
+                          num_gpu_blocks=num_gpu_blocks, kv_pool=kv_pool, cpu_cap_blocks=cpu_cap_blocks,
+                          kv_pool_cap_tokens=kv_pool_cap_tokens, extra_bytes=extra_bytes)
+
+
 def plan_num_blocks(*, dims: ModelDims, block_size: int, kv_name: str, device: Any, gpu_mem_util: float,
                     activation_reserve_gb: float, max_num_seqs: int, max_model_len: int,
-                    num_gpu_blocks: int | None = None, cpu_cap_blocks: int = 2048) -> int:
-    """How many KV blocks fit. On CUDA: ``total * util - allocated - activation reserve``; on CPU: enough for the
-    configured concurrency but capped (so a laptop does not allocate gigabytes)."""
-    import torch
-
-    if num_gpu_blocks:
-        return int(num_gpu_blocks)
-    per = kv_bytes_per_block(dims.num_kv_layers, dims.num_kv_heads, dims.head_dim, block_size, kv_name)
-    want = max_num_seqs * math.ceil(max_model_len / block_size)
-    if device.type != "cuda":
-        return max(8, min(want, cpu_cap_blocks))
-    free, total = torch.cuda.mem_get_info(device)
-    allocated = torch.cuda.memory_allocated(device)
-    budget = total * gpu_mem_util - allocated - activation_reserve_gb * 1e9
-    budget = min(budget, free - activation_reserve_gb * 1e9)
-    n = int(budget // per)
-    if n < 8:
-        raise ConfigError(f"not enough GPU memory for a KV cache (budget {budget / 1e9:.2f} GB, block {per / 1e6:.2f} MB); "
-                          "lower max_model_len/weights or raise gpu_mem_util")
-    return n
+                    num_gpu_blocks: int | None = None, cpu_cap_blocks: int = 2048, weight_bytes: int = 0, kv_pool: str = "fit_workload") -> int:
+    """Number of KV blocks of :func:`plan_kv_pool` (kept for callers that only need the count)."""
+    return plan_kv_pool(dims=dims, block_size=block_size, kv_name=kv_name, device=device, gpu_mem_util=gpu_mem_util,
+                        activation_reserve_gb=activation_reserve_gb, max_num_seqs=max_num_seqs, max_model_len=max_model_len,
+                        weight_bytes=weight_bytes, num_gpu_blocks=num_gpu_blocks, kv_pool=kv_pool, cpu_cap_blocks=cpu_cap_blocks).num_blocks

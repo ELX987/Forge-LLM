@@ -120,6 +120,14 @@ def inspect_model_dir(path: str | Path) -> dict[str, Any]:
         "forge_supported": False,
         "unsupported_reason": None,
     }
+    try:  # packed Forge artifacts describe themselves (layer kinds, bits, group size, layout, KV scheme)
+        from forge.core.artifactmeta import read_artifact_summary
+
+        qs = read_artifact_summary(p)
+        if qs and qs.get("is_quantized"):
+            info["quantization"] = qs
+    except Exception:  # noqa: BLE001
+        pass
     # --- preferred: forge.models.ModelConfig --------------------------------------------------
     try:
         from forge.models import ModelConfig  # type: ignore[attr-defined]
@@ -210,3 +218,122 @@ def model_local_path(row: dict[str, Any]) -> str | None:
     if row.get("source") == "local":
         return row.get("path_or_repo")
     return None
+
+
+# ------------------------------------------------------------------------------------------------ compress outputs as models
+def _unique_name(repo: ModelsRepo, want: str, path: str, suffix: str) -> str:
+    """``want`` unless another registered model already uses that display name for a different path."""
+    other = repo.find_by_name(want)
+    if other is None or (other.get("info") or {}).get("local_path") == path or other.get("path_or_repo") == path:
+        return want
+    return f"{want}-{suffix}"[:200]
+
+
+def register_artifact_dir(
+    path: str | Path,
+    *,
+    artifact_hash: str | None = None,
+    name: str | None = None,
+    job_id: str | None = None,
+    bytes_input: int | None = None,
+    models: ModelsRepo | None = None,
+) -> dict[str, Any]:
+    """Register a compress output directory (``config.json`` + ``forge_compress.json`` + packed safetensors) in the ``models`` table so it is
+    selectable for serving: ``source='artifact'``, ``hash`` = the artifact-store digest, ``info.kind='quantized'`` and ``info.quantization``
+    (label such as ``W4A16 g128``, layer kinds, bits, group size, layout id, KV scheme), ``info.base_model`` (what was compressed, linked to a
+    registered row as ``info.base_model_id`` when one matches), ``size_bytes`` = packed weight bytes. Idempotent per digest / directory."""
+    from forge.core.artifactmeta import read_artifact_summary
+
+    repo = models or ModelsRepo()
+    p = Path(path).expanduser().resolve()
+    summ = read_artifact_summary(p)
+    if summ is None or not (summ["is_quantized"] or summ["is_compress_artifact"]):
+        raise ConfigError(f"{p} is not a Forge compress artifact (needs config.json and forge_compress.json / a quantisation manifest)")
+    info = inspect_model_dir(p)
+    ps = str(p)
+    base = summ.get("base_model")
+    base_row = None
+    if base:
+        base_row = repo.find_by_repo(str(base)) or repo.find_by_path(str(base)) or repo.find_by_name(str(base))
+    label = summ.get("label") or "dense"
+    dname = name or summ.get("name") or p.parent.name or p.name
+    existing = (repo.find_by_hash(artifact_hash) if artifact_hash else None) or repo.find_by_path(ps)
+    suffix = (job_id or artifact_hash or p.parent.name or "x").split(":")[-1][:8]
+    if existing is None:
+        dname = _unique_name(repo, dname, ps, suffix)
+    size = info.get("weight_bytes") or _dir_size(p)
+    out_info: dict[str, Any] = {
+        **info, "local_path": ps, "kind": "quantized" if summ["is_quantized"] else "model", "quantization": summ,
+        "base_model": base, "base_model_id": base_row["id"] if base_row else None, "job_id": job_id, "artifact": artifact_hash,
+        "weight_gb": round(size / 1e9, 3),
+    }
+    if bytes_input:
+        out_info["bytes_input"] = int(bytes_input)
+        out_info["compression"] = round(bytes_input / max(size, 1), 3)
+    fields: dict[str, Any] = {
+        "name": dname, "source": "artifact", "path_or_repo": ps, "hash": artifact_hash, "licence": summ.get("licence") or info.get("licence"),
+        "params_b": summ.get("params_b") or info.get("params_b"), "status": "ready", "size_bytes": size, "info": out_info,
+        "tags": ["quantized"] + ([label] if summ["is_quantized"] else []),
+    }
+    if base_row and base_row.get("distill_allowed") is not None:
+        fields["distill_allowed"] = base_row["distill_allowed"]
+    if existing:
+        if existing.get("name") and not name:
+            fields.pop("name")
+        return repo.update(existing["id"], **fields)
+    t = now()
+    return repo.insert(id=new_id("mdl"), created_at=t, updated_at=t, notes=f"compress output of {base}" if base else "compress output", **fields)
+
+
+def import_artifacts(*, models: ModelsRepo | None = None, jobs: Any = None, extra_dirs: list[str | Path] | None = None) -> dict[str, Any]:
+    """Backfill: register every compress output found on disk. Sources: succeeded ``compress`` jobs (``outputs.model_dir`` / ``outputs.artifact``),
+    ``FORGE_HOME/runs/*/artifact`` and ``extra_dirs``. Returns ``{imported: [rows], updated: n, skipped: [{path, reason}]}``; never raises for one bad dir."""
+    from forge.core.paths import runs_dir
+
+    repo = models or ModelsRepo()
+    cands: dict[str, dict[str, Any]] = {}
+
+    def add(d: Any, **kw: Any) -> None:
+        try:
+            rp = str(Path(str(d)).expanduser().resolve())
+        except OSError:
+            return
+        cands.setdefault(rp, {}).update({k: v for k, v in kw.items() if v})
+
+    try:
+        if jobs is None:
+            from forge.jobs.repo import JobsRepo
+
+            jobs = JobsRepo()
+        for j in jobs.list({"type": "compress", "status": "succeeded"}, limit=2000):
+            o = j.get("outputs") or {}
+            md = o.get("model_dir") or (o.get("summary") or {}).get("model_dir")
+            if md:
+                add(md, job_id=j["id"], artifact_hash=o.get("artifact") or (o.get("summary") or {}).get("artifact"),
+                    bytes_input=o.get("bytes_input"), name=(o.get("summary") or {}).get("name"))
+    except Exception:  # noqa: BLE001 - a missing jobs table must not stop the disk scan
+        pass
+    try:
+        for d in sorted(runs_dir().glob("*/artifact")):
+            add(d, job_id=d.parent.name)
+    except OSError:
+        pass
+    for d in extra_dirs or []:
+        add(d)
+    imported: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    updated = 0
+    for rp, kw in cands.items():
+        pth = Path(rp)
+        if not (pth / "forge_compress.json").is_file():
+            skipped.append({"path": rp, "reason": "no forge_compress.json (not a compress artifact, or the run did not finish)"})
+            continue
+        try:
+            was = repo.find_by_path(rp) is not None
+            row = register_artifact_dir(pth, models=repo, **kw)
+            updated += 1 if was else 0
+            if not was:
+                imported.append(row)
+        except Exception as e:  # noqa: BLE001
+            skipped.append({"path": rp, "reason": f"{type(e).__name__}: {e}"})
+    return {"imported": imported, "updated": updated, "skipped": skipped, "scanned": len(cands)}

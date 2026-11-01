@@ -48,6 +48,7 @@ from forge.kernels.layouts import (
     repack,
 )
 from forge.kernels.layouts.chip import ChipInfo, chip_info
+from forge.kernels.w4_tuning import DECODE_MAX_M, W4_TUNE_TAG, neighbor_buckets, nearest_entry
 from forge.kernels.ref import (
     dequantize_fp4_ref,
     dequantize_fp8_ref,
@@ -177,7 +178,9 @@ def triton_usable(x: torch.Tensor, fkey: tuple | None = None) -> tuple[bool, str
 def _fail(op: str, e: Exception, fkey: tuple | None = None) -> None:
     if kernel_strict():
         raise e
-    if fkey is not None:
+    from forge.kernels.triton.gemm_common import is_compile_error
+
+    if fkey is not None and is_compile_error(e):  # transient errors (OOM, ...) are never memoised: only this call falls back
         _FAILED.add(fkey)
     _warn_once(f"{op}:{type(e).__name__}", f"{op}: Triton path failed ({type(e).__name__}: {e}); falling back to reference path")
 
@@ -216,7 +219,22 @@ def tuned_config(kernel: str, chip: ChipInfo, m: int, n: int, k: int, *, dtype_c
         tuner = _TUNERS.get(chip.fingerprint)
         if tuner is None:
             tuner = _TUNERS[chip.fingerprint] = Autotuner(chip=chip)
-        cfg = tuner.lookup(load_spec(kernel), {"M": m, "N": n, "K": k}, dtype_cfg=dtype_cfg_str, layout_id=layout_id)
+        spec = load_spec(kernel)
+        # W4A16: an untuned M bucket borrows the nearest tuned bucket of the same regime (decode / prefill) ...
+        buckets = neighbor_buckets(m) if kernel == "w4a16_gemm" else [key[2]]
+        for b in buckets:
+            cfg = tuner.lookup(spec, {"M": b, "N": n, "K": k}, dtype_cfg=dtype_cfg_str, layout_id=layout_id)
+            if cfg:
+                break
+        # ... and an untuned (N, K) borrows the closest tuned shape (decode only; split-K is recomputed for the new shape)
+        if not cfg and kernel == "w4a16_gemm" and buckets[0] <= DECODE_MAX_M:
+            entries = tuner.cache.entries()
+            for b in buckets:
+                want = tuner.key_fields(spec, {"M": b, "N": n, "K": k}, dtype_cfg=dtype_cfg_str, layout_id=layout_id)
+                near = nearest_entry(entries, want, n, k)
+                if near:
+                    cfg = {kk: v for kk, v in near["config"].items() if kk != "split_k"}
+                    break
     except Exception as e:  # corrupt cache etc. must never break inference
         log.debug("autotune lookup failed: %s", e)
     _CFG_MEMO[key] = (now, cfg)
@@ -273,8 +291,10 @@ def w4a16_linear(
             xc = x.to(_compute_dtype(x, chip))
             m = xc.reshape(-1, xc.shape[-1]).shape[0]
             cfg = config or tuned_config("w4a16_gemm", chip, m, p.n, p.k,
-                                         dtype_cfg_str=dtype_cfg("w4a16_gemm", xc.dtype, p.group_size), layout_id=p.layout_id)
-            y = w4a16_gemm_triton(xc, p, bias, config=cfg, deterministic=deterministic, sm=chip.sm, num_sms=chip.num_sms)
+                                         dtype_cfg_str=dtype_cfg("w4a16_gemm", xc.dtype, p.group_size, W4_TUNE_TAG),
+                                         layout_id=p.layout_id)
+            y = w4a16_gemm_triton(xc, p, bias, config=cfg, deterministic=deterministic, sm=chip.sm, num_sms=chip.num_sms,
+                                  allow_fallback=True if (cfg and not config) else None)
             _note("w4a16_linear", "triton")
             return y.to(x.dtype)
         except Exception as e:

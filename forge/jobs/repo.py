@@ -248,6 +248,11 @@ class ModelsRepo(Table):
         row = self.db.query_one("SELECT * FROM models WHERE path_or_repo=? AND source!='hf' LIMIT 1", (path,))
         return self._decode(row)
 
+    def find_by_hash(self, digest: str) -> dict[str, Any] | None:
+        """The row registered for an artifact-store digest (``models.hash``), newest first."""
+        row = self.db.query_one("SELECT * FROM models WHERE hash=? ORDER BY created_at DESC LIMIT 1", (digest,))
+        return self._decode(row)
+
     def find_by_name(self, name: str) -> dict[str, Any] | None:
         """Exact display-name match, falling back to case-insensitive. Among duplicates prefer a ``ready`` row whose files are
         on disk, then any ``ready`` row, then the newest row."""

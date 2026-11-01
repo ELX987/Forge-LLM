@@ -30,6 +30,30 @@ def require_triton() -> None:
         raise HardwareUnsupported("Triton is not installed; use the reference/fallback path (FORGE_FORCE_REF=1)")
 
 
+_COMPILE_ERROR_NAMES = ("CompilationError", "OutOfResources", "MLIRCompilationError", "PTXASError", "UnsupportedLanguageConstruct",
+                        "CompileTimeAssertionFailure", "InterpreterError")
+
+
+def is_compile_error(e: BaseException) -> bool:
+    """True for failures that are deterministic properties of (kernel, shape, device) -- Triton compile errors, ``OutOfResources`` (shared
+    memory / registers of a config), unsupported constructs -- and may be memoised.  Transient errors (CUDA / host OOM, generic runtime
+    errors, interrupts) are *not*: remembering them would disable a fast kernel for the whole process after one out-of-memory moment."""
+    try:
+        import torch
+
+        if isinstance(e, (torch.cuda.OutOfMemoryError, MemoryError, KeyboardInterrupt)):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    for k in type(e).__mro__:
+        if k.__name__ in _COMPILE_ERROR_NAMES:
+            return True
+    if isinstance(e, NotImplementedError):
+        return True
+    msg = str(e).lower()
+    return isinstance(e, RuntimeError) and ("ptxas" in msg or "triton" in msg and "compil" in msg)
+
+
 def next_pow2(x: int) -> int:
     return 1 if x <= 1 else 1 << (int(x) - 1).bit_length()
 
