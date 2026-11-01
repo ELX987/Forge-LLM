@@ -42,8 +42,8 @@ def _job(**kw):
 def test_all_stages_registered_with_param_models():
     import forge.compress.run  # noqa: F401
 
-    assert set(registry.names("stage")) >= {"calibrate", "ptq", "pack", "kv", "rotate", "prune", "lowrank", "delta", "lossless", "eval", "gate", "distill", "finetune"}
-    assert set(STAGE_PARAM_MODELS) == {"calibrate", "ptq", "pack", "kv", "rotate", "prune", "lowrank", "delta", "lossless", "eval", "gate", "distill", "finetune"}
+    assert set(registry.names("stage")) >= {"calibrate", "ptq", "ternarize", "pack", "kv", "rotate", "prune", "lowrank", "delta", "lossless", "eval", "gate", "distill", "finetune"}
+    assert set(STAGE_PARAM_MODELS) == {"calibrate", "ptq", "ternarize", "pack", "kv", "rotate", "prune", "lowrank", "delta", "lossless", "eval", "gate", "distill", "finetune"}
     sch = stage_schemas()
     assert sch["ptq"]["properties"]["method"]["enum"] and "description" in sch["ptq"]["properties"]["bits"]
     for stage, s in sch.items():  # every field of every stage model is documented (the UI renders forms from this)
@@ -257,7 +257,7 @@ def test_distill_delegates_to_forge_train(tmp_path):
     assert m.config.intermediate_size == 64  # the pruned architecture survived the round trip through the trainer
 
 
-@pytest.mark.parametrize("name", ["fp8-w8a8", "lowrank", "nvfp4-ptq", "w4a16-gptq-g128"])
+@pytest.mark.parametrize("name", ["fp8-w8a8", "lowrank", "nvfp4-ptq", "w4a16-gptq-g128", "ternary-ptq"])
 def test_shipped_recipe_templates_run_on_tiny_model(name):
     """The recipes under configs/recipes (written for 8B models) execute end to end on the CPU smoke model with shrunken calibration."""
     from pathlib import Path

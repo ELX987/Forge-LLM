@@ -158,3 +158,18 @@ algorithms on tiny models, planner/cost model, job system, API, CLI, web UI scaf
 real hardware or real models** - kernel validation and performance, serving throughput, FP4 native paths, 8B/70B
 results, gates G1-G5 - is open. The next actions are in `docs/VAST_AI.md` section 7 (run the GPU suite and the quick
 bench), then C-020/C-022/C-036 on one 24 GB card.
+
+## Ternary (1.58-bit) integration - ADR 0007 / docs/TERNARY.md
+
+Not a Plan work item; tracked here because it adds a method family. Everything is **CPU-validated only** (kernels: interpreter + offline PTX compile); no GPU has run any of it through Forge.
+
+| Phase | Item | Status | Notes |
+|-------|------|--------|-------|
+| P0 | ADR 0007, TERNARY.md, branch hygiene | done (CPU) | |
+| P1 | Format, layout, oracle, `t158` / `fq_t158`, artifact round trip, `.t158` interchange | done (CPU) | golden vectors from tern158; serves on CPU through the engine |
+| P2 | Quant-mode plug-in, ternary QAT, health metrics, `ternary_train` job, method catalog | done (CPU) | emulated fake-quant: no training speed-up; wd-to-zero schedule and bf16-SR optimizer state not done |
+| P3 | `ternarize` stage, ptq format, g-t158 gate, recipes, train simulator, t158 scheme, chip table | partial | planner rule R-Q7-TERNARY, T158 claims, HF conversion with SubLN, simulator panel on New Job not done |
+| P4 | Triton GEMM + quantiser, dispatcher, chip int8 flags, bench, native tier | GPU-unvalidated | interpreter + PTX only; native tier not wired |
+| P5 | Sharded multi-GPU trainer (`zero_ternary`) | in progress elsewhere | not part of this status |
+| P6 | Methods page, Ternary Lab, sim panel | done (CPU) | checked visually in demo mode only |
+| P7 | Smoke script, hardware validation ladder, docs | partial | ladder written (`docs/runbooks/ternary-validation.md`); every hardware cell is "no" |

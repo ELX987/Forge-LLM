@@ -25,6 +25,7 @@ _EXTRA: dict[str, dict[str, Any]] = {}
 #: kernels whose native path needs more than "triton + sm >= min_sm" (name -> (ChipInfo attr, human reason))
 _NEEDS_FEATURE = {
     "fp8_gemm": ("has_fp8", "native FP8 tensor cores (sm_89+)"),
+    "ternary_w158a8_gemm": ("has_int8_fast", "fast INT8 tensor cores (sm_75+, not throttled: B300/GB300 sm_103 excluded)"),
 }
 
 #: honest status of the shipped GEMM kernels (updated by whoever runs tests_gpu on real hardware)

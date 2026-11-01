@@ -516,6 +516,73 @@ def int8_linear(
 
 
 # ------------------------------------------------------------------------------------------------------------------
+# Ternary W1.58A8 -- experimental (ADR 0007)
+# ------------------------------------------------------------------------------------------------------------------
+def quantize_act_ternary(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token int8 quantisation with tern158's formula (``round(x * 127/max)``) -> ``(q int8 [M, K], scale fp32 [M])``."""
+    ok, why = triton_usable(x)
+    if ok and x.is_floating_point():
+        try:
+            from forge.kernels.triton.gemm_ternary import ternary_act_quant_triton
+
+            r = ternary_act_quant_triton(x)
+            _note("quantize_act_ternary", "triton")
+            return r
+        except Exception as e:
+            _fail("quantize_act_ternary", e)
+    from forge.formats.ternary import act_quant_int8
+
+    _note("quantize_act_ternary", "reference", why)
+    return act_quant_int8(x)
+
+
+def ternary_linear(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k: int,
+    bias: torch.Tensor | None = None,
+    *,
+    out_dtype: torch.dtype | None = None,
+    config: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """``x [..., K]`` float -> per-token int8 -> ternary GEMM with packed 2-bit weights ``qweight uint8 [N, K/4]`` and fp32 ``scales``.
+
+    Triton (int8 tensor cores) on CUDA sm_75+ where the INT8 pipe is not throttled and the scale layout is supported; otherwise the exact torch
+    oracle.  UNVALIDATED on GPU hardware (docs/KERNELS.md)."""
+    from forge.kernels.ref.gemm_ternary import ternary_gemm_ref
+
+    lead = x.shape[:-1]
+    odt = out_dtype or x.dtype
+    xq, sx = quantize_act_ternary(x)
+    n = qweight.shape[0]
+    fk = _fkey("ternary_linear", xq, n, group_size)
+    ok, why = triton_usable(xq, fk)
+    if ok and xq.is_cuda:
+        c = chip_of(xq)
+        if (c.sm or 0) < 75 or not c.has_int8_fast:
+            ok, why = False, f"sm_{c.sm}: int8 tensor cores missing or throttled"
+    if ok:
+        from forge.kernels.triton.gemm_ternary import supported_group, ternary_gemm_triton
+
+        if not supported_group(group_size, k):
+            ok, why = False, f"group_size={group_size} (K={k}) is not implemented in the Triton kernel"
+        else:
+            try:
+                y = ternary_gemm_triton(xq, sx, qweight, scales, group_size, k, bias, out_dtype=odt, config=config, sm=chip_of(xq).sm)
+                _note("ternary_linear", "triton")
+                return y.reshape(*lead, n)
+            except Exception as e:
+                _fail("ternary_linear", e, fk)
+    _note("ternary_linear", "reference", why)
+    y = ternary_gemm_ref(xq, sx, qweight, scales, group_size, k, torch.float32)
+    if bias is not None:
+        y = y + bias.float()
+    return y.to(odt).reshape(*lead, n)
+
+
+# ------------------------------------------------------------------------------------------------------------------
 # FP4 (NVFP4 / MXFP4) -- experimental
 # ------------------------------------------------------------------------------------------------------------------
 def as_packed_fp4(w: Any) -> PackedFP4:
@@ -1031,6 +1098,6 @@ __all__ = [
     "KernelFp4Linear", "KernelFp8Linear", "KernelInt8Linear", "KernelW4A16Linear", "KernelW8A16Linear",
     "PACKED_LINEAR_CLASSES", "as_packed_fp4", "bench_cases", "chip_of", "clear_config_memo", "dtype_cfg", "force_ref",
     "fp4_linear", "fp8_linear", "int8_linear", "kernel_debug", "last_path", "make_packed_linear", "native_fp4_available",
-    "quantize_act_fp4", "quantize_act_fp8", "quantize_act_int8", "quantize_weight_fp4", "quantize_weight_fp8",
+    "quantize_act_fp4", "quantize_act_fp8", "quantize_act_int8", "quantize_act_ternary", "ternary_linear", "quantize_weight_fp4", "quantize_weight_fp8",
     "prepare_w4", "register_packed_linears", "reset_failure_memo", "triton_usable", "tuned_config", "w4a16_linear", "w8a16_linear",
 ]

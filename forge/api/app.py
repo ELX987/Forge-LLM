@@ -35,6 +35,7 @@ TAGS = [
     {"name": "recipes", "description": "Compression / training recipes"},
     {"name": "deployments", "description": "Inference deployments + chat proxy"},
     {"name": "storage", "description": "Content-addressed store"},
+    {"name": "methods", "description": "Method catalog: training / fine-tuning / quantization / compression methods and their status"},
 ]
 
 
@@ -79,7 +80,7 @@ def create_app(
     ``start_background=False`` skips the job-manager and GPU-sampler threads (used by some tests)."""
     from forge.api.routers import (
         artifacts, checkpoints, configs, datasets, deployments, evals, events, hardware, jobs, kernels,
-        models, planner, recipes, schemas_r, storage, system,
+        methods, models, planner, recipes, schemas_r, storage, system,
     )
 
     st = get_settings()
@@ -138,7 +139,7 @@ def create_app(
     protected = [
         system.router, hardware.router, models.router, datasets.router, schemas_r.router, configs.router, jobs.router,
         recipes.router, planner.router, artifacts.router, storage.router, evals.router, kernels.router,
-        deployments.router, checkpoints.router, events.router,
+        deployments.router, checkpoints.router, events.router, methods.router,
     ]
     for r in protected:
         app.include_router(r, prefix=API_PREFIX, dependencies=[Depends(require_auth)])

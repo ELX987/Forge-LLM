@@ -1,0 +1,47 @@
+# ternary tiny-smoke (job type: ternary_train) -- EXPERIMENTAL, CPU-only end-to-end smoke test of 1.58-bit QAT.
+# Trains the built-in TINY test model with ternary {-1,0,+1} weights (group 32) and int8 activations for 40 steps.
+# Purpose: prove ingest -> ternary QAT -> ternary/* health metrics -> checkpoint works on any machine in about a minute.
+# Loss values mean nothing about quality. Prerequisite: ingest configs/dataset/sample-corpus.jsonl (name: tiny-corpus).
+name: ternary-tiny-smoke
+seed: 1337
+model:
+  source: tiny
+  tokenizer: byte
+data:
+  dataset: ["tiny-corpus"]
+  seq_len: 64
+  val_sequences: 4
+  num_workers: 0
+micro_batch_size: 2
+grad_accum_steps: 1
+optim:
+  lr: 0.003
+  weight_decay: 0.0
+  grad_clip: 1.0
+schedule:
+  name: cosine
+  warmup_steps: 5
+  min_lr_ratio: 0.1
+precision:
+  quant_aware: ternary
+  exempt_first_layers: 0
+  exempt_last_layers: 0
+  diagnostics_every: 5
+  loss_gap_every: 10
+  ternary:
+    group_size: 32          # tiny model width is 64
+    rule: lloyd
+    warmup_steps: 0
+parallel:
+  device: cpu
+checkpoint:
+  every_steps: 20
+  keep_last: 2
+  resume: none
+eval:
+  every_steps: 10
+  num_batches: 2
+budget:
+  max_steps: 40
+logging:
+  log_every: 5

@@ -71,7 +71,14 @@ def register_linear(kind: str) -> Callable[[type], type]:
     return deco
 
 
+_LAZY_KINDS = {"t158": "forge.ternary.linear", "fq_t158": "forge.ternary.linear"}
+
+
 def get_linear_cls(kind: str) -> type:
+    if kind not in _LINEAR_KINDS and kind in _LAZY_KINDS:
+        import importlib
+
+        importlib.import_module(_LAZY_KINDS[kind])
     try:
         return _LINEAR_KINDS[kind]
     except KeyError:

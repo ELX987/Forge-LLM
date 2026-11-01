@@ -1,0 +1,54 @@
+# ternary scratch-125m (job type: ternary_train) -- EXPERIMENTAL, NOT VALIDATED on GPU through Forge.
+# 125M-parameter Llama-style model trained from scratch with ternary QAT (about the size of the tern158 run that reached val
+# ppl 141 after 200M tokens on one RTX PRO 6000 Blackwell: a reference point, not a Forge result). This config uses the emulated
+# fake-quant path (no ternary kernel yet; speed is NOT better than bf16 training; the value is the resulting 2-bit model).
+# Watch ternary/zero_frac (healthy 0.40-0.52, TARGET) and ternary/flip_rate in the job's diagnostics.
+name: ternary-125m
+seed: 1337
+model:
+  source: scratch
+  tokenizer: "NousResearch/Llama-2-7b-hf"
+  dtype: float32
+  arch_overrides:
+    vocab_size: 32000
+    hidden_size: 768
+    intermediate_size: 2048
+    num_layers: 12
+    num_heads: 12
+    max_position_embeddings: 2048
+    tie_word_embeddings: true
+data:
+  dataset: ["my-corpus"]             # ingest first with the dataset_ingest job (tokenizer must match)
+  seq_len: 2048
+  val_sequences: 64
+micro_batch_size: 8
+grad_accum_steps: 4
+activation_checkpointing: true
+optim:
+  lr: 0.0003
+  weight_decay: 0.1
+  grad_clip: 1.0
+schedule:
+  name: wsd
+  warmup_steps: 500
+  decay_ratio: 0.1
+  min_lr_ratio: 0.1
+precision:
+  quant_aware: ternary
+  exempt_first_layers: 0
+  exempt_last_layers: 0
+  diagnostics_every: 10
+  loss_gap_every: 100
+  ternary:
+    group_size: 128
+    rule: lloyd
+    warmup_steps: 0
+checkpoint:
+  every_steps: 500
+  resume: auto
+eval:
+  every_steps: 250
+budget:
+  max_tokens: 200000000
+logging:
+  log_every: 10

@@ -16,7 +16,7 @@ SPECS = list_job_types()
 def test_all_expected_types_registered():
     names = {s.name for s in SPECS}
     assert {"probe", "bench", "dataset_ingest", "train", "finetune", "distill", "compress", "eval", "serve", "recipe",
-            "model_download", "gc", "selftest"} <= names
+            "model_download", "gc", "selftest", "ternary_train"} <= names
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.name)

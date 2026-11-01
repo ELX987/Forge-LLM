@@ -11,6 +11,8 @@
 * held-out evaluation, early stopping, best / pre-anneal / final checkpoints, cooperative cancel, time / token / step budgets
 * metrics: ``loss, lr, grad_norm, tokens_per_s, tokens_seen, step_time_ms, gpu_mem_gb, mfu, update_weight_ratio`` (+ task metrics,
   TR-2 ``fp4/*`` diagnostics, ``restarts``, ``skipped_steps``)
+* ``parallel.strategy = zero_ternary`` (:mod:`forge.ternary.zero`) through four narrow hooks: optimiser factory, gradient exchange,
+  global-norm clip and shard-aware checkpoint save/load, plus a final latent gather; ``parallel.oom_halve_micro_batch`` (single process)
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ from forge.train.config import CommonTrainConfig
 from forge.train.data import StepPrefetcher
 from forge.train.losses import IGNORE_INDEX, ce_loss_sum
 from forge.train.optim import anneal_start_step, build_optimizer, lr_factor, set_lr
-from forge.train.precision import PrecisionManager
+from forge.train.precision import make_precision_manager
 from forge.train.stability import SpikeDetector, TrainingDiverged
 
 log = logging.getLogger("forge.train.trainer")
@@ -378,6 +380,8 @@ class Trainer:
         self._t_start = time.time()
         self._prefetch: StepPrefetcher | None = None
         self._compile_checked = False
+        self.zero: Any = None  # forge.ternary.zero.ZeroTernary when parallel.strategy == "zero_ternary"
+        self._oom_split = 1  # every micro-batch is split into this many pieces (parallel.oom_halve_micro_batch)
 
     # -- setup ----------------------------------------------------------------------------------------
     def _resolve_total_steps(self) -> int:
@@ -411,7 +415,7 @@ class Trainer:
         self.total_steps = self._resolve_total_steps()
         self.global_batch = c.micro_batch_size * c.grad_accum_steps * self.dinfo.world
         self.raw.to(self.device)
-        self.precision = PrecisionManager(c.precision, device=self.device, total_steps=self.total_steps, seed=c.seed, rank=self.dinfo.rank)
+        self.precision = make_precision_manager(c.precision, device=self.device, total_steps=self.total_steps, seed=c.seed, rank=self.dinfo.rank)
         summ = self.precision.prepare(self.raw)
         self.ctx.log(f"precision: {json.dumps({k: v for k, v in summ.items() if k != 'exempt_names'})}")
         if c.activation_checkpointing:
@@ -425,10 +429,26 @@ class Trainer:
             except Exception as e:  # noqa: BLE001
                 self.ctx.log(f"torch.compile failed ({e!r}); running eager", "warning")
         named = [(n, p) for n, p in self.model.named_parameters()]
+        n_tr = sum(p.numel() for _, p in named if p.requires_grad)
+        if c.parallel.strategy == "zero_ternary":
+            from forge.ternary.zero import ZeroTernary
+
+            if self.state_filter is not None:
+                raise ConfigError("parallel.strategy=zero_ternary does not support adapter-only / filtered training")
+            if not hasattr(self.precision, "_ternary_modules"):
+                raise ConfigError("parallel.strategy=zero_ternary requires precision.quant_aware = 'ternary'")
+            self.zero = ZeroTernary(self.raw, self.precision, self.dinfo, c.parallel, c.precision.ternary, save_optimizer=c.checkpoint.save_optimizer)
+            self.ctx.log(f"zero_ternary (EXPERIMENTAL): {json.dumps(self.zero.describe())}")
+            named = self.zero.local_named_params(named)
+        if c.parallel.oom_halve_micro_batch and self.dinfo.world > 1:
+            self.ctx.log("parallel.oom_halve_micro_batch is single-process only: ignored with world_size > 1 (an OOM on one rank fails the run)", "warning")
         self.trainable = [(n, p) for n, p in named if p.requires_grad]
         if not self.trainable:
             raise ConfigError("no trainable parameters")
-        self.opt = build_optimizer(named, c.optim, cuda=self.device.type == "cuda")
+        if self.zero is not None:
+            self.opt = self.zero.build_optimizer(named, c.optim, cuda=self.device.type == "cuda")
+        else:
+            self.opt = build_optimizer(named, c.optim, cuda=self.device.type == "cuda")
         self.scaler = torch.amp.GradScaler("cuda") if self.precision.needs_scaler else None
         self.detector = SpikeDetector(c.stability.spike_window, c.stability.spike_zscore, c.stability.spike_ratio, c.stability.grad_spike_factor)
         ck_dir = Path(c.checkpoint.dir) if c.checkpoint.dir else self.run_dir / "checkpoints"
@@ -458,7 +478,6 @@ class Trainer:
         self._metrics_path = Path(mf) if self.dinfo.is_main else None
         if self._metrics_path:
             self._metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        n_tr = sum(p.numel() for _, p in self.trainable)
         n_all = sum(p.numel() for p in self.raw.parameters())
         self.ctx.log(f"trainer: {n_tr/1e6:.2f}M trainable / {n_all/1e6:.2f}M params, device={self.device}, world={self.dinfo.world}, "
                      f"global_batch={self.global_batch} seq, total_steps={self.total_steps}, autocast={self.precision.autocast_dtype}")
@@ -479,8 +498,13 @@ class Trainer:
         return {n for n, p in self.raw.named_parameters() if self.state_filter(n, p)} | {n for n, _ in self.raw.named_buffers() if self.state_filter(n, None)}
 
     def _collect_state(self, include_optim: bool = True) -> dict[str, Any]:
-        model_sd = D.get_model_state(self.model, self._names())
+        names = self._names()
+        if self.zero is not None:  # ternary latents live in the rank shards, not in state.pt
+            names = (names if names is not None else set(self.raw.state_dict().keys())) - self.zero.param_names
+        model_sd = D.get_model_state(self.model, names)
         st: dict[str, Any] = {"model": model_sd, "trainer": self._trainer_state(), "extra": {**self.task.state_dict()}}
+        if self.zero is not None:
+            st["zero"] = self.zero.manifest()
         if include_optim and self.cfg.checkpoint.save_optimizer:
             st["optim"] = D.get_optim_state(self.model, self.opt)
             if self.scaler is not None:
@@ -489,20 +513,28 @@ class Trainer:
         return st
 
     def save_checkpoint(self, *, good: bool = True, best: bool = False, pre_anneal: bool = False, final: bool = False, meta: dict[str, Any] | None = None) -> Path | None:
+        attach = None
+        if self.zero is not None:  # collective: every rank writes its shard file
+            from forge.ternary.zero import SHARD_DIR
+
+            attach = {SHARD_DIR: self.zero.write_shards(self.ckpt.root, self.step)}
         st = self._collect_state()  # collective under FSDP
         if not self.dinfo.is_main:
             return None
         m = {"loss": self.last_loss, "tokens_seen": self.tokens_seen, **(meta or {})}
-        p = self.ckpt.save(self.step, st, good=good, best=best, pre_anneal=pre_anneal, final=final, meta=m)
+        p = self.ckpt.save(self.step, st, good=good, best=best, pre_anneal=pre_anneal, final=final, meta=m, attachments=attach)
         self.ctx.log(f"checkpoint saved: step {self.step} -> {p.name}" + (" [best]" if best else "") + (" [pre-anneal]" if pre_anneal else "") + (" [final]" if final else ""))
         return p
 
-    def _load_state(self, state: dict[str, Any], *, restore_rng: bool, strict: bool = True) -> None:
+    def _load_state(self, state: dict[str, Any], *, restore_rng: bool, strict: bool = True, ckpt_dir: Path | None = None) -> None:
         res = D.load_model_state(self.model, state["model"], strict=False)
-        missing = list(getattr(res, "missing_keys", []))
+        # a zero_ternary checkpoint keeps the ternary latents in shards/, so their keys are legitimately absent from state.pt
+        missing = [k for k in getattr(res, "missing_keys", []) if self.zero is None or "zero" not in state or k not in self.zero.param_names]
         if strict and self.state_filter is None and missing:
             raise ConfigError("checkpoint is missing model keys", details={"missing": missing[:10]})
-        if "optim" in state:
+        if self.zero is not None:
+            self._load_zero(state, ckpt_dir)
+        if "optim" in state and (self.zero is None or "zero" in state):
             D.load_optim_state(self.model, self.opt, state["optim"])
         if self.scaler is not None and "scaler" in state:
             self.scaler.load_state_dict(state["scaler"])
@@ -528,6 +560,22 @@ class Trainer:
                     pass
         self.task.load_state_dict(state.get("extra", {}))
 
+    def _load_zero(self, state: dict[str, Any], ckpt_dir: Path | None) -> None:
+        """Restore the sharded ternary latents / optimiser rows (collective), or adopt full weights from a non-sharded checkpoint."""
+        man = state.get("zero")
+        if man is None:
+            # a ddp/none checkpoint: the full latents were just loaded into every rank's weight; only the codes need rebuilding
+            self.zero.resync()
+            self.ctx.log("checkpoint was not written by zero_ternary: latent weights adopted, sharded optimiser state starts fresh", "warning")
+            return
+        if ckpt_dir is None:
+            raise ConfigError("zero_ternary checkpoint load needs the checkpoint directory")
+        self.zero.load_shards(ckpt_dir, man, with_optim="optim" in state)
+
+    def _load_ckpt(self, which: str | int | Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
+        state, meta = self.ckpt.load(which)
+        return state, meta, self.ckpt.path_of(which)
+
     def _resume(self) -> None:
         spec = self.cfg.checkpoint.resume
         if spec in ("none", "", None):
@@ -535,7 +583,7 @@ class Trainer:
                 self.save_checkpoint(good=True, meta={"initial": True})
             return
         try:
-            state, meta = self.ckpt.load("latest" if spec == "auto" else spec)
+            state, meta, ck_dir = self._load_ckpt("latest" if spec == "auto" else spec)
         except NotFound:
             if spec == "auto":
                 self.ctx.log("resume=auto: no checkpoint found, starting fresh")
@@ -543,7 +591,7 @@ class Trainer:
                     self.save_checkpoint(good=True, meta={"initial": True})
                 return
             raise
-        self._load_state(state, restore_rng=True)
+        self._load_state(state, restore_rng=True, ckpt_dir=ck_dir)
         self.ctx.log(f"resumed from checkpoint at step {self.step} (tokens_seen={self.tokens_seen}, data_skip={self.data_skip})")
 
     # -- one optimiser step -------------------------------------------------------------------------------
@@ -579,6 +627,8 @@ class Trainer:
 
     def _clip(self) -> float:
         mx = self.cfg.optim.grad_clip
+        if self.zero is not None:
+            return self.zero.clip_grad_norm(mx)
         params = [p for _, p in self.trainable if p.grad is not None]
         if not params:
             return 0.0
@@ -586,15 +636,45 @@ class Trainer:
             return float(self.model.clip_grad_norm_(mx if mx > 0 else float("inf")))
         return float(torch.nn.utils.clip_grad_norm_(params, mx if mx > 0 else float("inf")))
 
+    def _split_micro(self, batches: list[dict[str, Any]], pieces: int) -> list[dict[str, Any]]:
+        if pieces <= 1:
+            return batches
+        out: list[dict[str, Any]] = []
+        for b in batches:
+            n = next(v.shape[0] for v in b.values() if isinstance(v, torch.Tensor) and v.ndim >= 1)
+            out.extend(split_batch(b, max(1, math.ceil(n / pieces))))
+        return out
+
     def _train_step(self, step: int, batches: list[dict[str, Any]], want_diag: bool, want_gap: bool, want_ratio: bool) -> dict[str, Any]:
+        """One optimiser step; with ``parallel.oom_halve_micro_batch`` (single process) a CUDA OOM splits every micro-batch and retries.
+
+        The gradient is unchanged by the split (the loss is normalised by the step's total token count), so only speed and memory differ.
+        """
+        if not (self.cfg.parallel.oom_halve_micro_batch and self.dinfo.world == 1):
+            return self._train_step_once(step, batches, want_diag, want_gap, want_ratio)
+        while True:
+            try:
+                return self._train_step_once(step, self._split_micro(batches, self._oom_split), want_diag, want_gap, want_ratio)
+            except torch.cuda.OutOfMemoryError:
+                rows = max(int(v.shape[0]) for b in batches for v in b.values() if isinstance(v, torch.Tensor) and v.ndim >= 1)
+                if math.ceil(rows / self._oom_split) <= 1:
+                    raise
+                self._oom_split *= 2
+                self.opt.zero_grad(set_to_none=True)
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                self.ctx.log(f"CUDA out of memory at step {step + 1}: splitting every micro-batch into {self._oom_split} pieces and retrying "
+                             "(same gradient, lower peak memory)", "warning")
+
+    def _train_step_once(self, step: int, batches: list[dict[str, Any]], want_diag: bool, want_gap: bool, want_ratio: bool) -> dict[str, Any]:
         c = self.cfg
         lr = self._lr(step)
         set_lr(self.opt, lr)
         self.opt.zero_grad(set_to_none=c.optim.zero_grad_set_to_none)
         items = [self.task.count(b) for b in batches]
         total_items = max(1.0, float(sum(items)))
-        if self.dinfo.initialized and self.model is not self.raw:
-            # DDP/FSDP average gradients over ranks, so normalise by the *mean per-rank* item count: the result is the exact
+        if self.dinfo.initialized and (self.model is not self.raw or self.zero is not None):
+            # DDP/FSDP/zero_ternary average gradients over ranks, so normalise by the *mean per-rank* item count: the result is the exact
             # global token-weighted mean even when ranks hold different numbers of supervised tokens (SFT masks, padding).
             import torch.distributed as dist
 
@@ -630,6 +710,8 @@ class Trainer:
         res: dict[str, Any] = {"loss": loss_val, "lr": lr, "tokens": tokens * self.dinfo.world, "metrics": {k: float(v) for k, v in msum.items()},
                                "anomaly": None, "skipped": False}
         # --- gradients ---------------------------------------------------------------------------------
+        if self.zero is not None:
+            self.zero.sync_grads()
         if self.scaler is not None:
             self.scaler.unscale_(self.opt)
         gnorm = self._clip()
@@ -640,6 +722,10 @@ class Trainer:
                 res["diag"] = self.precision.diagnostics(self.raw)
             except Exception as e:  # noqa: BLE001
                 self.ctx.log(f"diagnostics failed: {e!r}", "warning")
+            for level, msg in self.precision.drain_events():
+                self.ctx.log(msg, "error" if level == "error" else "warning")
+                if level == "error":
+                    raise TrainingDiverged(msg, details={"step": step + 1})
         if want_gap and finite and first_mb_loss is not None:
             with torch.no_grad(), self.precision.high_precision(), self.precision.autocast():
                 self.model.eval()
@@ -735,10 +821,10 @@ class Trainer:
         if target is None:
             raise TrainingDiverged(f"{reason} at step {cur_step + 1} and no checkpoint to roll back to "
                                    "(enable checkpoint.save_initial or a smaller checkpoint.every_steps)", details={"reason": reason})
-        state, _ = self.ckpt.load(target)
+        state, _, ck_dir = self._load_ckpt(target)
         old_skip = self.data_skip
         restarts, skipped, events = self.restarts, self.skipped_steps, list(self.rollback_events)
-        self._load_state(state, restore_rng=False)
+        self._load_state(state, restore_rng=False, ckpt_dir=ck_dir)
         self.restarts, self.skipped_steps = restarts, skipped
         self.data_skip = cur_step + old_skip + st.skip_batches_on_rollback - self.step
         ev = {"at_step": cur_step + 1, "to_step": self.step, "reason": reason, "data_skip": self.data_skip}
@@ -830,8 +916,8 @@ class Trainer:
                 done = step_idx + 1
                 is_log = done % c.logging.log_every == 0
                 prec = c.precision
-                want_diag = prec.rung != "R0" and prec.diagnostics_every > 0 and done % prec.diagnostics_every == 0 and self.precision.phase == "main"
-                want_gap = prec.rung != "R0" and prec.loss_gap_every > 0 and done % prec.loss_gap_every == 0 and self.precision.phase == "main" and self.precision.quantised
+                want_diag = self.precision.wants_diagnostics and prec.diagnostics_every > 0 and done % prec.diagnostics_every == 0 and self.precision.phase == "main"
+                want_gap = self.precision.wants_loss_gap and prec.loss_gap_every > 0 and done % prec.loss_gap_every == 0 and self.precision.phase == "main" and self.precision.quantised
                 want_ratio = is_log and c.logging.update_ratio_max_numel > 0
                 try:
                     _, batches = next(self._prefetch)  # type: ignore[arg-type]
@@ -945,6 +1031,8 @@ class Trainer:
         finally:
             if self._prefetch is not None:
                 self._prefetch.close()
+        if self.zero is not None:
+            self.zero.finalize()  # every rank's module weights are complete again (export, evaluation)
         # final evaluation + checkpoint
         final_eval: dict[str, float] = {}
         if self.eval_set and status != "stopped":
@@ -957,8 +1045,11 @@ class Trainer:
                 self.ctx.log(f"final evaluation failed: {e!r}", "warning")
         self.save_checkpoint(final=True, meta={"status": status})
         if status == "early_stopped" and c.eval.restore_best and self.ckpt.best() is not None:
-            state, _ = self.ckpt.load("best")
+            state, _, ck_dir = self._load_ckpt("best")
             D.load_model_state(self.model, state["model"], strict=False)
+            if self.zero is not None:
+                self._load_zero({k: v for k, v in state.items() if k != "optim"}, ck_dir)  # weights only: keep the live optimiser rows
+                self.zero.finalize()
             self.ctx.log(f"restored best checkpoint (step {self.ckpt.best()})")
         self.status = status
         result = {
@@ -967,5 +1058,9 @@ class Trainer:
             "checkpoint_dir": str(self.ckpt.root), "elapsed_s": time.time() - self._t_start, "precision": self.precision.summary,
             "total_steps": self.total_steps,
         }
+        if self.zero is not None:
+            result["zero_ternary"] = self.zero.describe()
+        if self._oom_split > 1:
+            result["oom_micro_batch_split"] = self._oom_split
         self.ctx.progress(1.0 if status != "stopped" else self._progress_frac(), f"{status}: {self.step} steps")
         return result

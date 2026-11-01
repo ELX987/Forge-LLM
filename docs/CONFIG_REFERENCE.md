@@ -8,6 +8,7 @@
   | Job type | Config model |
   |----------|--------------|
   | `train` | `forge.train.config.TrainConfig` |
+  | `ternary_train` | `forge.ternary.config.TernaryTrainConfig` (experimental) |
   | `finetune` | `forge.train.config.FinetuneConfig` |
   | `distill` | `forge.train.config.DistillConfig` |
   | `dataset_ingest` | `forge.train.data.IngestConfig` |
@@ -50,6 +51,13 @@ nesting level). "Validated" here means *parses and passes the model's checks*, n
 | `llama-8b-full-bf16` | Continued pre-training, all weights, R0 BF16 | FSDP over 8 GPUs by default; ~100 GB state; gated model |
 | `qwen-fp8` | Rung R1 FP8 mixed precision | Real speed-up only on sm_89+; emulated otherwise |
 | `nvfp4-pilot` | Rung R2 NVFP4 pilot | **Experimental, gated**: needs `allow_unvalidated_fp4`; emulated except on Blackwell; healing phase + diagnostics |
+
+### configs/ternary (job type `ternary_train`, EXPERIMENTAL)
+
+| Template | Purpose | Notes |
+|----------|---------|-------|
+| `tiny-smoke` | CPU smoke test of ternary QAT | Tiny model, group 32, dataset `tiny-corpus`; watch `ternary/*` metrics |
+| `scratch-125m` | 125M model from scratch with ternary QAT | **Not validated on GPU through Forge.** Emulated fake-quant path: no speed-up; thresholds are TARGET values from tern158 |
 
 ### configs/finetune (job type `finetune`)
 
@@ -110,6 +118,8 @@ as `tiny-smoke` does).
 | `w4a16-gptq-g128` | calibrate -> GPTQ 4-bit group 128 act-order -> pack for the chip -> FP8 KV -> gate `g-w4` | Plan Appendix C.1. K1 kernel unvalidated on hardware |
 | `fp8-w8a8` | calibrate -> FP8 quantisation -> FP8 KV -> gate `g-fp8` | Speed-up only on sm_89+ |
 | `nvfp4-ptq` | calibrate -> NVFP4 GPTQ -> pack -> gate `g-w4` | **Experimental**; emulated off Blackwell; gate reused from W4 |
+| `ternary-ptq` | ternarize (data-free, group 128) -> pack -> gate `g-t158` | **Experimental**; one-shot and lossy (no recovery training); gate thresholds are TARGET placeholders |
+| `ternary-convert` | distill (delegate, ternary QAT + KD) -> ternarize -> pack -> gate `g-t158` | **Experimental**; fill `config.data`; not validated on hardware |
 | `prune-distill-8b-to-4b` | calibrate -> structured prune -> built-in recovery distillation -> gate `g-struct` | Pilot budget; real run needs billions of tokens and `mode: delegate` |
 | `lowrank` | calibrate -> whitened SVD with rank allocation (+ healing) -> gate `g-struct` | **Experimental**; single-source evidence |
 | `delta` | BitDelta-style delta of a fine-tune vs its base -> gate `g-lossless` | **Experimental**; no serving kernel for deltas |
@@ -121,7 +131,7 @@ spellings are accepted as aliases (`ptq.group` -> `group_size`, `gate.suite` -> 
 Notes on specific fields: `calib` must name a registered calibration set (`builtin-mix`, `builtin-prose|code|math|chat`,
 `synthetic`, `file:<path>`, or one registered through the job's `calibration_texts` / `calibration_files`); `pack.target`
 is a measured chip descriptor id or null; `gate.suite` accepts the preset ids `g-lossless, g-fp8, g-w4, g-struct,
-g-long, g-spec, g-fp4train` (Appendix-C names like `G-W4-v2` resolve to their base gate); `compress.fail_on_gate` marks
+g-long, g-spec, g-fp4train, g-t158` (Appendix-C names like `G-W4-v2` resolve to their base gate); `compress.fail_on_gate` marks
 the job failed *after* the artifact is registered.
 
 `configs/compress/tiny-smoke.yaml` is the only compression template that runs on a laptop CPU (random tiny model).

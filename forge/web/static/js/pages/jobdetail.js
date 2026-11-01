@@ -18,6 +18,22 @@ const CHARTS = [
   { id: 'mem', title: 'GPU memory (GB)', keys: ['gpu_mem_gb'] },
   { id: 'uw', title: 'Update / weight ratio', keys: ['update_weight_ratio'], logY: true, smooth: true },
 ];
+const TERNARY_NOTES = {
+  'ternary/zero_frac': 'Share of weights quantised to 0 (mean over sampled layers). Healthy about 40-52%; the run warns above 60% and aborts above 80% (zero-density collapse). Thresholds are TARGET values from the tern158 report.',
+  'ternary/zero_frac_min': 'Lowest zero share among the sampled layers.',
+  'ternary/zero_frac_max': 'Highest zero share among the sampled layers: the first layer to drift towards collapse.',
+  'ternary/flip_rate': 'Fraction of ternary codes that changed per step (average since the previous sample). The AdamW equilibrium is about 0.59*sqrt(2*lr*wd); far above that means noise-dominated updates.',
+  'ternary/flip_rate_max': 'Highest per-layer flip rate among the sampled layers.',
+  'ternary/scale_mean': 'Mean group scale (recomputed every step, never learned). Large drift means the latent weights are changing scale.',
+  'ternary/lam': 'Quantisation warm-up blend: 0 = full precision, 1 = fully ternary.',
+  'ternary/loss_gap': 'Relative loss gap between the ternary forward and a shadow full-precision forward on the same batch.',
+  'ternary/loss_ref': 'Loss of the shadow full-precision forward.',
+};
+// Diagnostic panels, one per metric namespace: { prefix, title, notes, tip }.
+const DIAG_PANELS = [
+  { prefix: 'fp4/', title: 'FP4 training diagnostics', notes: () => FP4_NOTES, tip: 'NVFP4 training is gated (Plan TR-3). These diagnostics are measured on this run but the recipe itself is unvalidated.', lead: 'Watch these to detect underflow, scale flushing and rounding bias before the loss visibly diverges.' },
+  { prefix: 'ternary/', title: 'Ternary (1.58-bit) health', notes: () => TERNARY_NOTES, tip: 'Ternary QAT is experimental and validated on CPU only. Thresholds are TARGET values from the tern158 report, not Forge measurements.', lead: 'Loss alone hides collapse: watch the zero share and flip rate.' },
+];
 const FP4_NOTES = {
   'fp4/zero_grad_tile_frac': 'Fraction of gradient tiles that quantise to all-zero. Rising values mean underflow is eating signal.',
   'fp4/scale_flush_frac': 'Fraction of block scales flushed to zero/subnormal in E4M3.',
@@ -227,12 +243,14 @@ export default async function render(ctx) {
     let any = false;
     for (const def of CHARTS) { if (def.keys.some((k) => S.raw.has(k))) { chartCard(grid, def); any = true; } }
     if (!any) grid.appendChild(emptyState('Waiting for the first metrics', 'Metrics appear as soon as the trainer reports its first logging step.'));
-    // FP4 diagnostics
-    const fp4 = Array.from(S.raw.keys()).filter((k) => k.startsWith('fp4/'));
-    if (fp4.length) {
+    // diagnostics panels (fp4/, ternary/, ...)
+    for (const panel of DIAG_PANELS) {
+      const dkeys = Array.from(S.raw.keys()).filter((k) => k.startsWith(panel.prefix));
+      if (!dkeys.length) continue;
+      const notes = panel.notes();
       const fgrid = h('div', { class: 'grid cols-2' });
-      body.append(h('div', { class: 'mt' }, h('h2', 'FP4 training diagnostics ', badge('experimental', 'warn', { tip: 'NVFP4 training is gated (Plan TR-3). These diagnostics are measured on this run but the recipe itself is unvalidated.' })), h('p', { class: 'muted small' }, 'Watch these to detect underflow, scale flushing and rounding bias before the loss visibly diverges.')), fgrid);
-      for (const k of fp4) { chartCard(fgrid, { id: k, title: k.replace('fp4/', ''), keys: [k], smooth: true }); fgrid.lastChild.appendChild(h('div', { class: 'small muted' }, FP4_NOTES[k] || '')); }
+      body.append(h('div', { class: 'mt' }, h('h2', panel.title + ' ', badge('experimental', 'warn', { tip: panel.tip })), h('p', { class: 'muted small' }, panel.lead)), fgrid);
+      for (const k of dkeys) { chartCard(fgrid, { id: k, title: k.slice(panel.prefix.length), keys: [k], smooth: true }); fgrid.lastChild.appendChild(h('div', { class: 'small muted' }, notes[k] || '')); }
     }
     // system series
     const sys = Array.from(S.raw.keys()).filter((k) => k.startsWith('sys/'));
@@ -244,7 +262,7 @@ export default async function render(ctx) {
     }
     // other keys
     const known = new Set([...CHARTS.flatMap((c) => c.keys), 'tokens_seen']);
-    const others = Array.from(S.raw.keys()).filter((k) => !known.has(k) && !k.startsWith('fp4/') && !k.startsWith('sys/'));
+    const others = Array.from(S.raw.keys()).filter((k) => !known.has(k) && !DIAG_PANELS.some((p) => k.startsWith(p.prefix)) && !k.startsWith('sys/'));
     if (others.length) {
       const sel = h('select', { 'aria-label': 'Add metric chart', onchange: () => { if (sel.value) { const k = sel.value; sel.value = ''; if (!S.charts.has('x-' + k)) chartCard(ogrid, { id: 'x-' + k, title: k, keys: [k], smooth: true }); } } }, h('option', { value: '' }, 'Add chart for another metric...'), others.map((k) => h('option', { value: k }, k)));
       const ogrid = h('div', { class: 'grid cols-2 mt' });

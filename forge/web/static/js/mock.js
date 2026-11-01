@@ -90,6 +90,7 @@ function trainSchema(kind) {
 
 const JOB_TYPES = [
   { type: 'probe', title: 'Hardware probe', description: 'Measure the GPU: bandwidth, tensor-core throughput, launch latency. Fills a ChipDescriptor.', schema: S.obj('Probe', { quick: S.bool('Skip long micro-benchmarks.', false), device: S.int('CUDA device index.', 0, 0, 63) }, { additionalProperties: false }), templates: ['probe-quick'] },
+  { type: 'ternary_train', title: 'Train ternary (1.58-bit) - experimental', description: 'DEMO DATA. Latent-weight ternary QAT with health diagnostics (zero density, flip rate).', schema: trainSchema('train'), templates: ['tiny-smoke'] },
   { type: 'bench', title: 'Kernel benchmark', description: 'Benchmark kernels against their reference oracles with roofline fields.', schema: S.obj('Bench', { kernels: S.arr('Kernel names.', { type: 'string' }, ['w4a16_gemm']), dtypes: S.arr('Dtypes.', { type: 'string', enum: ['fp16', 'bf16', 'fp8', 'fp4'] }, ['bf16']), repeats: S.int('Timed repeats.', 20, 1, 1000), warmup: S.int('Warm-up iterations.', 5, 0, 100), l2_flush: S.bool('Flush L2 between runs.', true) }), templates: [] },
   { type: 'dataset_ingest', title: 'Dataset ingest', description: 'Tokenise, pack and shard a text/jsonl/parquet/HF dataset.', schema: S.obj('Ingest', { source: S.str('Path, upload id or HF dataset.', ''), tokenizer: S.str('Tokenizer id or path.', 'llama-3.1-8b'), shard_mb: S.int('Shard size.', 256, 1, 4096, ui(null, true, 'MiB')), dedup: S.enm('Deduplication.', ['none', 'exact', 'minhash'], 'exact') }, { required: ['source'] }), templates: [] },
   { type: 'train', title: 'Train', description: 'Pre-train or continue training with the precision ladder, checkpoints and diagnostics.', schema: trainSchema('train'), templates: ['tiny-smoke', 'nvfp4-pilot'] },
@@ -237,15 +238,40 @@ function metricAt(key, step, total) {
     case 'fp4/scale_flush_frac': return 0.0004 + 0.0002 * Math.abs(hnoise(step, 10));
     case 'fp4/sr_bias': return 0.0002 * hnoise(step, 11);
     case 'fp4/loss_gap': return 0.02 + 0.03 * x + 0.004 * hnoise(step, 12);
+    case 'ternary/zero_frac': return 0.43 + 0.012 * hnoise(step, 13) + 0.02 * Math.exp(-x * 6);
+    case 'ternary/zero_frac_min': return 0.40 + 0.01 * hnoise(step, 14);
+    case 'ternary/zero_frac_max': return 0.47 + 0.01 * hnoise(step, 15) + 0.03 * x;
+    case 'ternary/flip_rate': return 0.0006 + 0.006 * Math.exp(-x * 8) + 0.0002 * Math.abs(hnoise(step, 16));
+    case 'ternary/flip_rate_max': return 0.0012 + 0.01 * Math.exp(-x * 8) + 0.0004 * Math.abs(hnoise(step, 17));
+    case 'ternary/scale_mean': return 0.021 + 0.003 * x + 0.0002 * hnoise(step, 18);
+    case 'ternary/lam': return Math.min(1, step / 500);
+    case 'ternary/loss_gap': return 0.06 * Math.exp(-x * 2) + 0.02 + 0.004 * hnoise(step, 19);
     default: return 0;
   }
 }
 const METRIC_KEYS = ['loss', 'val_loss', 'lr', 'grad_norm', 'tokens_per_s', 'tokens_seen', 'step_time_ms', 'gpu_mem_gb', 'mfu', 'update_weight_ratio'];
 const FP4_KEYS = ['fp4/zero_grad_tile_frac', 'fp4/scale_flush_frac', 'fp4/sr_bias', 'fp4/loss_gap'];
-function jobKeys(j) { const k = METRIC_KEYS.slice(); if (j.id === 'job_demo_fail' || (j.spec.params.precision && j.spec.params.precision.rung === 'R2')) k.push(...FP4_KEYS); return k; }
+const TERNARY_KEYS = ['ternary/zero_frac', 'ternary/zero_frac_min', 'ternary/zero_frac_max', 'ternary/flip_rate', 'ternary/flip_rate_max', 'ternary/scale_mean', 'ternary/lam', 'ternary/loss_gap'];
+function jobKeys(j) { const k = METRIC_KEYS.slice(); if (j.spec.type === 'ternary_train') k.push(...TERNARY_KEYS); if (j.id === 'job_demo_fail' || (j.spec.params.precision && j.spec.params.precision.rung === 'R2')) k.push(...FP4_KEYS); return k; }
+
+const MOCK_METHODS = [
+  { id: 'pretrain-bf16', title: 'Pre-train / continue training (bf16) (demo)', family: 'pretrain', status: 'supported', summary: 'DEMO DATA. Decoder-only pre-training with bf16 autocast.', job_type: 'train', template: null, config_hint: {}, produces: 'model', needs: ['dataset'], diagnostics_prefix: null, planner_scheme: null, gpu_validated: false, docs: null },
+  { id: 'lora', title: 'LoRA / DoRA (demo)', family: 'peft', status: 'supported', summary: 'DEMO DATA. Low-rank adapters.', job_type: 'finetune', template: null, config_hint: {}, produces: 'adapter', needs: ['dataset'], diagnostics_prefix: null, planner_scheme: null, gpu_validated: false, docs: null },
+  { id: 'ptq-w4a16-gptq', title: 'GPTQ W4A16 (demo)', family: 'ptq', status: 'supported', summary: 'DEMO DATA. 4-bit weight quantisation.', job_type: 'compress', template: null, config_hint: {}, produces: 'quantized', needs: ['calibration data'], diagnostics_prefix: null, planner_scheme: 'w4a16-g128', gpu_validated: false, docs: null },
+  { id: 'ternary-train', title: 'Ternary (1.58-bit) QAT from scratch (demo)', family: 'ternary', status: 'experimental', summary: 'DEMO DATA. Latent-weight QAT with {-1,0,+1} weights and int8 activations; CPU-validated only.', job_type: 'ternary_train', template: null, config_hint: {}, produces: 'model', needs: ['dataset'], diagnostics_prefix: 'ternary', planner_scheme: 't158', gpu_validated: false, docs: 'docs/TERNARY.md' },
+  { id: 'ternary-ptq', title: 'Ternary post-training quantisation (demo)', family: 'ternary', status: 'planned', summary: 'DEMO DATA. Reserved slot.', job_type: null, template: null, config_hint: {}, produces: 'quantized', needs: [], diagnostics_prefix: 'ternary', planner_scheme: 't158', gpu_validated: false, docs: null },
+];
+function mockTrainSim(b) {
+  const c = b.config || {}; const hidden = c.hidden || 768, layers = c.layers || 12, ffn = c.ffn || 2048, vocab = c.vocab || 32000;
+  const lin = layers * (4 * hidden * hidden + 3 * ffn * hidden); const gib = 1024 ** 3; const world = b.n_gpu || 1;
+  const state = lin * (c.scheme === 'ternary_native' ? 0.25 + 4 + 4 + 2 : 16) / (c.shard_state ? world : 1) / gib;
+  const mem = { 'DEMO weights+optimiser': state, 'DEMO activations': 0.002 * layers * hidden * (c.seq_len || 2048) / 1e6, 'DEMO embeddings/head': vocab * hidden * 16 / gib, 'DEMO runtime': 1.6 };
+  const total = Object.values(mem).reduce((a, x) => a + x, 0); const tps = 180000 * (768 / hidden) * (12 / layers) ** 0.5 * world * 0.9;
+  return { ok: total < 80, scheme: c.scheme || 'bf16', params: { linear: lin, total: lin + vocab * hidden }, mem_gb: mem, vram_gb: 80, micro_batch: 8, accum: 4, step_s: (c.global_batch_tokens || 262144) / tps, tokens_per_s: tps, tokens_per_s_gpu: tps / world, mfu: 0.22, total_hours: (c.max_tokens || 2e8) / tps / 3600, cost_usd: 0, energy_kwh: 1.2, breakdown_s: { 'DEMO linear fwd': 0.3, 'DEMO linear bwd': 0.6, 'DEMO attention': 0.1 }, notes: ['DEMO DATA: crude closed-form numbers, no relation to measurements. ESTIMATE only.'], suggestions: [], estimate: true };
+}
 
 function metricsFor(j, q) {
-  if (!['train', 'finetune', 'distill'].includes(j.spec.type)) return { keys: [], points: {} };
+  if (!['train', 'finetune', 'distill', 'ternary_train'].includes(j.spec.type)) return { keys: [], points: {} };
   const total = j.total_steps || 5000; const stepNow = jobStepNow(j);
   const maxPts = Math.max(10, Math.min(5000, Number(q.max_points) || 2000));
   const since = Number(q.since_step) || 0;
@@ -391,6 +417,10 @@ export async function mockRequest(method, path, { query = {}, body, form } = {})
   if (route(/^\/recipes\/validate$/, ['POST'])) { const y = String(body.yaml || ''); const errs = []; if (!/^name:/m.test(y)) errs.push('missing "name"'); if (!/stages:/.test(y)) errs.push('missing "stages"'); return { valid: !errs.length, errors: errs, hash: errs.length ? null : H(y.length * 31), warnings: /nvfp4/.test(y) ? ['nvfp4 stages are experimental and gated'] : [] }; }
   if ((m = route(/^\/recipes\/([^/]+)\/run$/, ['POST']))) return addJob('recipe', 'recipe ' + m[1], { recipe_id: m[1] });
   if ((m = route(/^\/recipes\/([^/]+)$/))) { const i = state.recipes.findIndex((x) => x.id === m[1]); if (i < 0) throw notFound(p); if (M === 'DELETE') { state.recipes.splice(i, 1); return { ok: true }; } if (M === 'PUT') Object.assign(state.recipes[i], body); return state.recipes[i]; }
+  // ---- methods + training simulator (DEMO DATA: crude closed-form numbers, no relation to measurements)
+  if (route(/^\/methods$/, ['GET'])) return MOCK_METHODS.filter((x) => (!q.family || x.family === q.family) && (!q.status || x.status === q.status));
+  if ((m = route(/^\/methods\/([^/]+)$/, ['GET']))) { const x = MOCK_METHODS.find((y) => y.id === m[1]); if (!x) throw notFound(p); return x; }
+  if (route(/^\/planner\/train-sim$/, ['POST'])) return mockTrainSim(body || {});
   // ---- planner
   if (route(/^\/planner\/estimate$/, ['POST'])) return estimate(body || {});
   if (route(/^\/planner\/plan$/, ['POST'])) return plan(body || {});

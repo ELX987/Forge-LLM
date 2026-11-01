@@ -34,6 +34,22 @@ class CalibrateParams(BaseModel):
     seed: int = Field(0, description="Sampling seed.")
 
 
+class TernarizeParams(BaseModel):
+    """Stage ``ternarize``: data-free post-training ternarisation to packed ``t158`` layers ({-1,0,+1} weights, fp32 group scales; EXPERIMENTAL).
+
+    One-shot ternarisation of a pretrained model is lossy: precede it with a `finetune` / `distill` stage that sets
+    ``precision.quant_aware: ternary`` (QAT recovery), or use this stage on a model already trained with ternary QAT
+    (then it reproduces the QAT forward weights exactly)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_size: int = Field(128, ge=-1, description="Scale group along K (>0), -1 = one scale per output row, 0 = one per tensor. Converted pretrained models need 128.")
+    rule: Literal["absmean", "twn", "lloyd"] = Field("lloyd", description="Weight quantiser: absmean, TWN, or Lloyd (absmean start + refinement).")
+    iters: int = Field(1, ge=1, le=16, description="Lloyd refinement steps.")
+    exclude: list[str] = Field(["lm_head", "(^|\\.)gate$", "router", "shared_expert_gate", "embed"], description="Regexes of module names kept in high precision.")
+    include: list[str] | None = Field(None, description="If set, only modules whose name matches one of these regexes are ternarised.")
+
+
 class PackParams(BaseModel):
     """Stage ``pack``: derive the device layout of packed weights for a target chip."""
 
@@ -156,6 +172,7 @@ STAGE_PARAM_MODELS: dict[str, type[BaseModel]] = {
     "calibrate": CalibrateParams,
     "ptq": PTQConfig,
     "pack": PackParams,
+    "ternarize": TernarizeParams,
     "kv": KVQuantConfig,
     "rotate": RotationConfig,
     "prune": PruneConfig,

@@ -21,6 +21,7 @@ _STAGE_DOCS = {
     "calibrate": "Choose and fingerprint the calibration set; optionally pre-collect statistics.",
     "ptq": "Post-training quantisation: rtn / gptq / awq / smoothquant / mrgptq (FP4).",
     "pack": "Derive and validate the device layout of packed weights for a target chip.",
+    "ternarize": "Data-free ternary (1.58-bit) post-training quantisation to packed t158 layers (EXPERIMENTAL).",
     "kv": "KV-cache quantisation scheme (FP8 / int8 / KIVI) with accuracy-vs-bytes report.",
     "rotate": "Fuse norms and rotate the residual stream (randomised Hadamard or learned orthogonal).",
     "prune": "Structured pruning (width, GQA heads, depth, hidden, experts) and research sparsity.",

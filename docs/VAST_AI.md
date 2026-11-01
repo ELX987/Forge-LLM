@@ -214,3 +214,10 @@ Never paste `HF_TOKEN`, `FORGE_API_TOKEN` or `~/.forge_env` contents that contai
 On a host with Docker and the NVIDIA Container Toolkit: `docker compose -f docker/docker-compose.yml up --build`
 (see `docker/Dockerfile.cuda`; also unvalidated). On vast.ai you are already inside a container, so use the
 scripts above instead.
+
+## Ternary (1.58-bit) validation on a rented GPU (experimental)
+
+After `scripts/vast_setup.sh`: `bash scripts/ternary_smoke.sh` (end-to-end pipeline, CPU or `GPUS=auto`) and `bash scripts/ternary_validate.sh` (kernel checks, CUDA-graph benchmark,
+smoke; `FORGE_TERNARY_NATIVE=1` also builds and self-tests the optional native CUDA tier, which needs a `-devel` image with `nvcc`: CUDA 12.8+ for sm_100/120, 12.9+ for sm_103/121).
+Disk: about 40 GB is enough for the smoke tests; real conversion runs need far more. Without NVLink, prefer larger gradient accumulation (gradient traffic goes over PCIe).
+The full ladder and the results table are in `docs/runbooks/ternary-validation.md`.

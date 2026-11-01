@@ -10,6 +10,8 @@ export const ROUTES = [
   { id: 'jobs', path: '/jobs', title: 'Jobs', nav: true, group: 'Run', icon: 'list', module: './pages/jobs.js' },
   { id: 'job-detail', path: '/jobs/:id', title: 'Job', nav: false, parent: 'jobs', module: './pages/jobdetail.js' },
   { id: 'finetune', path: '/finetune', title: 'Fine-tune', nav: true, group: 'Run', icon: 'tune', module: './pages/finetune.js' },
+  { id: 'ternary', path: '/ternary', title: 'Ternary Lab', nav: true, group: 'Run', icon: 'bolt', module: './pages/ternary.js' },
+  { id: 'methods', path: '/methods', title: 'Methods', nav: true, group: 'Run', icon: 'flow', module: './pages/methods.js' },
   { id: 'recipes', path: '/recipes', title: 'Recipes', nav: true, group: 'Run', icon: 'flow', module: './pages/recipes.js' },
   { id: 'recipe-edit', path: '/recipes/:id', title: 'Recipe', nav: false, parent: 'recipes', module: './pages/recipes.js' },
   { id: 'compare', path: '/compare', title: 'Compare', nav: true, group: 'Analyse', icon: 'scale', module: './pages/compare.js' },

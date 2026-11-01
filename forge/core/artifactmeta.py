@@ -15,7 +15,7 @@ from typing import Any
 
 META_FILE = "forge_compress.json"
 
-_FP_LABELS = {"fp8": "FP8", "nvfp4": "NVFP4", "mxfp4": "MXFP4", "int8": "W8A8", "w8a8": "W8A8", "lowrank": "LowRank", "bitdelta": "BitDelta"}
+_FP_LABELS = {"fp8": "FP8", "nvfp4": "NVFP4", "mxfp4": "MXFP4", "int8": "W8A8", "w8a8": "W8A8", "lowrank": "LowRank", "bitdelta": "BitDelta", "t158": "Ternary 1.58b"}
 
 
 def _read_json(p: Path) -> dict[str, Any] | None:

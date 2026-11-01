@@ -33,7 +33,7 @@ from forge.train.fp4sim import FP4Rng, fake_quant_fp8, fake_quant_nvfp4, random_
 
 log = logging.getLogger("forge.train.precision")
 
-__all__ = ["PrecisionManager", "QuantLinear", "is_exempt", "resolve_compute_dtype"]
+__all__ = ["PrecisionManager", "QuantLinear", "is_exempt", "make_precision_manager", "register_quant_mode", "resolve_compute_dtype"]
 
 _LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 
@@ -255,6 +255,20 @@ class PrecisionManager:
     @property
     def quantised(self) -> bool:
         return bool(self._quant_names) or self._te_active or self._converted_torchao
+
+    @property
+    def wants_diagnostics(self) -> bool:
+        """Whether the trainer should call :meth:`diagnostics` on its cadence (quant-mode plug-ins override)."""
+        return self.cfg.rung != "R0"
+
+    @property
+    def wants_loss_gap(self) -> bool:
+        """Whether the trainer should run the shadow high-precision loss-gap forward on its cadence."""
+        return self.cfg.rung != "R0"
+
+    def drain_events(self) -> list[tuple[str, str]]:
+        """``[(level, message)]`` raised since the last call (level 'warning' | 'error'); the trainer logs them and aborts on 'error'."""
+        return []
 
     def set_step(self, step: int) -> bool:
         """Switch phase if needed (healing). Returns True when the phase changed."""
@@ -504,3 +518,29 @@ class PrecisionManager:
         if zk in acc:
             out[zk + "_max"] = max(acc[zk])
         return out
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# quant-aware mode plug-ins (ADR 0007): modes subclass PrecisionManager (same interface: prepare, set_step, autocast, high_precision,
+# diagnostics, restore, quantised, metric_prefix, wants_*, drain_events) and register under a ``PrecisionConfig.quant_aware`` value.
+# ---------------------------------------------------------------------------------------------------------------
+_QUANT_MODES: dict[str, str] = {"ternary": "forge.ternary.qat:TernaryPrecisionManager"}
+
+
+def register_quant_mode(name: str, target: str) -> None:
+    """Register ``name`` -> ``"module:Class"`` (lazy import) for ``PrecisionConfig.quant_aware``."""
+    _QUANT_MODES[name] = target
+
+
+def make_precision_manager(cfg: PrecisionConfig, **kw: Any) -> PrecisionManager:
+    """The manager for ``cfg``: the registered quant-aware plug-in when ``cfg.quant_aware != 'none'``, else :class:`PrecisionManager`."""
+    mode = getattr(cfg, "quant_aware", "none")
+    if mode == "none":
+        return PrecisionManager(cfg, **kw)
+    if mode not in _QUANT_MODES:
+        raise ConfigError(f"unknown precision.quant_aware mode {mode!r}; registered: {sorted(_QUANT_MODES)}")
+    import importlib
+
+    mod, _, cls = _QUANT_MODES[mode].partition(":")
+    return getattr(importlib.import_module(mod), cls)(cfg, **kw)
+

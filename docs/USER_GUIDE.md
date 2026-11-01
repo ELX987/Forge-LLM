@@ -212,3 +212,11 @@ graph for any artifact (which model, recipe, calibration set and teacher produce
 * After a server restart, jobs that were running are marked failed; clone them and set `checkpoint.resume: auto`.
 * Anything GPU-specific that behaves strangely: reproduce with `FORGE_FORCE_REF=1` (reference kernels) and send the
   report as described in `docs/VAST_AI.md` section 7.
+
+## Ternary Lab and Methods (experimental)
+
+**Methods** lists every training, fine-tuning, quantization and compression method with its honest status (supported / experimental / planned, never GPU-validated unless a hardware run is recorded).
+**Ternary Lab** is a shortcut wizard over the `ternary_train` job: pick a size preset (the tiny preset runs on CPU in about a minute), a dataset, learning rate, weight decay, scale group and
+quantiser rule. A live training simulator (`POST /planner/train-sim`; an ESTIMATE, uncalibrated) shows memory per GPU, step time and cost, and a calculator shows the predicted equilibrium flip rate
+(0.59 x sqrt(2 x lr x wd), a TARGET value). While the job runs, its page shows **Ternary (1.58-bit) health**: zero density (healthy 40-52%, abort above 80%) and flip rate.
+Ternary QAT today is fake-quantised bf16 compute: it is not faster than bf16 training. The product is the 2-bit model (`docs/TERNARY.md`).

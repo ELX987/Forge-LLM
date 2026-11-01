@@ -96,8 +96,8 @@ class PTQConfig(BaseModel):
         "gptq", description="Algorithm. rtn = baseline, gptq = Hessian reconstruction, awq = activation-aware scaling + RTN, "
         "smoothquant = W8A8 with outlier migration, mrgptq = format-aware GPTQ for NVFP4/MXFP4."
     )
-    format: Literal["int", "fp8", "nvfp4", "mxfp4"] = Field(
-        "int", description="Weight format: int (group-wise INT, W{bits}A16), fp8 (per-channel FP8 E4M3 W8A8), nvfp4 (16-block E4M3 scales), mxfp4 (32-block E8M0)."
+    format: Literal["int", "fp8", "nvfp4", "mxfp4", "ternary"] = Field(
+        "int", description="Weight format: int (group-wise INT, W{bits}A16), fp8 (per-channel FP8 E4M3 W8A8), nvfp4 (16-block E4M3 scales), mxfp4 (32-block E8M0), ternary (1.58-bit {-1,0,+1}, data-free, method rtn only; EXPERIMENTAL)."
     )
     bits: int = Field(4, ge=2, le=8, description="Weight bits for format=int (2..8).")
     group_size: int = Field(128, description="Quantisation group size along the input dim (format=int). 0 or -1 = one group per output channel.")
@@ -146,6 +146,8 @@ class PTQConfig(BaseModel):
             raise ValueError("method 'awq' searches integer group scales: use format='int' (for FP4 use method gptq/mrgptq)")
         if self.method == "smoothquant" and self.format not in ("int",):
             raise ValueError("method 'smoothquant' produces INT8 W8A8; leave format='int' (FP8 W8A8 is format='fp8' with method rtn)")
+        if self.format == "ternary" and (self.method != "rtn" or self.mixed_precision):
+            raise ValueError("format ternary is data-free: use method=rtn without mixed_precision (group_size sets the scale group)")
         if self.mixed_precision and self.format != "int":
             raise ValueError("mixed_precision allocates integer bit widths: use format='int'")
         return self
@@ -729,6 +731,19 @@ def _replace(model: nn.Module, name: str, new: nn.Module, lin: nn.Module) -> Non
     set_submodule(model, name, new)
 
 
+def _quantize_ternary(model: nn.Module, cfg: PTQConfig, report: QuantReport, t_start: float) -> QuantizedModel:
+    from forge.ternary.convert import ternarize_model
+
+    tr = ternarize_model(model, cfg.group_size, "lloyd", 1, exclude=cfg.exclude, include=cfg.include)
+    for r in tr.layers:
+        report.layers.append(LayerRecord(r.name, "t158", 1.585, cfg.group_size, r.shape, 10.0 ** (-r.sqnr_db / 20.0) if math.isfinite(r.sqnr_db) else 0.0, None, 0.0,
+                                         r.bytes_before, r.bytes_after, [f"sqnr_db={r.sqnr_db:.2f}", f"zero_frac={r.zero_frac:.3f}"]))
+    report.warnings.append("format=ternary is EXPERIMENTAL: data-free one-shot ternarisation is lossy; recover with QAT / distillation")
+    report.bytes_after = model_nbytes(model)
+    report.seconds = time.perf_counter() - t_start
+    return QuantizedModel(model, report)
+
+
 def quantize_model(
     model: nn.Module,
     method: str | None = None,
@@ -765,6 +780,8 @@ def quantize_model(
     dev = model_device(model)
     if cfg.method == "smoothquant":
         cfg = cfg.model_copy(update={"format": "int", "bits": 8})
+    if cfg.format == "ternary":
+        return _quantize_ternary(model, cfg, report, t_start)
     g4 = gemma4_features(model)
     if g4 and (cfg.uses_calibration() or cfg.mixed_precision):
         raise ConfigError(

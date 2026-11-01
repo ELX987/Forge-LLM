@@ -1,0 +1,5 @@
+Forge LLM
+Copyright (c) the Forge LLM authors. Licensed under the Apache License 2.0 (see LICENSE).
+
+Portions of the ternary (1.58-bit) support (forge/native/ternary, forge/ternary, forge/formats/ternary.py, forge/planner/trainsim.py) derive from the
+tern158 project (v0.1, same copyright holder, originally under a placeholder MIT notice) and are relicensed under the Apache License 2.0.

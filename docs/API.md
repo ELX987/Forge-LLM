@@ -41,6 +41,7 @@ SSE event formats. All paths below are relative to the prefix **`/api/v1`**.
 | Method & path | Purpose |
 |---------------|---------|
 | `GET /models`, `POST /models` | List / create model records |
+| `GET /methods?family=&status=`, `GET /methods/{id}` | Method catalog (training / fine-tuning / quantization / compression): status supported / experimental / planned, job type, template, diagnostics prefix, `gpu_validated` (read-only metadata) |
 | `GET/PATCH/DELETE /models/{id}` | Read / update / remove a model record |
 | `POST /models/{id}/download` | Start a Hugging Face download job into the models dir |
 | `POST /models/register-local` `{path}` | Register an existing local model directory |
@@ -85,6 +86,7 @@ Job types: `probe`, `bench`, `dataset_ingest`, `train`, `finetune`, `distill`, `
 | `POST /recipes/{id}/run` | Start a `recipe` job |
 | `POST /planner/estimate` `{model, chip\|descriptor_id, quant, kv_dtype, workload}` | Quick fit / bandwidth bound / throughput ceiling |
 | `POST /planner/plan` `{model, chip, workload, budget}` | Ranked candidate recipes |
+| `POST /planner/train-sim` `{config, chip, n_gpu, price_per_gpu_hour, link, calibration}` | Training memory / step time / cost estimate for a scheme (bf16, fp8, nvfp4_emulated, lora, qlora, ternary_qat, ternary_native). First-order and uncalibrated: an estimate, never a measurement |
 | `GET /claims`, `GET /claims/summary`, `GET /claims/{id}`, `PUT /claims` | Claims ledger (see `docs/CLAIMS.md`); `PUT` updates status / notes / linked experiments |
 
 ### Artifacts, storage, evals, gates
@@ -98,7 +100,7 @@ Job types: `probe`, `bench`, `dataset_ingest`, `train`, `finetune`, `distill`, `
 | `POST /storage/gc` `{dry_run}` | Mark-and-sweep from pins; `dry_run=true` only reports |
 | `GET /evals`, `GET /evals/{id}` | EvalReports |
 | `POST /evals/compare` `{ids:[...], parent?}` | Table with CIs, within-noise flags, Pareto set |
-| `GET /gates`, `GET /gates/{id}` | Gate definitions (G-LOSSLESS, G-FP8, G-W4, G-STRUCT, G-LONG, G-SPEC, G-FP4TRAIN) |
+| `GET /gates`, `GET /gates/{id}` | Gate definitions (G-LOSSLESS, G-FP8, G-W4, G-STRUCT, G-LONG, G-SPEC, G-FP4TRAIN, G-T158) |
 
 ### Kernels
 
