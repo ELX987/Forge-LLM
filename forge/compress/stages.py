@@ -196,6 +196,24 @@ def stage_ptq(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContext) -
     return {"model": digest, "ptq_report": summary, "bytes_after": rep["bytes_after"], "compression": rep["compression"]}
 
 
+# ------------------------------------------------------------------------------------------------ ternarize
+@_stage("ternarize", ["model"], "Data-free ternary (1.58-bit) post-training quantisation to packed t158 layers (EXPERIMENTAL).")
+def stage_ternarize(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
+    from forge.ternary.convert import ternarize_model
+
+    p = _params("ternarize", params)
+    parent, lm = _cur(inputs, ctx)
+    model = _fork(lm)
+    rep = ternarize_model(model, p.group_size, p.rule, p.iters, exclude=p.exclude, include=p.include)
+    if not rep.layers:
+        raise ConfigError(f"ternarize: no layer was eligible (skipped: {dict(list(rep.skipped.items())[:5])})")
+    summary = rep.summary()
+    ctx.log(f"ternarize (EXPERIMENTAL): {summary['n_layers']} layers, {summary['bits_per_weight']:.3f} bits/weight, mean SQNR {summary['mean_sqnr_db']:.2f} dB", "warning")
+    digest = _emit(inputs, ctx, "ternarize", p.model_dump(), parent, lm, model, report=summary,
+                   meta={"quant": {"method": "ternarize", "format": "ternary", "bits": 1.585, "group_size": p.group_size}})
+    return {"model": digest, "ternarize_report": summary, "bytes_after": model_nbytes(model), "compression": summary["compression_vs_source"]}
+
+
 # ------------------------------------------------------------------------------------------------ pack
 @_stage("pack", ["model"], "Derive/validate the device layout of packed weights for a target chip.")
 def stage_pack(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
@@ -208,6 +226,7 @@ def stage_pack(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContext) 
     layers = list(iter_packed_linears(model))
     int4 = [(n, m) for n, m in layers if isinstance(m, IntLinear) and m.bits == 4 and m.group_size % 8 == 0]
     fp4 = [(n, m) for n, m in layers if isinstance(m, NVFP4Linear)]
+    tern = [(n, m) for n, m in layers if getattr(m, "kind", "") == "t158"]
     notes: list[str] = []
     layout_id = LAYOUT_ID
     packed_bytes = 0
@@ -261,6 +280,18 @@ def stage_pack(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContext) 
                         raise ForgeError(f"pack: scale swizzle round trip differs for layer {name}")
                     checked += 1
                 packed_bytes += m.qweight.numel() + sw.numel() + 4
+        if tern:
+            from forge.formats import ternary as _tn
+            from forge.kernels.layouts.ternary import TERNARY2_ROW
+
+            layout_id = TERNARY2_ROW.id if layout_id == LAYOUT_ID else f"{layout_id}+{TERNARY2_ROW.id}"
+            for name, m in tern:
+                if p.validate_roundtrip:
+                    t = _tn.unpack_ternary(m.qweight, m.in_features)
+                    if not torch.equal(_tn.pack_ternary(t), m.qweight):
+                        raise ForgeError(f"pack: ternary unpack/pack round trip differs for layer {name}")
+                    checked += 1
+                packed_bytes += m.qweight.numel() + m.scales.numel() * 4
     except ImportError as e:
         notes.append(f"forge.kernels.layouts unavailable ({e}); weights stay in the portable layout '{LAYOUT_ID}'")
     except ForgeError:
@@ -672,4 +703,4 @@ def stage_finetune(inputs: dict[str, Any], params: dict[str, Any], ctx: RunConte
     return {"model": digest, "finetune_report": _jsonable({"result": result, "model_dir": str(out_dir)})}
 
 
-STAGE_NAMES = ["calibrate", "ptq", "pack", "kv", "rotate", "prune", "lowrank", "delta", "lossless", "eval", "gate", "distill", "finetune"]
+STAGE_NAMES = ["calibrate", "ptq", "ternarize", "pack", "kv", "rotate", "prune", "lowrank", "delta", "lossless", "eval", "gate", "distill", "finetune"]

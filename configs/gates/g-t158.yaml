@@ -1,0 +1,32 @@
+# G-T158 - ternary (1.58-bit) weights with int8 activations. EXPERIMENTAL; every threshold is a TARGET placeholder, NOT derived from a
+# Forge measurement (the tern158 report and the BitNet literature motivate the bands; they are pre-registration candidates, to be
+# re-set after the first real converted-model runs). One-shot ternarisation of a pretrained model is expected to FAIL this gate;
+# QAT + distillation recovery is the intended route.
+# Training-time evidence enters through EvalConfig.extra_metrics (loss_gap_rel, ternary_zero_frac) and extra_flags
+# (export_roundtrip_bitexact, kernel_matches_oracle) like g-fp4train does.
+gate: G-T158-v1
+status: TARGET
+title: Ternary 1.58-bit weights
+description: >
+  Suite score within a wide placeholder band of the bf16 parent, KL p99 and top-1 flip bounded, loss gap of the QAT run within the
+  placeholder band, zero-weight fraction inside the healthy range, packed artifact round-trips bit-exactly and the serving kernel
+  matches the oracle.
+applies_to: [t158, ternary_qat]
+parent: required
+ci_policy: conservative
+noninferiority: {margin_pts: 5.0, alpha: 0.05, fdr: benjamini_hochberg}
+metrics:
+  kl_p99: {max: 0.5, description: "placeholder: ternary is far lossier than 4-bit"}
+  top1_flip: {max: 0.15, description: "placeholder"}
+  suite_score_ratio: {min: 0.90, description: "placeholder; recovery-trained models only"}
+  suite_score_diff_pts: {noninferior: true, description: "non-inferior within margin_pts"}
+  loss_gap_rel: {max: 0.05, description: "QAT run vs shadow high-precision loss (placeholder 5%)"}
+  ternary_zero_frac: {min: 0.30, max: 0.60, description: "healthy 0.40-0.52 per tern158; band widened (TARGET)"}
+  safety_delta: {within_noise: true}
+flags:
+  export_roundtrip_bitexact: "unpack(pack(codes)) and save->load reproduce the packed tensors bit-exactly"
+  kernel_matches_oracle: "the serving kernel output equals the torch oracle on the evaluated shapes (GPU-only evidence)"
+  zero_density_healthy: "no zero-density collapse alarm was raised during training"
+noise_floor: from_parent_repeats(n=5)
+suites: [distribution, mcq, longctx, safety]
+source: "tern158 REPORT_NOTES (graded A-D, unreproduced in Forge); docs/TERNARY.md"
