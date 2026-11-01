@@ -8,7 +8,8 @@
 #   FORGE_HOME           state directory (default: /workspace/forge-home if /workspace exists, else ~/.forge)
 #   FORGE_USE_VENV       1 = install into a venv that can see the image's torch
 #   FORGE_INSTALL_TORCH  1 = pip install torch if missing / CPU-only (uses FORGE_TORCH_INDEX)
-#   FORGE_TORCH_INDEX    pip index URL for torch (default https://download.pytorch.org/whl/cu124)
+#   FORGE_TORCH_INDEX    pip index URL for torch (default: chosen from the driver's CUDA version, e.g. .../whl/cu130)
+#   FORGE_SKIP_CUDA_CHECK 1 = do not abort (exit 3) when the CUDA stack check reports a failure (docs/CUDA_COMPAT.md)
 #   FORGE_EXTRAS         pip extras (default: gpu,serve,parquet,dev)
 #   FORGE_MIN_FREE_GIB   warn when FORGE_HOME has less free space (default 100)
 #
@@ -20,7 +21,7 @@ set -euo pipefail
 
 EXTRAS="${FORGE_EXTRAS:-gpu,serve,parquet,dev}"
 MIN_FREE="${FORGE_MIN_FREE_GIB:-100}"
-TORCH_INDEX="${FORGE_TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
+TORCH_INDEX="${FORGE_TORCH_INDEX:-}"   # empty = auto-detect from the driver (forge.hw.cuda_compat --torch-index)
 
 log "Forge setup in $FORGE_REPO_ROOT"
 
@@ -80,14 +81,39 @@ import torch, sys
 sys.exit(0 if torch.cuda.is_available() else 1)
 EOF
 }
+# forge.hw.cuda_compat is stdlib-only, so it runs from the source tree before forge is installed.
+cuda_compat() { PYTHONPATH="$FORGE_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m forge.hw.cuda_compat "$@"; }
+torch_is_container_build() {
+    "$PY" -c 'import re, torch, sys; sys.exit(0 if re.search(r"\.nv\d", torch.__version__) else 1)' >/dev/null 2>&1
+}
+
+log "CUDA stack (driver / torch / GPU / triton):"
+cuda_compat --no-probe || true
+
 if ! torch_cuda_ok; then
+    # A container build (e.g. 2.14.0a0+...nv26.08) is pinned to its image: never pip-replace it.
+    if torch_is_container_build; then
+        err "torch is an NVIDIA container build that cannot use CUDA here; it must not be pip-replaced."
+        err "Fix the host/driver (see the report above) or pick another instance."
+        exit 2
+    fi
     if [ "${FORGE_INSTALL_TORCH:-0}" = "1" ]; then
+        if [ -z "$TORCH_INDEX" ]; then
+            TORCH_SUFFIX="$(cuda_compat --torch-index 2>/dev/null || true)"
+            if [ -z "$TORCH_SUFFIX" ]; then
+                err "cannot choose a torch build for this host (driver too old for the GPU, or no driver CUDA version):"
+                cuda_compat --no-probe >&2 || true
+                die "Upgrade/choose another instance, or set FORGE_TORCH_INDEX explicitly."
+            fi
+            TORCH_INDEX="https://download.pytorch.org/whl/$TORCH_SUFFIX"
+            log "Auto-selected torch index $TORCH_INDEX from the driver's CUDA version"
+        fi
         log "Installing torch from $TORCH_INDEX"
         "$PY" -m pip install torch --index-url "$TORCH_INDEX"
     fi
     if ! torch_cuda_ok; then
         err "torch is missing or cannot see CUDA. Either pick a PyTorch image, or re-run with FORGE_INSTALL_TORCH=1"
-        err "(optionally FORGE_TORCH_INDEX=https://download.pytorch.org/whl/cu121|cu124|cu128; cu128 is needed for RTX 50xx / B200)."
+        err "(optionally FORGE_TORCH_INDEX=https://download.pytorch.org/whl/cu126|cu128|cu129|cu130; the default follows the driver)."
         exit 2
     fi
 fi
@@ -96,10 +122,47 @@ fi
 log "Installing forge[$EXTRAS] (editable)"
 (cd "$FORGE_REPO_ROOT" && "$PY" -m pip install --quiet -e ".[$EXTRAS]")
 
-if ! "$PY" -c 'import triton' >/dev/null 2>&1; then
-    log "Installing triton (not shipped with this torch build)"
-    "$PY" -m pip install --quiet "triton>=2.2"
+# ---- 6b. CUDA stack gate (runs a device allocation probe in a subprocess) ---------------------------------
+log "CUDA stack check:"
+if ! cuda_compat; then
+    if [ "${FORGE_SKIP_CUDA_CHECK:-0}" = "1" ]; then
+        warn "CUDA stack check failed; continuing because FORGE_SKIP_CUDA_CHECK=1"
+    else
+        err "CUDA stack check failed (report above). Fix the host, or set FORGE_SKIP_CUDA_CHECK=1 to continue anyway."
+        exit 3
+    fi
 fi
+
+# ---- 6c. Companion requirements for this driver (nvidia-ml-py, triton) -------------------------------------
+# torch is never touched: the constraint pins the installed torch, and a container build also gets --no-deps.
+mapfile -t CC_REQS < <(cuda_compat --requirements 2>/dev/null || true)
+CONSTRAINTS="$(mktemp)"
+trap 'rm -f "$CONSTRAINTS"' EXIT
+"$PY" -c 'import torch; print("torch==" + torch.__version__)' >"$CONSTRAINTS" 2>/dev/null || : >"$CONSTRAINTS"
+NODEPS=()
+if torch_is_container_build; then NODEPS=(--no-deps); fi
+for req in ${CC_REQS[@]+"${CC_REQS[@]}"}; do
+    [ -n "$req" ] || continue
+    case "$req" in
+        nvidia-ml-py*)  # no dependencies of its own that matter; never let it drag anything else in
+            "$PY" -m pip install --quiet --no-deps "$req" ;;
+        *)
+            name="${req%%[<>=!~ ]*}"
+            if "$PY" - "$req" <<'EOF' >/dev/null 2>&1
+import sys
+import importlib.metadata as md
+from packaging.requirements import Requirement
+r = Requirement(sys.argv[1])
+sys.exit(0 if r.specifier.contains(md.version(r.name), prereleases=True) else 1)
+EOF
+            then
+                log "$name already satisfies '$req'"
+            else
+                log "Installing $req"
+                "$PY" -m pip install --quiet -c "$CONSTRAINTS" ${NODEPS[@]+"${NODEPS[@]}"} "$req"
+            fi ;;
+    esac
+done
 
 # ---- 7. Persist environment -------------------------------------------------------------------------
 {

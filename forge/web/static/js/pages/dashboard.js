@@ -2,8 +2,10 @@
 
 import { h, clear, fmtBytes, fmtPct, listOf, isNum, normGpus } from '../util.js';
 import { api, sse, tryGet } from '../api.js';
-import { pageHead, card, stat, loadInto, poll, statusBadge, dataTable, progressBar, emptyState, notice, unavailableNotice, badge, provBadge } from '../components/ui.js';
+import { cudaBanner, pageHead, card, stat, loadInto, poll, statusBadge, dataTable, progressBar, emptyState, notice, unavailableNotice, badge, provBadge } from '../components/ui.js';
 import { sparkline } from '../charts.js';
+
+const cudaReport = async (refresh) => { const r = await tryGet('/system/cuda', refresh ? { refresh: 1 } : undefined); return r.ok ? r.data : null; };
 
 export default async function render(ctx) {
   const root = ctx.root;
@@ -16,6 +18,7 @@ export default async function render(ctx) {
   root.append(
     pageHead('Dashboard', 'Live overview of hardware, jobs, quality gates, storage and open scientific claims.',
       h('a', { class: 'btn primary', href: '#/jobs/new' }, '+ New job'), h('a', { class: 'btn', href: '#/inference' }, 'Inference')),
+    cudaBanner(cudaReport),
     kpis,
     h('div', { class: 'mt' }, card('GPUs', gpuHost, h('span', { class: 'muted small', id: 'gpu-live' }, ''))),
     h('div', { class: 'grid cols-2 mt' },

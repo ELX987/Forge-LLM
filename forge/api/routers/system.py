@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import platform
 import sys
+import threading
 import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from starlette.concurrency import run_in_threadpool
 
 from forge import __version__
 from forge.api.common import lazy_module
@@ -82,6 +84,35 @@ def info(svc: Services = Depends(get_services)) -> dict[str, Any]:
         "server_time": time.time(),
         "uptime_s": time.time() - svc.started_at,
     }
+
+
+_CUDA_TTL_S = 60.0
+_cuda_cache: dict[bool, tuple[float, dict[str, Any]]] = {}  # probe flag -> (monotonic ts, report)
+_cuda_lock = threading.Lock()
+
+
+def _cuda_report(probe: bool, refresh: bool) -> dict[str, Any]:
+    """Blocking (subprocess probe): run in a worker thread.  Never raises; the probe runs in a child so this process gets no CUDA context."""
+    with _cuda_lock:  # one probe at a time; concurrent callers reuse its result
+        hit = _cuda_cache.get(probe)
+        if hit and not refresh and time.monotonic() - hit[0] < _CUDA_TTL_S:
+            return hit[1]
+        try:
+            from forge.hw import cuda_compat
+
+            rep = cuda_compat.check(probe=probe)
+        except Exception as e:  # a broken driver stack must not 500 the dashboard
+            rep = {"ok": False, "worst": "fail", "stack": {}, "findings": [], "recommend": {}, "error": f"{type(e).__name__}: {e}"}
+        _cuda_cache[probe] = (time.monotonic(), rep)
+        return rep
+
+
+@router.get("/cuda", summary="CUDA stack check: driver / torch / GPU / Triton compatibility (cached ~60 s)")
+async def cuda(
+    refresh: bool = Query(False, description="Bypass the cache."),
+    probe: bool = Query(True, description="Run the per-device allocation test (in a subprocess)."),
+) -> dict[str, Any]:
+    return await run_in_threadpool(_cuda_report, probe, refresh)
 
 
 @router.get("/gpus", summary="Live GPU telemetry")

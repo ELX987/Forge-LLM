@@ -222,7 +222,53 @@ def _smi(*query_args: str) -> list[str]:
         return [f"nvidia-smi unavailable: {e}"]
 
 
+def _load_cuda_compat():
+    """forge.hw.cuda_compat is stdlib-only; import it from the source tree even when forge is not installed.  None on failure."""
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import importlib
+
+        return importlib.import_module("forge.hw.cuda_compat")
+    except Exception:  # noqa: BLE001 - fall back to the built-in logic
+        return None
+
+
 def cuda_health_report() -> dict:
+    """Stack + device check via forge.hw.cuda_compat.check (driver <-> torch build <-> GPU arch <-> triton, then an allocation
+    probe in a subprocess).  Falls back to :func:`_legacy_cuda_health_report` when the module cannot be imported.  ``ok`` stays
+    "every visible device is usable" and additionally requires that no compatibility rule failed."""
+    cc = _load_cuda_compat()
+    if cc is None:
+        return _legacy_cuda_health_report()
+    try:
+        chk = cc.check(probe=True)
+    except Exception:  # noqa: BLE001
+        return _legacy_cuda_health_report()
+    probe = (chk["stack"].get("probe") or {})
+    devices = []
+    for d in probe.get("devices") or []:
+        rec = {"index": d.get("torch_index"), "ok": bool(d.get("ok"))}
+        if rec["ok"]:
+            rec["sum"] = d.get("sum")
+        else:
+            rec["error"] = d.get("error") or "?"
+        devices.append(rec)
+    rep: dict = {"devices": devices, "compute_mode": _smi("--query-gpu=index,compute_mode,persistence_mode,mig.mode.current",
+                                                          "--format=csv,noheader"),
+                 "compute_apps": _smi("--query-compute-apps=gpu_uuid,pid,process_name,used_memory", "--format=csv,noheader"),
+                 "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                 "NVIDIA_VISIBLE_DEVICES": os.environ.get("NVIDIA_VISIBLE_DEVICES", ""),
+                 "source": "forge.hw.cuda_compat", "stack": chk["stack"], "findings": chk["findings"],
+                 "recommend": chk["recommend"], "report_text": cc.format_report(chk)}
+    if probe.get("error"):
+        rep["error"] = probe["error"]
+    rep["ok"] = bool(devices) and all(d["ok"] for d in devices) and bool(chk["ok"])
+    rep["usable_devices"] = [d["index"] for d in devices if d["ok"]]
+    return rep
+
+
+def _legacy_cuda_health_report() -> dict:
     """Can torch actually allocate on each visible device?  torch.cuda.is_available() only says the driver loaded; a device in
     exclusive/prohibited compute mode, held by another process, or not passed through to the container still fails on first use
     (cudaErrorDevicesUnavailable) and makes every GPU test fail identically before any Forge code runs."""
@@ -271,6 +317,8 @@ def format_cuda_banner(rep: dict) -> str:
                   "Quick check outside Forge:  python -c \"import torch; print(torch.ones(1, device='cuda'))\""]
     if rep["usable_devices"] and bad:
         lines += ["", f"Some devices work: re-run with CUDA_VISIBLE_DEVICES={','.join(map(str, rep['usable_devices']))}"]
+    if rep.get("report_text"):
+        lines += ["", "CUDA stack check (forge.hw.cuda_compat):", *[f"  {ln}" for ln in rep["report_text"].splitlines()]]
     lines.append(bar)
     return "\n".join(lines)
 
@@ -283,6 +331,8 @@ def cmd_cuda_health(argv: list[str]) -> int:
     (report_dir / "cuda_health.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
     if rep["ok"]:
         print(f"[cuda] {len(rep['devices'])} device(s) usable", flush=True)
+        if rep.get("report_text"):
+            print(rep["report_text"], flush=True)
         return 0
     print(format_cuda_banner(rep), flush=True)
     return 3
@@ -435,6 +485,27 @@ def _parse_junit(path: Path) -> dict:
     return out
 
 
+def _cuda_stack_md(cuda_health: dict | None) -> list[str]:
+    """'CUDA stack' markdown section from cuda_health.json (empty when the check did not use forge.hw.cuda_compat)."""
+    stack = (cuda_health or {}).get("stack")
+    if not stack:
+        return []
+    torch = stack.get("torch") or {}
+    out = ["## CUDA stack", "",
+           f"- driver: `{stack.get('driver_version')}`", f"- driver CUDA: `{stack.get('driver_cuda')}`",
+           f"- torch CUDA: `{torch.get('cuda')}` (torch `{torch.get('version')}`)", f"- nvcc: `{stack.get('nvcc')}`",
+           f"- triton: `{stack.get('triton')}`", f"- torch arch list: `{' '.join(torch.get('arch_list') or [])}`"]
+    for d in stack.get("devices") or []:
+        out.append(f"- GPU {d.get('index')}: `{d.get('name')}` sm_{d.get('sm')} ({d.get('compute_mode')})")
+    out += ["", "Findings:", ""]
+    for f in cuda_health.get("findings") or []:
+        out.append(f"- **{str(f.get('level')).upper()}** `{f.get('code')}`: {f.get('message')}")
+        if f.get("fix"):
+            out.append(f"  - fix: {f['fix']}")
+    out.append("")
+    return out
+
+
 def cmd_finalize(argv: list[str]) -> int:
     report_dir = Path(argv[0])
     env = _load(report_dir / "env.json", {})
@@ -461,6 +532,7 @@ def cmd_finalize(argv: list[str]) -> int:
     md: list[str] = ["# Forge GPU report", "", f"Generated: {report['generated']}", f"Overall: **{overall}**", ""]
     if cuda_unusable:
         md += ["**CUDA unusable on this host - no GPU test ran.**", "", "```", *[json.dumps(d) for d in cuda_health["devices"]], *cuda_health.get("compute_mode", []), "```", ""]
+    md += _cuda_stack_md(cuda_health)
     md += ["## Environment", ""]
     for k in ("python", "platform", "torch", "torch_cuda", "triton", "transformers", "forge", "fastapi", "uvicorn", "zstandard",
               "cuda_available", "fp32_matmul_precision", "allow_tf32_matmul", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "NVIDIA_TF32_OVERRIDE"):

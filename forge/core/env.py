@@ -131,6 +131,16 @@ def _driver_version() -> str | None:
     return None
 
 
+def _driver_cuda() -> str | None:
+    """Newest CUDA version the driver supports (NVML / nvidia-smi header; no probing, never raises)."""
+    try:
+        from forge.hw import cuda_compat
+
+        return cuda_compat.detect_stack(probe=False).get("driver_cuda")
+    except Exception:
+        return None
+
+
 def gpu_fingerprint(gpus: list[dict[str, Any]] | None = None, driver: str | None = None) -> str | None:
     """Stable hash over GPU names/sm/memory + driver, or None without GPUs."""
     if gpus is None:
@@ -155,6 +165,7 @@ def capture_environment() -> dict[str, Any]:
         "torch": torch_info,
         "triton": _pkg_version("triton"),
         "cuda_driver": driver,
+        "cuda_driver_cuda": _driver_cuda(),
         "gpu_fingerprint": gpu_fingerprint(torch_info.get("gpus"), driver),
         "git_sha": git_sha(),
         "packages": versions,

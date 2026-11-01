@@ -386,3 +386,5 @@ the achieved-bandwidth ratio of the two kernels.
 Follow `docs/runbooks/adding-a-chip-descriptor.md`: add an entry to `forge/hw/chips.py::KNOWN_CHIPS`, extend the
 capability rules, add an example descriptor under `configs/chips/`, run `forge probe` on the real device, and only
 then upgrade the chip's tier from C to B/A.
+
+Kernels need a working CUDA stack (driver <-> torch build <-> GPU architecture <-> Triton); see `docs/CUDA_COMPAT.md`.

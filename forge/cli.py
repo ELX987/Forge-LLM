@@ -511,6 +511,20 @@ def collect_doctor() -> dict[str, Any]:
     except Exception as e:
         rep["info"]["capabilities"] = f"unavailable: {type(e).__name__}: {e}"
 
+    # --- CUDA stack (driver <-> torch build <-> GPU arch <-> triton) -------------------------------
+    try:
+        from forge.hw import cuda_compat
+
+        # probe (a throwaway subprocess that allocates on each GPU) only where there is something to probe
+        crep = cuda_compat.check(probe=bool(smi) and bool(pk.get("torch")), probe_timeout=60.0)
+        rep["info"]["cuda_compat"] = crep
+        for f in crep["findings"]:
+            if f["code"] == "no_nvidia_driver":
+                continue  # already reported by the nvidia-smi / gpu checks above (CPU-only hosts stay at warn)
+            add(f["level"], f"cuda:{f['code']}", f["message"] + (f" -> {f['fix']}" if f.get("fix") and f["level"] in ("warn", "fail") else ""))
+    except Exception as e:
+        add("warn", "cuda:check", f"CUDA compatibility check unavailable: {type(e).__name__}: {e}")
+
     # --- forge modules ------------------------------------------------------------------------
     mods = {}
     for m in ("store", "hw", "kernels", "formats", "models", "compress", "train", "serve", "eval", "planner"):
@@ -561,6 +575,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for c in rep["checks"]:
             print(f"{tag.get(c['level'], '[ ?? ]')} {c['name']}: {c['detail']}")
     return 1 if any(c["level"] == "fail" for c in rep["checks"]) else 0
+
+
+def cmd_cuda_check(args: argparse.Namespace) -> int:
+    from forge.hw import cuda_compat
+
+    rep = cuda_compat.check(probe=not args.no_probe)
+    print(json.dumps(rep, indent=2) if args.json else cuda_compat.format_report(rep))
+    return 1 if not rep["ok"] or (args.strict and rep["worst"] == "warn") else 0
 
 
 # --------------------------------------------------------------------------------------------
@@ -674,6 +696,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="check the environment (python, torch, GPUs, triton, modules, disk)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("cuda-check", help="check the driver / torch / GPU / Triton CUDA stack (CUDA 12.x - 13.4) and say what to fix")
+    p.add_argument("--json", action="store_true", help="print the full report as JSON")
+    p.add_argument("--no-probe", action="store_true", help="skip the per-device allocation test (no torch import)")
+    p.add_argument("--strict", action="store_true", help="exit 1 on warnings too")
+    p.set_defaults(fn=cmd_cuda_check)
     return ap
 
 

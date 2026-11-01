@@ -43,6 +43,7 @@ Details: [`docs/VAST_AI.md`](docs/VAST_AI.md).
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module layout, ownership, public APIs, conventions |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | Using the UI and CLI |
 | [`docs/KERNELS.md`](docs/KERNELS.md) | Kernel catalog and validation status |
+| [`docs/CUDA_COMPAT.md`](docs/CUDA_COMPAT.md) | CUDA driver / torch / GPU / Triton compatibility check (CUDA 12.x, 13.0-13.4) |
 | [`docs/API.md`](docs/API.md) | REST API reference |
 | [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) | Every configuration option |
 | [`configs/`](configs) | Ready-to-use config and recipe templates |

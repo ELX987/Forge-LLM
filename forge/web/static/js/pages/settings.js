@@ -2,7 +2,7 @@
 
 import { h, clear } from '../util.js';
 import { api, tryGet } from '../api.js';
-import { pageHead, card, kv, toast, toastError, objectView, notice, badge, confirmDialog } from '../components/ui.js';
+import { cudaBanner, pageHead, card, kv, toast, toastError, objectView, notice, badge, confirmDialog } from '../components/ui.js';
 import { getToken, setToken, getTheme, setTheme, prefs, isMockMode, setMockMode } from '../state.js';
 
 export default async function render(ctx) {
@@ -37,6 +37,6 @@ export default async function render(ctx) {
   if (!ctx.isActive()) return;
   clear(infoHost);
   if (!r.ok) infoHost.appendChild(r.unavailable ? notice('unavailable', 'No /system/info endpoint', 'The server did not expose system information.') : notice('error', 'Server unreachable', r.error.message));
-  else infoHost.appendChild(objectView(r.data));
+  else infoHost.append(cudaBanner(async (refresh) => { const c = await tryGet('/system/cuda', refresh ? { refresh: 1 } : undefined); return c.ok ? c.data : null; }), objectView(r.data));
   void kv; void badge; void toastError;
 }

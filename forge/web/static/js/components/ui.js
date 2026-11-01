@@ -349,3 +349,20 @@ export function dataTable({ columns, rows = [], onRowClick, empty = 'Nothing her
 }
 
 export { fmtTime };
+
+// ------------------------------------------------------------------ CUDA stack banner (GET /system/cuda); hidden unless worst is warn/fail
+export function cudaBanner(fetchReport) {
+  const host = h('div');
+  const paint = (rep) => {
+    clear(host);
+    const bad = rep && (rep.worst === 'warn' || rep.worst === 'fail');
+    if (!rep || (!bad && !rep.error)) return;
+    const items = (rep.findings || []).filter((f) => f.level === 'warn' || f.level === 'fail');
+    if (rep.error) items.push({ level: 'fail', message: rep.error });
+    const btn = h('button', { class: 'btn sm', onclick: async () => { btn.disabled = true; try { paint(await fetchReport(true)); } catch (_) { btn.disabled = false; } } }, 'Re-check');
+    host.appendChild(notice(rep.worst === 'fail' || rep.error ? 'error' : 'unavailable', rep.worst === 'fail' || rep.error ? 'CUDA stack problem' : 'CUDA stack warning',
+      h('div', items.map((f) => h('p', { class: 'small' }, h('b', f.message), f.fix ? h('span', { class: 'muted' }, ' - ' + f.fix) : null))), h('div', { class: 'row mt-s' }, btn)));
+  };
+  fetchReport(false).then(paint).catch(() => {});
+  return host;
+}

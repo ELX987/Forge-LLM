@@ -21,6 +21,19 @@ step() { "$PY" "$HELPER" step "$REPORT_DIR" "$@"; }
 
 "$PY" "$HELPER" env "$REPORT_DIR"
 
+# CUDA stack check (driver <-> torch build <-> GPU arch <-> triton + allocation probe): stop with its report when it fails,
+# instead of letting every later step fail with an opaque CUDA error. FORGE_SKIP_CUDA_CHECK=1 runs anyway.
+CUDA_RC=0
+PYTHONPATH="$FORGE_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m forge.hw.cuda_compat >"$REPORT_DIR/cuda_compat.txt" 2>&1 || CUDA_RC=$?
+cat "$REPORT_DIR/cuda_compat.txt"
+if [ "$CUDA_RC" -ne 0 ]; then
+    if [ "${FORGE_SKIP_CUDA_CHECK:-0}" != "1" ]; then
+        err "CUDA stack check failed (report above, saved to $REPORT_DIR/cuda_compat.txt). Set FORGE_SKIP_CUDA_CHECK=1 to run anyway."
+        "$PY" "$HELPER" finalize "$REPORT_DIR" || true
+        exit 3
+    fi
+fi
+
 step torch_cuda --allow-fail --timeout 300 -- "$PY" - <<'EOF'
 import torch
 assert torch.cuda.is_available(), "torch.cuda.is_available() is False"
