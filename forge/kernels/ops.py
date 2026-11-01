@@ -14,13 +14,13 @@ _MODULES = ("forge.kernels.ops_gemm", "forge.kernels.ops_attn", "forge.kernels.o
 #: ops promised by docs/ARCHITECTURE.md 5.5 (checked by available_ops and the tests)
 _DOCUMENTED = (
     "w4a16_linear", "w8a16_linear", "fp8_linear", "quantize_act_fp8", "int8_linear", "quantize_act_int8", "fp4_linear",
-    "quantize_act_fp4", "make_packed_linear", "last_path",
+    "quantize_act_fp4", "make_packed_linear", "last_path", "ternary_linear", "quantize_act_ternary",
     "paged_decode_attention", "prefill_attention", "sparse_topk_attention", "tree_attention", "mla_decode_attention",
     "moe_route", "moe_permute", "moe_unpermute", "grouped_gemm",
     "hadamard_transform", "quantize_fp8_rowwise", "stochastic_round", "rmsnorm_quant", "rope_and_kv_write",
     "rejection_verify", "kv_compact", "topk_select",
 )
-_GEMM_OPS = _DOCUMENTED[:10]
+_GEMM_OPS = _DOCUMENTED[:12]
 _INDEX: dict[str, str] | None = None
 _NOT_EXPORTED = {"bench_cases", "catalog_entries", "KERNELS"}
 

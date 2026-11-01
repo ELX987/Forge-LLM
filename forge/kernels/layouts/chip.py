@@ -48,6 +48,8 @@ class ChipInfo:
     has_fp4_block_scaled: bool = False
     has_cp_async: bool = False
     has_tma: bool = False
+    has_int8: bool = False  # int8 tensor cores present (sm_75+)
+    int8_tc_fast: bool = True  # False where the INT8 pipe is throttled (sm_103 B300/GB300: ~1/30 of FP8)
     hbm_gbs: float | None = None
     l2_mb: float | None = None
     total_mem_gb: float | None = None
@@ -56,6 +58,11 @@ class ChipInfo:
     @property
     def is_cuda(self) -> bool:
         return self.sm is not None
+
+    @property
+    def has_int8_fast(self) -> bool:
+        """Int8 tensor cores that are worth using (present and not throttled)."""
+        return self.has_int8 and self.int8_tc_fast
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -96,6 +103,8 @@ def chip_from_sm(sm: int | None, name: str | None = None, **over: Any) -> ChipIn
         has_fp4_block_scaled=bool(d["fp4"]),
         has_cp_async=bool(d["cp_async"]),
         has_tma=bool(d["tma"]),
+        has_int8=sm >= 75,
+        int8_tc_fast=sm != 103,
     )
     kw.update(over)
     return ChipInfo(**kw)

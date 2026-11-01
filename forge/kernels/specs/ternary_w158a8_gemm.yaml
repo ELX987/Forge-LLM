@@ -1,0 +1,33 @@
+# ADR 0007: ternary (1.58-bit) weights x int8 activations. EXPERIMENTAL; every kpi / search value is an UNMEASURED target.
+kernel: ternary_w158a8_gemm
+family: gemm
+op: "Y[M,N] = sx[M] * sum_g sw[N,g] * (Xq[M,Kg] @ T[N,Kg]^T)_int32 + bias, T in {-1,0,+1} stored as 2-bit codes"
+description: INT8 activations x 2-bit ternary weights -> INT32 accumulation per scale group, fp32 group scales applied when a group completes, per-token scale in the epilogue.
+dtypes: {x: int8, w: ternary, scale: fp32, acc: int32, y: bf16}
+compute_dtype: int8
+quant:
+  weight_bits: 1.58
+  group: [-1, 0, 32, 64, 128, 256]
+  zero_point: none
+  scale_apply: epilogue
+  act_scaling: per_token
+  weight_scaling: per_group
+shape_hints: {M: [1, 16, 128, 1024, 4096], N: model_native, K: model_native}
+search:
+  tile_m: [16, 64, 128]
+  tile_n: [64, 128]
+  tile_k: [128, 256]
+  stages: [2, 3, 4]
+  warps: [4, 8]
+  split_k: [1]
+fusion: {prologue: [act_absmax_quant], epilogue: [bias]}
+layout: {weights: ternary2_row, scales: fp32_NxG, align_bytes: 16}
+oracle: ref.ternary_gemm_ref
+tolerance: {rel: 1.0e-5, abs: 1.0e-6, rel_norm: 1.0e-5, bitexact_int_paths: true}
+kpi: {tflops_fraction_min: 0.8, at_M: [4096], note: "target: >= 80% of tern158's hand-written mma kernel (346-411 TOPS on sm_120); unmeasured for the Triton kernel"}
+min_sm: 75
+experimental: true
+notes:
+  - "Triton planes kernel (group %128 / row / tensor) and gather kernel (group 32/64): interpreter-checked and compiled offline for sm_80/89/120 (int8 mma.sync m16n8k32); NOT run on a GPU."
+  - "int8 throttled on sm_103 (B300/GB300): the dispatcher uses the torch oracle path there (a bf16 dequant+cuBLAS route is planned)."
+  - "Activation quantiser follows tern158 (q = round(x * 127/max)), which can differ from the int8_w8a8 quantiser (x / (max/127)) on rare ties."

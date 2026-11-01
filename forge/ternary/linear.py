@@ -81,7 +81,9 @@ class T158Linear(PackedLinear):
         return {"group_size": self.group_size, "layout": TERNARY2_ROW.id}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return ternary_linear_ref(x, self.qweight, self.scales, self.group_size, self.in_features, self.bias)
+        from forge.kernels.ops_gemm import ternary_linear
+
+        return ternary_linear(x, self.qweight, self.scales, self.group_size, self.in_features, None if self.bias is None else self.bias.to(x.dtype))
 
 
 @register_linear("fq_t158")

@@ -148,3 +148,38 @@ def test_format_registry_and_label():
     w = torch.randn(4, 64)
     assert torch.equal(fake_quantize(w, "ternary", group_size=32), tn.fake_quant_ternary(w, 32))
     assert quant_label({"t158": 3}, {}) == "Ternary 1.58b"
+
+
+# ------------------------------------------------------------------------------------------------ P4: dispatch on CPU, catalog, chip flags
+def test_ternary_linear_reference_path_on_cpu_equals_oracle(monkeypatch):
+    from forge.kernels import ops_gemm as O
+
+    monkeypatch.delenv("TRITON_INTERPRET", raising=False)
+    p = quantize_pack_ternary(torch.randn(24, 64), 32)
+    x = torch.randn(3, 5, 64)
+    y = O.ternary_linear(x, p.qweight, p.scales, 32, 64)
+    assert O.last_path("ternary_linear") == "reference"
+    assert torch.equal(y, ternary_linear_ref(x, p.qweight, p.scales, 32, 64))
+    assert "ternary_linear" in __import__("forge.kernels.ops", fromlist=["x"]).available_ops()
+
+
+def test_chip_info_int8_flags_and_catalog_gating():
+    from forge.kernels.catalog import get_kernel, list_kernels
+    from forge.kernels.layouts.chip import chip_from_sm
+
+    assert chip_from_sm(120).has_int8_fast and chip_from_sm(75).has_int8_fast and not chip_from_sm(70).has_int8
+    b300 = chip_from_sm(103)
+    assert b300.has_int8 and not b300.int8_tc_fast and not b300.has_int8_fast
+    names = {r["name"] for r in list_kernels()}
+    assert "ternary_w158a8_gemm" in names
+    row = get_kernel("ternary_w158a8_gemm", b300)
+    assert row["available"] is False or row.get("native") is False or any("INT8" in str(r) for r in row.get("reasons", row.get("unavailable_reasons", [])))
+
+
+def test_ternary_bench_case_builds_and_runs_on_cpu():
+    from forge.kernels.bench import BenchConfig, gemm_bench_cases
+
+    case = next(c for c in gemm_bench_cases() if c["name"] == "ternary_w158a8_gemm")
+    b = case["build"]({"M": 4, "N": 32, "K": 128}, torch.float32, "cpu", BenchConfig())
+    run, ref = b["run"](), b["ref"]()
+    assert run.shape == ref.shape == (4, 32) and torch.allclose(run, ref, rtol=1e-5, atol=1e-5) and b["spec"] == "ternary_w158a8_gemm"

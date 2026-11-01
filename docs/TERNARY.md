@@ -1,6 +1,11 @@
 # Ternary (1.58-bit) in Forge
 
-> Status: **phases P1-P3 done (CPU path).** P3 adds: `ternarize` recipe stage and `ptq format=ternary` (`forge/ternary/convert.py`), `pack` validation,
+> Status: **phases P1-P4 done on CPU; P4 kernels are interpreter-checked and PTX-compiled only.** P4 adds: Triton ternary GEMM (planes + gather kernels) and
+> tern158-exact activation quantiser (`forge/kernels/triton/gemm_ternary.py`), `ops_gemm.ternary_linear` dispatcher (used by `t158` layers), spec
+> `ternary_w158a8_gemm`, `ChipInfo.has_int8/int8_tc_fast`, catalog gating, bench case + `scripts/bench_ternary.py` (CUDA-graph timing, plan-only without GPU),
+> `tests_gpu/test_kernels_ternary.py`, and the optional native CUDA tier `forge/native/ternary` (renamed `forge_ternary_C`, type-checked, NOT wired into dispatch).
+> Note: Triton emits `mma.sync ... satfinite` for int8; accumulators cannot saturate at these magnitudes. No GPU run exists: all GPU/perf cells are 'no'.
+> **P1-P3:** P3 adds: `ternarize` recipe stage and `ptq format=ternary` (`forge/ternary/convert.py`), `pack` validation,
 > gate `g-t158` (TARGET placeholders), recipes `ternary-ptq` / `ternary-convert`, LoRA-on-ternary test, planner Scheme `t158` + prior,
 > training simulator `forge/planner/trainsim.py` + `POST /planner/train-sim`, chip table fields (`tdp_w`, `pcie_gbs`, `int8_tc_fast`) + RTX PRO 6000 preset.
 > NOT in P3 (deferred): planner rule R-Q7-TERNARY and T158 claims (the claims-seed tests tie claims to rules), simulator UI panel (P6), HF conversion on

@@ -295,6 +295,30 @@ def _build_int8(shape: dict[str, int], dtype: torch.dtype, device: str, cfg: Ben
     }
 
 
+def _build_ternary(shape: dict[str, int], dtype: torch.dtype, device: str, cfg: BenchConfig) -> dict[str, Any]:
+    from forge.formats import ternary as tn
+    from forge.kernels import ops_gemm
+    from forge.kernels.layouts.ternary import quantize_pack_ternary
+    from forge.kernels.ref.gemm_ternary import ternary_gemm_ref
+
+    w = _weights(shape, device, cfg.seed)
+    group = 128 if shape["K"] % 128 == 0 else -1
+    p = quantize_pack_ternary(w, group)
+    x = _act(shape, dtype, device, cfg.seed)
+    xq, sx = tn.act_quant_int8(x)
+    dense = p.dequantize(torch.float32).to(dtype)
+    return {
+        "run": lambda: ops_gemm.ternary_linear(x, p.qweight, p.scales, group, shape["K"], out_dtype=dtype),
+        "ref": lambda: ternary_gemm_ref(xq, sx, p.qweight, p.scales, group, shape["K"], torch.float32),
+        "bytes": p.nbytes + _io_bytes(shape, dtype),
+        "flops": 2 * shape["M"] * shape["N"] * shape["K"],
+        "baseline": lambda: F.linear(x, dense),
+        "layout_id": p.layout_id,
+        "path": lambda: ops_gemm.last_path("ternary_linear") or "?",
+        "spec": "ternary_w158a8_gemm",
+    }
+
+
 def _make_fp4_builder(fmt: str, act_quant: str) -> Callable[..., dict[str, Any]]:
     def build(shape: dict[str, int], dtype: torch.dtype, device: str, cfg: BenchConfig) -> dict[str, Any]:
         from forge.kernels import ops_gemm
@@ -331,6 +355,8 @@ def gemm_bench_cases() -> list[dict[str, Any]]:
         dict(name="fp8_gemm", kernel="fp8_gemm", description="FP8 E4M3 W8A8 GEMM, per-token x per-channel scales", min_sm=70, build=_build_fp8),
         dict(name="fp8_act_quant", kernel="fp8_gemm", description="Per-token FP8 activation quantiser", min_sm=70, build=_build_fp8_quant),
         dict(name="int8_w8a8_gemm", kernel="int8_w8a8_gemm", description="INT8 W8A8 GEMM", min_sm=75, build=_build_int8),
+        dict(name="ternary_w158a8_gemm", kernel="ternary_w158a8_gemm", description="Ternary 1.58-bit weights x int8 activations GEMM [experimental]", min_sm=75,
+             build=_build_ternary),
         dict(name="fp4_nvfp4_gemm", kernel="fp4_block_gemm", description="NVFP4 weight-only GEMM (dequant kernel) [experimental]", min_sm=70,
              build=_make_fp4_builder("nvfp4", "none")),
         dict(name="fp4_mxfp4_gemm", kernel="fp4_block_gemm", description="MXFP4 weight-only GEMM (dequant kernel) [experimental]", min_sm=70,
