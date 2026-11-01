@@ -110,9 +110,21 @@ def _cuda_report(probe: bool, refresh: bool) -> dict[str, Any]:
 @router.get("/cuda", summary="CUDA stack check: driver / torch / GPU / Triton compatibility (cached ~60 s)")
 async def cuda(
     refresh: bool = Query(False, description="Bypass the cache."),
-    probe: bool = Query(True, description="Run the per-device allocation test (in a subprocess)."),
+    probe: bool = Query(False, description="Run the per-device allocation test (in a subprocess). Skipped while Forge jobs hold GPUs unless force=1."),
+    force: bool = Query(False, description="Run the allocation probe even though Forge jobs are running on GPUs."),
+    svc: Services = Depends(get_services),
 ) -> dict[str, Any]:
-    return await run_in_threadpool(_cuda_report, probe, refresh)
+    skipped: str | None = None
+    if probe and not force:
+        try:
+            busy = sorted(svc.jobs.busy_gpus())
+        except Exception:  # job bookkeeping must not break the check
+            busy = []
+        if busy:
+            probe = False
+            skipped = f"allocation probe skipped: Forge jobs are running on GPU(s) {busy}; pass force=1 to probe anyway"
+    rep = await run_in_threadpool(_cuda_report, probe, refresh)
+    return {**rep, "probe_skipped": skipped} if skipped else rep
 
 
 @router.get("/gpus", summary="Live GPU telemetry")

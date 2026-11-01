@@ -18,6 +18,12 @@ FINDINGS = [{"level": "fail", "code": "torch_cuda_newer_minor", "message": "torc
 MSG = "CUDA stack problem: torch CUDA 13.4 > driver CUDA 13.0 -> use driver >= 595.91.07"
 
 
+@pytest.fixture(autouse=True)
+def no_disk_cache(monkeypatch):
+    """Default: no fingerprint -> the on-disk success cache is bypassed (the cache tests below opt in)."""
+    monkeypatch.setattr(cuda_gate, "fingerprint", lambda env: None)
+
+
 @pytest.fixture
 def probe(monkeypatch):
     """Replace assert_cuda_usable with a counting fake; ``probe.fail`` toggles the failure."""
@@ -101,6 +107,137 @@ def test_failure_is_rechecked_each_time(probe):
     assert probe["calls"] == 2
     probe["fail"] = False
     cuda_gate.gate_cuda(True)
+
+
+@pytest.mark.parametrize("dev", ["cpu", "CPU", "cpu:0", " cpu "])
+def test_params_device_cpu_not_gated(probe, dev):
+    cuda_gate.gate_cuda(True, params={"device": dev})
+    assert probe["calls"] == 0
+
+
+@pytest.mark.parametrize("params", [None, {}, {"device": "auto"}, {"device": "cuda:1"}, {"device": None}, {"device": 3}])
+def test_params_without_cpu_still_gated(probe, params):
+    with pytest.raises(HardwareUnsupported):
+        cuda_gate.gate_cuda(True, params=params)
+
+
+# -- on-disk success cache ----------------------------------------------------------------------------------------------------
+FP = {"driver_version": "580.65.06", "driver_cuda": "13.0", "torch": "2.11.0", "cuda_visible_devices": "0"}
+
+
+@pytest.fixture
+def disk(monkeypatch, tmp_path):
+    state = {"fp": dict(FP)}
+    monkeypatch.setattr(cuda_gate, "fingerprint", lambda env: state["fp"])
+    state["path"] = tmp_path / "cache" / "cuda_gate.json"
+    return state
+
+
+def _gate(disk, now):
+    cuda_gate.gate_cuda(True, now=now, path=disk["path"])
+
+
+def test_disk_cache_skips_check_within_ttl(probe, disk):
+    probe["fail"] = False
+    _gate(disk, 1000.0)
+    _gate(disk, 1000.0 + cuda_gate.CACHE_TTL_S - 1)
+    assert probe["calls"] == 1 and disk["path"].exists()
+
+
+def test_disk_cache_expires(probe, disk):
+    probe["fail"] = False
+    _gate(disk, 1000.0)
+    _gate(disk, 1000.0 + cuda_gate.CACHE_TTL_S + 1)
+    assert probe["calls"] == 2
+
+
+def test_disk_cache_future_timestamp_ignored(probe, disk):
+    probe["fail"] = False
+    _gate(disk, 1000.0)
+    _gate(disk, 500.0)  # clock went backwards
+    assert probe["calls"] == 2
+
+
+@pytest.mark.parametrize("key,val", [("driver_version", "590.1"), ("driver_cuda", "13.1"), ("torch", "2.12.0"), ("cuda_visible_devices", "1")])
+def test_disk_cache_invalidated_by_fingerprint_change(probe, disk, key, val):
+    probe["fail"] = False
+    _gate(disk, 1000.0)
+    disk["fp"] = {**FP, key: val}
+    _gate(disk, 1001.0)
+    assert probe["calls"] == 2
+
+
+def test_failure_never_cached_and_rechecked(probe, disk):
+    for t in (1000.0, 1001.0):
+        with pytest.raises(HardwareUnsupported):
+            _gate(disk, t)
+    assert probe["calls"] == 2 and not disk["path"].exists()
+    probe["fail"] = False
+    _gate(disk, 1002.0)
+    assert probe["calls"] == 3 and disk["path"].exists()
+
+
+def test_failure_after_cached_success_is_not_masked_after_change(probe, disk):
+    probe["fail"] = False
+    _gate(disk, 1000.0)
+    disk["fp"] = {**FP, "driver_version": "470.0"}
+    probe["fail"] = True
+    with pytest.raises(HardwareUnsupported):
+        _gate(disk, 1001.0)
+
+
+@pytest.mark.parametrize("blob", [b"", b"{not json", b"[]", b'{"ts": "x", "fingerprint": {}}', b'{"fingerprint": null}', b"\xff\xfe"])
+def test_corrupt_cache_ignored_and_rewritten(probe, disk, blob):
+    probe["fail"] = False
+    disk["path"].parent.mkdir(parents=True)
+    disk["path"].write_bytes(blob)
+    _gate(disk, 1000.0)
+    _gate(disk, 1001.0)
+    assert probe["calls"] == 1  # first run re-checked and healed the file, second hit it
+
+
+def test_unwritable_cache_does_not_break_gate(probe, disk, tmp_path):
+    probe["fail"] = False
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    cuda_gate.gate_cuda(True, now=1.0, path=blocker / "sub" / "cuda_gate.json")  # parent is a file -> cannot write
+    assert probe["calls"] == 1
+
+
+def test_no_fingerprint_means_no_cache(probe, disk):
+    probe["fail"] = False
+    disk["fp"] = None
+    _gate(disk, 1000.0)
+    _gate(disk, 1001.0)
+    assert probe["calls"] == 2 and not disk["path"].exists()
+
+
+def test_skip_env_does_not_touch_cache(probe, disk, monkeypatch):
+    monkeypatch.setenv("FORGE_SKIP_CUDA_CHECK", "1")
+    _gate(disk, 1000.0)
+    assert probe["calls"] == 0 and not disk["path"].exists()
+
+
+def test_default_cache_path_under_forge_home(home):
+    assert cuda_gate.cache_path() == Path(home) / "cache" / "cuda_gate.json" or cuda_gate.cache_path().name == "cuda_gate.json"
+    assert cuda_gate.cache_path().parent.name == "cache"
+
+
+def test_fingerprint_uses_nvml_then_smi_without_torch_or_probe(monkeypatch):
+    monkeypatch.undo()  # drop the autouse stub
+    monkeypatch.setattr(cuda_compat, "_nvml_facts", lambda: {"driver_version": "580.65.06"})
+    monkeypatch.setattr(cuda_compat, "_smi_facts", lambda: {"devices": [{"driver": "x"}], "driver_cuda": "13.0"})
+    monkeypatch.setattr(cuda_compat, "detect_stack", lambda **_: pytest.fail("must not run the full detection"))
+    monkeypatch.setattr(cuda_compat, "probe_devices", lambda *_a, **_k: pytest.fail("must not probe"))
+    fp = cuda_gate.fingerprint({"CUDA_VISIBLE_DEVICES": "0"})
+    assert fp["driver_version"] == "580.65.06" and fp["driver_cuda"] == "13.0" and fp["cuda_visible_devices"] == "0"
+
+
+def test_fingerprint_none_without_driver(monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(cuda_compat, "_nvml_facts", lambda: {})
+    monkeypatch.setattr(cuda_compat, "_smi_facts", lambda: {"present": False, "devices": []})
+    assert cuda_gate.fingerprint({}) is None
 
 
 # -- through the worker -------------------------------------------------------------------------------------------------------

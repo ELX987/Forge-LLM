@@ -37,6 +37,6 @@ export default async function render(ctx) {
   if (!ctx.isActive()) return;
   clear(infoHost);
   if (!r.ok) infoHost.appendChild(r.unavailable ? notice('unavailable', 'No /system/info endpoint', 'The server did not expose system information.') : notice('error', 'Server unreachable', r.error.message));
-  else infoHost.append(cudaBanner(async (refresh) => { const c = await tryGet('/system/cuda', refresh ? { refresh: 1 } : undefined); return c.ok ? c.data : null; }), objectView(r.data));
+  else infoHost.append(cudaBanner(async (refresh, probe) => { const c = await tryGet('/system/cuda', { probe: probe ? 1 : 0, ...(refresh ? { refresh: 1 } : {}) }); return c.ok ? c.data : null; }), objectView(r.data));
   void kv; void badge; void toastError;
 }

@@ -7,7 +7,7 @@
 # Environment knobs (all optional):
 #   FORGE_HOME           state directory (default: /workspace/forge-home if /workspace exists, else ~/.forge)
 #   FORGE_USE_VENV       1 = install into a venv that can see the image's torch
-#   FORGE_INSTALL_TORCH  1 = pip install torch if missing / CPU-only (uses FORGE_TORCH_INDEX)
+#   FORGE_INSTALL_TORCH  1 = pip install torch if missing / CPU-only (uses FORGE_TORCH_INDEX; a CPU-only torch is force-replaced)
 #   FORGE_TORCH_INDEX    pip index URL for torch (default: chosen from the driver's CUDA version, e.g. .../whl/cu130)
 #   FORGE_SKIP_CUDA_CHECK 1 = do not abort (exit 3) when the CUDA stack check reports a failure (docs/CUDA_COMPAT.md)
 #   FORGE_EXTRAS         pip extras (default: gpu,serve,parquet,dev)
@@ -109,7 +109,14 @@ if ! torch_cuda_ok; then
             log "Auto-selected torch index $TORCH_INDEX from the driver's CUDA version"
         fi
         log "Installing torch from $TORCH_INDEX"
-        "$PY" -m pip install torch --index-url "$TORCH_INDEX"
+        TORCH_FORCE=()
+        # An installed CPU-only (e.g. PyPI) torch already satisfies "torch", so a plain install is a no-op: replace it explicitly.
+        # Container builds were refused above, so this only ever replaces a pip-installed torch.
+        if "$PY" -c 'import torch' >/dev/null 2>&1; then
+            log "Replacing the installed torch (it cannot see CUDA) with the build from that index"
+            TORCH_FORCE=(--upgrade --force-reinstall)
+        fi
+        "$PY" -m pip install ${TORCH_FORCE[@]+"${TORCH_FORCE[@]}"} torch --index-url "$TORCH_INDEX"
     fi
     if ! torch_cuda_ok; then
         err "torch is missing or cannot see CUDA. Either pick a PyTorch image, or re-run with FORGE_INSTALL_TORCH=1"
@@ -121,6 +128,24 @@ fi
 # ---- 6. Forge + triton -----------------------------------------------------------------------------
 log "Installing forge[$EXTRAS] (editable)"
 (cd "$FORGE_REPO_ROOT" && "$PY" -m pip install --quiet -e ".[$EXTRAS]")
+
+# ---- 6a. Persist environment (before the strict check: a failed check must not leave the host half-configured) ----
+{
+    echo "# written by scripts/vast_setup.sh - safe to delete, safe to edit"
+    echo "export FORGE_HOME=\"$FORGE_HOME\""
+    if [ -n "$FORGE_VENV" ]; then
+        echo "export FORGE_VENV=\"$FORGE_VENV\""
+    fi
+    echo "export HF_HOME=\"\${HF_HOME:-$FORGE_HOME/hf_cache}\""
+    echo "export TRITON_CACHE_DIR=\"\${TRITON_CACHE_DIR:-$FORGE_HOME/triton_cache}\""
+    echo "export HF_HUB_ENABLE_HF_TRANSFER=\"\${HF_HUB_ENABLE_HF_TRANSFER:-0}\""
+} >"$FORGE_ENV_FILE"
+mkdir -p "$FORGE_HOME/hf_cache" "$FORGE_HOME/triton_cache"
+BASHRC_LINE=". \"$FORGE_ENV_FILE\""
+if [ -f "$HOME/.bashrc" ] && ! grep -Fqx "$BASHRC_LINE" "$HOME/.bashrc"; then
+    echo "$BASHRC_LINE" >>"$HOME/.bashrc"
+fi
+log "Wrote $FORGE_ENV_FILE (sourced from ~/.bashrc)"
 
 # ---- 6b. CUDA stack gate (runs a device allocation probe in a subprocess) ---------------------------------
 log "CUDA stack check:"
@@ -163,24 +188,6 @@ EOF
             fi ;;
     esac
 done
-
-# ---- 7. Persist environment -------------------------------------------------------------------------
-{
-    echo "# written by scripts/vast_setup.sh - safe to delete, safe to edit"
-    echo "export FORGE_HOME=\"$FORGE_HOME\""
-    if [ -n "$FORGE_VENV" ]; then
-        echo "export FORGE_VENV=\"$FORGE_VENV\""
-    fi
-    echo "export HF_HOME=\"\${HF_HOME:-$FORGE_HOME/hf_cache}\""
-    echo "export TRITON_CACHE_DIR=\"\${TRITON_CACHE_DIR:-$FORGE_HOME/triton_cache}\""
-    echo "export HF_HUB_ENABLE_HF_TRANSFER=\"\${HF_HUB_ENABLE_HF_TRANSFER:-0}\""
-} >"$FORGE_ENV_FILE"
-mkdir -p "$FORGE_HOME/hf_cache" "$FORGE_HOME/triton_cache"
-BASHRC_LINE=". \"$FORGE_ENV_FILE\""
-if [ -f "$HOME/.bashrc" ] && ! grep -Fqx "$BASHRC_LINE" "$HOME/.bashrc"; then
-    echo "$BASHRC_LINE" >>"$HOME/.bashrc"
-fi
-log "Wrote $FORGE_ENV_FILE (sourced from ~/.bashrc)"
 
 # ---- 8. Versions -------------------------------------------------------------------------------------
 log "Versions:"

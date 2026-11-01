@@ -28,6 +28,7 @@ SSE event formats. All paths below are relative to the prefix **`/api/v1`**.
 | Method & path | Purpose |
 |---------------|---------|
 | `GET /system/info` | Versions, `FORGE_HOME`, store stats summary, capabilities of the current GPU, job counts, server time |
+| `GET /system/cuda` `?probe=0\|1&refresh=0\|1&force=0\|1` | CUDA stack check (driver / torch / GPU / Triton compatibility): `{ok, worst, stack, findings[{level, code, message, fix}], recommend}`; cached ~60 s, `refresh=1` bypasses. `probe=1` (default 0) also runs a per-GPU allocation test in a subprocess; it is skipped (static report plus a `probe_skipped` note) while Forge jobs hold GPUs unless `force=1`. Level `info` findings (e.g. `torch_cuda_newer_minor`) are informational only; never 5xx |
 | `GET /system/gpus` | Live GPU telemetry list (one sample per GPU) |
 | `GET /system/health` | Public liveness probe (no token needed) |
 | `GET /system/gpus/stream` | SSE of GPU telemetry |

@@ -134,7 +134,7 @@ def test_finalize_fails_when_cuda_was_unusable(rep_mod, tmp_path):
 
 
 class _FakeCompat:
-    """Stand-in for forge.hw.cuda_compat: a driver-CUDA-13.0 host with a CUDA 13.4 torch whose devices cannot allocate."""
+    """Stand-in for forge.hw.cuda_compat: a host whose devices fail the allocation test (cudaErrorDevicesUnavailable)."""
 
     def __init__(self, ok: bool = False):
         self._ok = ok
