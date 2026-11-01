@@ -125,3 +125,9 @@ def test_cuda_health_cmd_on_cpu_host_writes_json_and_fails(rep_mod, tmp_path, mo
     data = json.loads((tmp_path / "cuda_health.json").read_text(encoding="utf-8"))
     assert data["ok"] is False and data["devices"] == []
     assert "no CUDA device" in capsys.readouterr().out
+
+
+def test_finalize_fails_when_cuda_was_unusable(rep_mod, tmp_path):
+    (tmp_path / "cuda_health.json").write_text(json.dumps({"ok": False, "devices": [], "compute_mode": []}), encoding="utf-8")
+    assert rep_mod.cmd_finalize([str(tmp_path)]) == 1
+    assert "Overall: **FAIL**" in (tmp_path / "report.md").read_text(encoding="utf-8")

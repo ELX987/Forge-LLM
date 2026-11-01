@@ -443,7 +443,9 @@ def cmd_finalize(argv: list[str]) -> int:
     bench = _load(report_dir / "bench_summary.json", None)
     failed_steps = [s["name"] for s in steps if s["exit_code"] != 0]
     n_fail = sum(j.get("failures", 0) + j.get("errors", 0) for j in junits)
-    overall = "PASS" if not failed_steps and n_fail == 0 else "FAIL"
+    cuda_health = _load(report_dir / "cuda_health.json", None)
+    cuda_unusable = bool(cuda_health) and not cuda_health.get("ok", True)
+    overall = "PASS" if not failed_steps and n_fail == 0 and not cuda_unusable else "FAIL"
     report = {
         "generated": _now(),
         "overall": overall,
@@ -457,6 +459,8 @@ def cmd_finalize(argv: list[str]) -> int:
     (report_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     md: list[str] = ["# Forge GPU report", "", f"Generated: {report['generated']}", f"Overall: **{overall}**", ""]
+    if cuda_unusable:
+        md += ["**CUDA unusable on this host - no GPU test ran.**", "", "```", *[json.dumps(d) for d in cuda_health["devices"]], *cuda_health.get("compute_mode", []), "```", ""]
     md += ["## Environment", ""]
     for k in ("python", "platform", "torch", "torch_cuda", "triton", "transformers", "forge", "fastapi", "uvicorn", "zstandard",
               "cuda_available", "fp32_matmul_precision", "allow_tf32_matmul", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "NVIDIA_TF32_OVERRIDE"):
