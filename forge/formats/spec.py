@@ -40,6 +40,9 @@ def format_info(name: str, group_size: int | None = None, scale_bits: float = 16
         return FormatInfo(n, "fp4_block", 4, 16, 8, "E2M1 elements, 16-block E4M3 scale + FP32 tensor scale (4.5 b/elem)")
     if n == "mxfp4":
         return FormatInfo(n, "fp4_block", 4, 32, 8, "E2M1 elements, 32-block E8M0 scale (4.25 b/elem)")
+    if n in ("ternary", "t158", "bitnet158"):
+        blk = group_size if group_size and group_size > 0 else None
+        return FormatInfo("ternary", "ternary", 1.58496, blk, scale_bits if scale_bits != 16.0 else 32.0, "ternary {-1,0,+1} (log2 3 bits; stored in 2), fp32 group scales, int8 activations")
     m = re.fullmatch(r"(?:int|w)(\d+)", n)
     if m:
         bits = int(m.group(1))
@@ -68,6 +71,10 @@ def fake_quantize(x: torch.Tensor, fmt: str, **kw: Any) -> torch.Tensor:
         return _fp4.fake_quant_nvfp4(x, **kw)
     if n == "mxfp4":
         return _fp4.fake_quant_mxfp4(x, **kw)
+    if n in ("ternary", "t158", "bitnet158"):
+        from forge.formats import ternary as _tn
+
+        return _tn.fake_quant_ternary(x, kw.get("group_size", 128), kw.get("rule", "lloyd"), kw.get("iters", 1))
     m = re.fullmatch(r"(?:int|w)(\d+)", n)
     if m:
         kw.setdefault("group_size", 128)

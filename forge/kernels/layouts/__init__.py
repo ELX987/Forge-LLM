@@ -60,6 +60,7 @@ from .w4 import (
     sort_columns_by_group,
     unpack_w4,
 )
+from .ternary import TERNARY2_ROW, PackedTernary, pack_ternary_weight, quantize_pack_ternary, unpack_ternary_weight
 from .w8 import PackedW8, dequantize_w8_parts, pack_w8, unpack_w8
 
 __all__ = [n for n in dir() if not n.startswith("_")]

@@ -405,7 +405,7 @@ def _ensure_kind(kind: str) -> None:
         return
     except ConfigError:
         pass
-    for mod in ("forge.compress", "forge.compress.packed", "forge.compress.ptq", "forge.kernels", "forge.kernels.ops_gemm"):
+    for mod in ("forge.compress", "forge.compress.packed", "forge.compress.ptq", "forge.kernels", "forge.kernels.ops_gemm", "forge.ternary.linear"):
         try:
             importlib.import_module(mod)
         except Exception:

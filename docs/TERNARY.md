@@ -1,6 +1,7 @@
 # Ternary (1.58-bit) in Forge
 
-> Status: **skeleton (phase P0).** Nothing described below is implemented yet. See `docs/adr/0007-ternary-and-method-layer.md`
+> Status: **phase P1 done (CPU path).** Implemented and CPU-tested: numerics (`forge/formats/ternary.py`), layout `ternary2_row`, oracle,
+> `t158` / `fq_t158` linears, artifact save/load/serve, `.t158.safetensors` tensor-level import/export. Everything else below is planned. No GPU path exists or is validated. See `docs/adr/0007-ternary-and-method-layer.md`
 > and `plan-and-docs/Forge_Ternary_Merge_Plan.pdf` for the design and phased roadmap.
 
 ## What it is
