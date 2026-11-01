@@ -5,7 +5,7 @@ import { api, sse, tryGet } from '../api.js';
 import { cudaBanner, pageHead, card, stat, loadInto, poll, statusBadge, dataTable, progressBar, emptyState, notice, unavailableNotice, badge, provBadge } from '../components/ui.js';
 import { sparkline } from '../charts.js';
 
-const cudaReport = async (refresh) => { const r = await tryGet('/system/cuda', refresh ? { refresh: 1 } : undefined); return r.ok ? r.data : null; };
+const cudaReport = async (refresh, probe) => { const r = await tryGet('/system/cuda', { probe: probe ? 1 : 0, ...(refresh ? { refresh: 1 } : {}) }); return r.ok ? r.data : null; };
 
 export default async function render(ctx) {
   const root = ctx.root;

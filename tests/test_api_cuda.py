@@ -46,19 +46,40 @@ def test_cuda_report_shape_and_cache(client, fake_check):
 
 def test_cuda_probe_flag_and_separate_cache(client, fake_check):
     client.get(f"{API}/system/cuda", params={"probe": 0})
-    client.get(f"{API}/system/cuda")
+    client.get(f"{API}/system/cuda", params={"probe": 1})
     client.get(f"{API}/system/cuda", params={"probe": 0})
+    client.get(f"{API}/system/cuda", params={"probe": 1})
     assert [c["probe"] for c in fake_check] == [False, True]
+
+
+def test_cuda_probe_defaults_off(client, fake_check):
+    client.get(f"{API}/system/cuda")
+    assert [c["probe"] for c in fake_check] == [False]
 
 
 def test_cuda_cache_expires(client, fake_check, monkeypatch):
     from forge.api.routers import system
 
-    client.get(f"{API}/system/cuda")
+    client.get(f"{API}/system/cuda", params={"probe": 1})
     ts, rep = system._cuda_cache[True]
     system._cuda_cache[True] = (ts - system._CUDA_TTL_S - 1, rep)
-    client.get(f"{API}/system/cuda")
+    client.get(f"{API}/system/cuda", params={"probe": 1})
     assert len(fake_check) == 2
+
+
+def test_cuda_probe_skipped_while_jobs_hold_gpus(client, fake_check, monkeypatch):
+    jobs = client.app.state.services.jobs
+    monkeypatch.setattr(jobs, "busy_gpus", lambda: {0, 1})
+    body = client.get(f"{API}/system/cuda", params={"probe": 1}).json()
+    assert [c["probe"] for c in fake_check] == [False]  # static report only
+    assert "probe_skipped" in body and "[0, 1]" in body["probe_skipped"] and "force=1" in body["probe_skipped"]
+    body = client.get(f"{API}/system/cuda", params={"probe": 0}).json()
+    assert "probe_skipped" not in body and len(fake_check) == 1  # the static report is cached and carries no note
+    body = client.get(f"{API}/system/cuda", params={"probe": 1, "force": 1}).json()
+    assert [c["probe"] for c in fake_check] == [False, True] and "probe_skipped" not in body
+    monkeypatch.setattr(jobs, "busy_gpus", lambda: set())
+    client.get(f"{API}/system/cuda", params={"probe": 1, "refresh": 1})
+    assert [c["probe"] for c in fake_check] == [False, True, True]
 
 
 def test_cuda_never_raises(client, monkeypatch):

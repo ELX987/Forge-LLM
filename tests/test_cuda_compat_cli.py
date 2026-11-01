@@ -25,7 +25,8 @@ def _stack(torch_cuda: str, driver_cuda: str = "13.0", probe: dict | None = None
 HEALTHY = _stack("13.0", probe={"available": True, "device_count": 1, "devices": [{"torch_index": 0, "ok": True}]})
 BROKEN = _stack("13.4", probe={"available": True, "device_count": 1,
                                "devices": [{"torch_index": 0, "ok": False, "error": "CUDA-capable device(s) is/are busy or unavailable"}]})
-MISMATCH = _stack("13.4")  # driver 13.0 vs torch 13.4: warn only (no probe result)
+MISMATCH = _stack("13.4")  # driver 13.0 vs torch 13.4: NVIDIA-supported minor-version compatibility, informational only
+WARN_ONLY = {**HEALTHY, "triton": None}  # a genuine warn: Forge kernels would fall back to torch paths
 CPU_ONLY = {"driver_version": None, "driver_cuda": None, "smi_present": False, "smi_ok": False, "devices": [],
             "torch": {"installed": True, "version": "2.9.0+cpu", "cuda": None, "hip": None, "container_build": False, "arch_list": []},
             "triton": None, "nvidia_ml_py": None, "nvcc": None, "cuda_visible_devices": None, "platform": "win32"}
@@ -59,15 +60,21 @@ def test_cuda_check_healthy_exit_zero(stack_of, capsys):
 def test_cuda_check_broken_exit_one_and_explains(stack_of, capsys):
     stack_of(BROKEN)
     code, out, _ = run(["cuda-check"], capsys)
-    assert code == 1 and "[FAIL]" in out and "busy or unavailable" in out and "newer driver" in out
+    assert code == 1 and "[FAIL]" in out and "busy or unavailable" in out and "minor-version compatibility" in out
 
 
 def test_cuda_check_strict_fails_on_warn(stack_of, capsys):
-    stack_of(MISMATCH)
+    stack_of(WARN_ONLY)
     code, out, _ = run(["cuda-check"], capsys)
     assert code == 0 and "[warn]" in out
     code, _, _ = run(["cuda-check", "--strict"], capsys)
     assert code == 1
+
+
+def test_torch_newer_minor_than_driver_is_informational_even_when_strict(stack_of, capsys):
+    stack_of(MISMATCH)
+    code, out, _ = run(["cuda-check", "--strict"], capsys)
+    assert code == 0 and "[info]" in out and "[warn]" not in out and "[FAIL]" not in out
 
 
 def test_cuda_check_json_and_no_probe(stack_of, capsys):
@@ -118,11 +125,18 @@ def test_doctor_survives_a_crashing_cuda_check(monkeypatch):
 
 
 def test_capture_environment_has_driver_cuda(monkeypatch):
-    monkeypatch.setattr(cuda_compat, "detect_stack", lambda **_: {"driver_cuda": "13.0"})
+    smi_calls = []
+    monkeypatch.setattr(cuda_compat, "detect_stack", lambda **_: pytest.fail("full detect_stack must not run"))
+    monkeypatch.setattr(cuda_compat, "_nvml_facts", lambda: {"driver_cuda": "13.0"})
+    monkeypatch.setattr(cuda_compat, "_smi_facts", lambda: smi_calls.append(1) or {"driver_cuda": "12.8"})
     assert env.capture_environment()["cuda_driver_cuda"] == "13.0"
+    assert not smi_calls  # NVML answered, nvidia-smi not spawned
 
-    def boom(**_):
+    monkeypatch.setattr(cuda_compat, "_nvml_facts", lambda: {})
+    assert env.capture_environment()["cuda_driver_cuda"] == "12.8"
+
+    def boom(*_a, **_k):
         raise RuntimeError("no")
 
-    monkeypatch.setattr(cuda_compat, "detect_stack", boom)
+    monkeypatch.setattr(cuda_compat, "_nvml_facts", boom)
     assert env.capture_environment()["cuda_driver_cuda"] is None

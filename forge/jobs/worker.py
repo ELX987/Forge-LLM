@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         jt = get_job_type(spec["type"])
         (run_dir / "spec.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
-        gate_cuda(jt.needs_gpu)  # before anything here touches CUDA; raises HardwareUnsupported -> job fails with the diagnosis
+        gate_cuda(jt.needs_gpu, params=spec.get("params"))  # before anything here touches CUDA; raises HardwareUnsupported -> job fails with the diagnosis
         if jt.needs_gpu:
             threading.Thread(target=_write_env, args=(run_dir,), daemon=True).start()
         cfg_cls = jt.config_model()

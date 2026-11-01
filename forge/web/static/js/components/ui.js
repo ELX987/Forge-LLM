@@ -351,18 +351,22 @@ export function dataTable({ columns, rows = [], onRowClick, empty = 'Nothing her
 export { fmtTime };
 
 // ------------------------------------------------------------------ CUDA stack banner (GET /system/cuda); hidden unless worst is warn/fail
+// fetchReport(refresh, probe): the automatic load is static-only (probe=false); "Re-check (test GPUs)" runs the allocation probe.
+// Hidden on CPU-only hosts (no devices, or the only warn+/fail finding is no_nvidia_driver); info findings never show it.
 export function cudaBanner(fetchReport) {
   const host = h('div');
   const paint = (rep) => {
     clear(host);
-    const bad = rep && (rep.worst === 'warn' || rep.worst === 'fail');
-    if (!rep || (!bad && !rep.error)) return;
+    if (!rep) return;
     const items = (rep.findings || []).filter((f) => f.level === 'warn' || f.level === 'fail');
+    const cpuOnly = !rep.error && ((rep.stack && Array.isArray(rep.stack.devices) && rep.stack.devices.length === 0) || (items.length > 0 && items.every((f) => f.code === 'no_nvidia_driver')));
+    if (cpuOnly || (!items.length && !rep.error)) return;
     if (rep.error) items.push({ level: 'fail', message: rep.error });
-    const btn = h('button', { class: 'btn sm', onclick: async () => { btn.disabled = true; try { paint(await fetchReport(true)); } catch (_) { btn.disabled = false; } } }, 'Re-check');
+    if (rep.probe_skipped) items.push({ level: 'warn', message: rep.probe_skipped });
+    const btn = h('button', { class: 'btn sm', title: 'Re-runs the checks and allocates a small buffer on every GPU (may disturb GPUs used by running jobs).', onclick: async () => { btn.disabled = true; try { paint(await fetchReport(true, true)); } catch (_) { btn.disabled = false; } } }, 'Re-check (test GPUs)');
     host.appendChild(notice(rep.worst === 'fail' || rep.error ? 'error' : 'unavailable', rep.worst === 'fail' || rep.error ? 'CUDA stack problem' : 'CUDA stack warning',
       h('div', items.map((f) => h('p', { class: 'small' }, h('b', f.message), f.fix ? h('span', { class: 'muted' }, ' - ' + f.fix) : null))), h('div', { class: 'row mt-s' }, btn)));
   };
-  fetchReport(false).then(paint).catch(() => {});
+  fetchReport(false, false).then(paint).catch(() => {});
   return host;
 }

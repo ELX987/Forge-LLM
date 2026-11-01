@@ -136,7 +136,7 @@ def _driver_cuda() -> str | None:
     try:
         from forge.hw import cuda_compat
 
-        return cuda_compat.detect_stack(probe=False).get("driver_cuda")
+        return cuda_compat._nvml_facts().get("driver_cuda") or cuda_compat._smi_facts().get("driver_cuda")
     except Exception:
         return None
 
