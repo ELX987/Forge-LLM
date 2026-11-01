@@ -32,6 +32,16 @@ step() { "$PY" "$HELPER" step "$REPORT_DIR" "$@"; }
 "$PY" -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' \
     || die "CUDA not available to torch - run scripts/vast_setup.sh first"
 
+# is_available() only means the driver loaded. Allocate on every visible device: a busy/exclusive/unpassed GPU fails here with a
+# diagnosis in ~2 s instead of failing every test of a 15-minute run identically. FORGE_ALLOW_UNUSABLE_CUDA=1 runs anyway.
+if ! "$PY" "$HELPER" cuda-health "$REPORT_DIR"; then
+    if [ "${FORGE_ALLOW_UNUSABLE_CUDA:-0}" != "1" ]; then
+        echo "Stopping: fix the CUDA problem above (or set FORGE_ALLOW_UNUSABLE_CUDA=1 to run the suites anyway)." >&2
+        "$PY" "$HELPER" finalize "$REPORT_DIR" || true
+        exit 3
+    fi
+fi
+
 step forge_doctor --allow-fail --timeout 300 -- "$PY" -m forge.cli doctor
 step forge_probe --allow-fail --timeout 900 -- "$PY" -m forge.cli probe --quick
 

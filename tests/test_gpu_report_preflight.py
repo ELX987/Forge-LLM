@@ -102,3 +102,26 @@ def test_missing_dependency_skips_instead_of_collection_error(tmp_path, path, mi
     assert proc.returncode in (0, 5), out[-2000:]
     assert "ERROR" not in out, out[-2000:]
     assert f"{missing} not installed in this interpreter" in out and "SKIPPED [1]" in out, out[-2000:]
+
+
+def test_cuda_health_flags_unusable_devices_and_explains(rep_mod, monkeypatch):
+    monkeypatch.setattr(rep_mod, "_smi", lambda *a: ["0, Exclusive_Process, Enabled, N/A"])
+    rep = {"devices": [{"index": 0, "ok": False, "error": "CUDA error: CUDA-capable device(s) is/are busy or unavailable"},
+                       {"index": 1, "ok": True, "sum": 1024.0}],
+           "compute_mode": ["0, Exclusive_Process, Enabled, N/A"], "compute_apps": ["GPU-x, 99, python3, 100 MiB"],
+           "ok": False, "usable_devices": [1]}
+    banner = rep_mod.format_cuda_banner(rep)
+    assert "cuda:0: FAILED" in banner and "cuda:1: ok" in banner
+    assert "Exclusive_Process" in banner and "python3" in banner
+    assert "CUDA_VISIBLE_DEVICES=1" in banner
+
+
+def test_cuda_health_cmd_on_cpu_host_writes_json_and_fails(rep_mod, tmp_path, monkeypatch, capsys):
+    torch = pytest.importorskip("torch")
+    if torch.cuda.is_available():
+        pytest.skip("only meaningful on CPU-only torch")
+    monkeypatch.setattr(rep_mod, "_smi", lambda *a: [])
+    assert rep_mod.cmd_cuda_health([str(tmp_path)]) == 3
+    data = json.loads((tmp_path / "cuda_health.json").read_text(encoding="utf-8"))
+    assert data["ok"] is False and data["devices"] == []
+    assert "no CUDA device" in capsys.readouterr().out

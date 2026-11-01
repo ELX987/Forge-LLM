@@ -214,6 +214,80 @@ def format_banner(rep: dict) -> str:
     return "\n".join(lines)
 
 
+def _smi(*query_args: str) -> list[str]:
+    try:
+        out = subprocess.run(["nvidia-smi", *query_args], capture_output=True, text=True, timeout=30)
+        return out.stdout.strip().splitlines() if out.returncode == 0 else [f"nvidia-smi failed: {out.stderr.strip()}"]
+    except Exception as e:  # noqa: BLE001
+        return [f"nvidia-smi unavailable: {e}"]
+
+
+def cuda_health_report() -> dict:
+    """Can torch actually allocate on each visible device?  torch.cuda.is_available() only says the driver loaded; a device in
+    exclusive/prohibited compute mode, held by another process, or not passed through to the container still fails on first use
+    (cudaErrorDevicesUnavailable) and makes every GPU test fail identically before any Forge code runs."""
+    rep: dict = {"devices": [], "compute_mode": _smi("--query-gpu=index,compute_mode,persistence_mode,mig.mode.current",
+                                                       "--format=csv,noheader"),
+                 "compute_apps": _smi("--query-compute-apps=gpu_uuid,pid,process_name,used_memory", "--format=csv,noheader"),
+                 "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                 "NVIDIA_VISIBLE_DEVICES": os.environ.get("NVIDIA_VISIBLE_DEVICES", "")}
+    try:
+        import torch  # type: ignore
+
+        n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception as e:  # noqa: BLE001
+        rep["error"] = repr(e)
+        n = 0
+    for i in range(n):
+        try:
+            x = torch.ones(1024, device=f"cuda:{i}")
+            torch.cuda.synchronize(i)
+            rep["devices"].append({"index": i, "ok": True, "sum": float(x.sum())})
+        except Exception as e:  # noqa: BLE001
+            rep["devices"].append({"index": i, "ok": False, "error": str(e).splitlines()[0] if str(e) else repr(e)})
+    rep["ok"] = bool(rep["devices"]) and all(d["ok"] for d in rep["devices"])
+    rep["usable_devices"] = [d["index"] for d in rep["devices"] if d["ok"]]
+    return rep
+
+
+def format_cuda_banner(rep: dict) -> str:
+    bar = "=" * 78
+    bad = [d for d in rep["devices"] if not d["ok"]]
+    lines = [bar, "FORGE CUDA PREFLIGHT: torch cannot use the GPU(s) on this host", bar]
+    for d in rep["devices"]:
+        lines.append(f"  cuda:{d['index']}: " + ("ok" if d["ok"] else f"FAILED - {d['error']}"))
+    if not rep["devices"]:
+        lines.append("  torch sees no CUDA device" + (f" ({rep['error']})" if rep.get("error") else ""))
+    lines += ["", "nvidia-smi compute mode (index, compute_mode, persistence, MIG):", *[f"  {r}" for r in rep["compute_mode"]]]
+    if rep["compute_apps"]:
+        lines += ["processes holding the GPUs:", *[f"  {r}" for r in rep["compute_apps"]]]
+    if bad and any("busy or unavailable" in d["error"] for d in bad):
+        lines += ["",
+                  "cudaErrorDevicesUnavailable is a host/instance problem, not a Forge one. Usual causes, in order of likelihood:",
+                  "  1. compute mode is Exclusive_Process/Prohibited and another process holds the device (a leftover python, jupyter,",
+                  "     forge serve/worker: `nvidia-smi`, `pkill -f forge`, `fuser -v /dev/nvidia*`).  Reset with `nvidia-smi -c DEFAULT` if allowed.",
+                  "  2. the container was not given the GPUs it lists (check `echo $NVIDIA_VISIBLE_DEVICES`, `ls /dev/nvidia*`); recreate the instance.",
+                  "  3. a driver/fabric fault on a multi-GPU box: rent a different machine, or run on one healthy index, e.g. CUDA_VISIBLE_DEVICES=0.",
+                  "Quick check outside Forge:  python -c \"import torch; print(torch.ones(1, device='cuda'))\""]
+    if rep["usable_devices"] and bad:
+        lines += ["", f"Some devices work: re-run with CUDA_VISIBLE_DEVICES={','.join(map(str, rep['usable_devices']))}"]
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+def cmd_cuda_health(argv: list[str]) -> int:
+    """Writes cuda_health.json; exit 0 when every visible device is usable, 3 otherwise (the runner then stops early)."""
+    report_dir = Path(argv[0])
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rep = cuda_health_report()
+    (report_dir / "cuda_health.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
+    if rep["ok"]:
+        print(f"[cuda] {len(rep['devices'])} device(s) usable", flush=True)
+        return 0
+    print(format_cuda_banner(rep), flush=True)
+    return 3
+
+
 def cmd_preflight(argv: list[str]) -> int:
     report_dir = Path(argv[0])
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -425,10 +499,10 @@ def cmd_finalize(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("step", "env", "preflight", "finalize", "bench-export"):
+    if not argv or argv[0] not in ("step", "env", "preflight", "cuda-health", "finalize", "bench-export"):
         print(__doc__)
         return 64
-    return {"step": cmd_step, "env": cmd_env, "preflight": cmd_preflight, "finalize": cmd_finalize,
+    return {"step": cmd_step, "env": cmd_env, "preflight": cmd_preflight, "cuda-health": cmd_cuda_health, "finalize": cmd_finalize,
             "bench-export": cmd_bench_export}[argv[0]](argv[1:])
 
 
