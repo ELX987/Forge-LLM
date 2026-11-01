@@ -41,6 +41,7 @@ SSE event formats. All paths below are relative to the prefix **`/api/v1`**.
 | Method & path | Purpose |
 |---------------|---------|
 | `GET /models`, `POST /models` | List / create model records |
+| `GET /methods?family=&status=`, `GET /methods/{id}` | Method catalog (training / fine-tuning / quantization / compression): status supported / experimental / planned, job type, template, diagnostics prefix, `gpu_validated` (read-only metadata) |
 | `GET/PATCH/DELETE /models/{id}` | Read / update / remove a model record |
 | `POST /models/{id}/download` | Start a Hugging Face download job into the models dir |
 | `POST /models/register-local` `{path}` | Register an existing local model directory |

@@ -26,7 +26,7 @@ VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "met
 
 API_ROOTS = {
     "system", "hardware", "models", "datasets", "schemas", "configs", "jobs", "recipes", "planner", "claims", "artifacts",
-    "storage", "evals", "gates", "kernels", "deployments", "serve", "checkpoints", "events",
+    "storage", "evals", "gates", "kernels", "deployments", "serve", "checkpoints", "events", "methods",
 }
 
 
