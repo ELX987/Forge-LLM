@@ -1,6 +1,6 @@
 # ternary-ptq (recipe) -- EXPERIMENTAL one-shot, data-free ternarisation of a pretrained model to packed t158 layers.
 # EXPECT A LARGE QUALITY LOSS: no recovery training happens here. Use it to size the artifact and measure reconstruction SQNR; use
-# ternary-convert for the QAT + distillation route. Group 128 scales are needed for converted pretrained models (+0.125 bit/weight).
+# ternary-convert for the QAT + distillation route. Group 128 scales are needed for converted pretrained models (+0.25 bit/weight with fp32 scales; tern158 quoted +0.125 assuming 16-bit scales).
 # Gate G-T158 thresholds are TARGET placeholders. No ternary kernel exists yet: serving uses the torch oracle path (correct, not fast).
 recipe: ternary-ptq-g128
 inputs:

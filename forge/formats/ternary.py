@@ -45,7 +45,7 @@ def effective_group(group_size: int, k: int) -> int:
 
 
 def bits_per_weight(k: int, group_size: int, scale_bits: int = 32, packed: bool = True) -> float:
-    """Storage bits per weight including scales (2.0 packed, +0.125 for G=128 fp32 scales)."""
+    """Storage bits per weight including scales (2.0 packed, +0.25 for G=128 fp32 scales: 32 bits per 128 weights)."""
     base = BITS_PACKED if packed else BITS_IDEAL
     if group_size == 0:
         return base

@@ -43,6 +43,7 @@ Details: [`docs/VAST_AI.md`](docs/VAST_AI.md).
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module layout, ownership, public APIs, conventions |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | Using the UI and CLI |
 | [`docs/KERNELS.md`](docs/KERNELS.md) | Kernel catalog and validation status |
+| [`docs/TERNARY.md`](docs/TERNARY.md) | Ternary (1.58-bit) support: what exists, what is validated (CPU only), roadmap |
 | [`docs/CUDA_COMPAT.md`](docs/CUDA_COMPAT.md) | CUDA driver / torch / GPU / Triton compatibility check (CUDA 12.x, 13.0-13.4) |
 | [`docs/API.md`](docs/API.md) | REST API reference |
 | [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) | Every configuration option |
@@ -59,7 +60,8 @@ forge/models    decoder-only transformer, loaders, LoRA, KV caches
 forge/compress  PTQ, KV quantisation, pruning, low-rank, delta, lossless
 forge/train     data pipeline, trainer, fine-tuning, distillation
 forge/serve     inference engine, scheduler, OpenAI-compatible server
-forge/eval      metrics, suites, gates     forge/planner  cost model, claims ledger
+forge/eval      metrics, suites, gates     forge/planner  cost model, training simulator, claims ledger
+forge/ternary   ternary (1.58-bit) QAT, conversion, export (experimental)   forge/methods  method catalog   forge/native  optional compiled tiers
 forge/jobs  forge/api  forge/telemetry  forge/web   job manager, REST API, metrics, front end
 ```
 

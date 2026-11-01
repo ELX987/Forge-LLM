@@ -57,3 +57,10 @@ The ledger is bookkeeping: it does not verify anything by itself. At release tim
 except those that a test in this repository reproduces with synthetic data** (for example formula-level facts such
 as KV bytes per token or the E2M1 grid). A claim checked on synthetic tensors is not a claim about real models;
 say so in `notes`.
+
+## Ternary (tern158) numbers are not in the ledger yet
+
+The tern158 report's claims (never learn the scale; one Lloyd step recovers ~86% of the absmean gap; equilibrium flip rate 0.59*sqrt(2*lr*wd); zero density 40-52% healthy; INT8 pipe ~1/30 of
+FP8 on sm_103; 8x less traffic from gathering packed codes) and tern158's own sm_120 measurements (mma 346-411 TOPS, 125M run ppl 141 at step 500) are **not seeded** as ledger claims: the
+seed tests tie every claim to a planner rule and no ternary rule exists yet. Until then they appear only as labelled TARGET values (health thresholds, gate `g-t158`, simulator caption) and in
+`docs/TERNARY.md`; none of them has been reproduced through Forge.
