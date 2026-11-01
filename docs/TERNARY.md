@@ -30,7 +30,7 @@ straight-through estimator with the scale detached. Latent full-precision weight
 | P2 | `ternary.train` job, health diagnostics (`ternary/*` metrics), templates in `configs/ternary/` |
 | P3 | `ternarize` / `ternary_qat` stages, HF conversion, ternary LoRA, gate `g-t158`, training simulator |
 | P4 | Triton GEMM/GEMV/quantiser, optional native CUDA tier, chip int8 flags |
-| P5 | `zero_ternary` sharded trainer |
+| P5 | `zero_ternary` sharded trainer (CPU/gloo-validated; NCCL unexecuted) - see `docs/ZERO_TERNARY.md` |
 | P6 | Ternary Lab and method picker in the UI |
 
 ## Validation ladder (carried over from tern158)

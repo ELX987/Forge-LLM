@@ -10,7 +10,7 @@ Health diagnostics (metric prefix ``ternary``) are sampled on the trainer's ``di
 previous sample), ``ternary/scale_mean``, ``ternary/lam``.  Thresholds default to the tern158 report values (TARGET until re-measured
 in Forge): healthy zero fraction 0.40-0.52, warn 0.60, stop 0.80.
 
-EXPERIMENTAL: CPU-validated only; the sharded ``zero_ternary`` trainer and bf16-stochastic-rounded optimiser state are later phases.
+EXPERIMENTAL: CPU-validated only; the sharded ``zero_ternary`` trainer is :mod:`forge.ternary.zero` (docs/ZERO_TERNARY.md); bf16-stochastic-rounded optimiser state is a later phase.
 """
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ from .linear import FakeQuantTernaryLinear
 
 log = logging.getLogger("forge.ternary.qat")
 
-_ATTRS = ("group_size", "rule", "iters", "quant_acts", "lam", "enabled", "_cache", "_forge_t158", "_forge_orig_cls")
+_ATTRS = ("group_size", "rule", "iters", "quant_acts", "lam", "enabled", "_cache", "_forge_t158", "_forge_orig_cls",
+          "_enabled", "_zero", "_zero_q", "_zero_s")  # the last four belong to forge.ternary.zero.ZeroTernaryLinear
 
 
 class TernaryPrecisionManager(PrecisionManager):
@@ -160,7 +161,7 @@ class TernaryPrecisionManager(PrecisionManager):
         new_prev: dict[str, torch.Tensor] = {}
         with torch.no_grad():
             for n, m in sample:
-                t, s = tn.quantize_ternary(m.weight.detach(), m.group_size, m.rule, m.iters)
+                t, s = m.codes()
                 zs.append(float((t == 0).float().mean()))
                 scales.append(float(s.mean()))
                 prev = self._prev.get(n)

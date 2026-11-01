@@ -19,11 +19,14 @@ Batches use *aligned* labels: ``labels[t]`` is the target of ``logits[t]`` and `
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from forge.core.jsonschema import ui
+
+log = logging.getLogger("forge.train.config")
 
 __all__ = [
     "BudgetConfig", "CheckpointConfig", "CommonTrainConfig", "DistillConfig", "DistillLossConfig", "DiversityConfig",
@@ -211,7 +214,9 @@ class PrecisionConfig(_Cfg):
 class ParallelConfig(_Cfg):
     """Distributed training (torchrun) and compilation."""
 
-    strategy: Literal["none", "ddp", "fsdp"] = F("none", "none = single process; ddp = DistributedDataParallel; fsdp = FullyShardedDataParallel.", "Parallelism")
+    strategy: Literal["none", "ddp", "fsdp", "zero_ternary"] = F("none", "none = single process; ddp = DistributedDataParallel; fsdp = FullyShardedDataParallel; zero_ternary = row-sharded optimiser state and update with packed 2-bit code all-gather (ternary QAT only, EXPERIMENTAL; see docs/TERNARY.md).", "Parallelism")
+    zero_comm: Literal["auto", "reduce_scatter", "all_reduce"] = F("auto", "zero_ternary gradient exchange: reduce_scatter (NCCL) or all_reduce + slice (any backend). auto = reduce_scatter on nccl, all_reduce on gloo.", "Parallelism", True)
+    oom_halve_micro_batch: bool = F(False, "On a CUDA out-of-memory error split every micro-batch in two (exact same gradient, token-weighted) and retry the step. Single-process only: ignored with a warning when world_size > 1 (ranks cannot agree on a split mid-collective).", "Parallelism")
     nproc_per_node: int = F(1, "Processes (GPUs) to launch with torchrun when started from a job (ignored if already under torchrun).", "Parallelism", ge=1, le=64)
     nnodes: int = F(1, "Nodes for torchrun (multi-node needs rdzv settings via the environment).", "Parallelism", True, ge=1)
     backend: Literal["auto", "nccl", "gloo"] = F("auto", "torch.distributed backend (auto: nccl on CUDA, gloo on CPU).", "Parallelism", True)
@@ -332,6 +337,24 @@ class CommonTrainConfig(_Cfg):
         b = self.budget
         if b.max_steps is None and b.max_tokens is None and b.max_epochs is None and b.max_minutes is None:
             raise ValueError("budget: set at least one of max_steps / max_tokens / max_epochs / max_minutes")
+        return self
+
+    @model_validator(mode="after")
+    def _check_zero_ternary(self) -> CommonTrainConfig:
+        if self.parallel.strategy != "zero_ternary":
+            return self
+        if self.precision.quant_aware != "ternary":
+            raise ValueError("parallel.strategy=zero_ternary shards ternary latent weights: set precision.quant_aware = 'ternary' (or use ddp/fsdp)")
+        if self.optim.name not in ("adamw", "lion", "sgd"):
+            raise ValueError(f"parallel.strategy=zero_ternary supports optim.name adamw|lion|sgd (per-parameter state that can be row-sliced), got {self.optim.name!r}")
+        if self.precision.compute_dtype == "float16":
+            raise ValueError("parallel.strategy=zero_ternary does not support float16 + GradScaler: use bfloat16 or float32")
+        t = self.precision.ternary
+        if t.group_size == 0:
+            # one scale per tensor couples every row, so a row shard cannot be quantised independently
+            log.warning("parallel.strategy=zero_ternary: precision.ternary.group_size=0 (per-tensor scale) cannot be sharded by rows; "
+                        "rewritten to -1 (one scale per output row). The saved config reflects this.")
+            t.group_size = -1
         return self
 
 

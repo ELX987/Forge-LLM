@@ -126,10 +126,10 @@ def _layer_class(model: nn.Module) -> type | None:
 
 def wrap_model(model: nn.Module, parallel: ParallelConfig, dinfo: DistInfo, autocast_dtype: torch.dtype | None = None) -> nn.Module:
     """Wrap ``model`` in DDP or FSDP according to ``parallel.strategy`` (no-op when single process)."""
-    if not dinfo.initialized or parallel.strategy == "none":
+    if not dinfo.initialized or parallel.strategy in ("none", "zero_ternary"):
         if dinfo.initialized and parallel.strategy == "none":
             log.warning("running under torchrun with parallel.strategy=none: ranks train independent replicas")
-        return model
+        return model  # zero_ternary does its own gradient exchange (forge.ternary.zero), so the model stays unwrapped
     if parallel.strategy == "ddp":
         from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -174,7 +174,7 @@ def get_model_state(model: nn.Module, names: set[str] | None = None) -> dict[str
             sd = model.state_dict()
         sd = {k.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", ""): v for k, v in sd.items()}
     else:
-        sd = {k: v.detach().cpu() for k, v in unwrap(model).state_dict().items()}
+        sd = {k: v.detach().cpu() for k, v in unwrap(model).state_dict().items() if names is None or k in names}
     if names is not None:
         sd = {k: v for k, v in sd.items() if k in names}
     return sd

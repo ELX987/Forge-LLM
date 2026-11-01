@@ -605,5 +605,14 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _collectives_check(device: int, quick: bool) -> dict[str, Any]:
+    from forge.train.collectives import probe_check
+
+    return probe_check(device, quick)
+
+
+register_check("collectives", _collectives_check)  # multi-GPU NCCL collectives used by the zero_ternary trainer (skipped with < 2 GPUs)
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
