@@ -16,7 +16,8 @@ from forge.train import dist as D
 from forge.train.checkpoint import CheckpointManager
 from forge.train.config import TrainConfig
 from forge.train.data import IngestConfig, ingest_dataset
-from forge.train.run import run_training
+from forge.train.run import _check_dataset_tokenizers, run_training
+from forge.train.trainer import _validate_batch_token_ids
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,6 +70,27 @@ def test_run_training_validates_inputs(ds_dir, tmp_path):
     # accepts a plain dict (what the job worker may pass)
     cfg = small_train_cfg(ds_dir, budget={"max_steps": 1}).model_dump(mode="json")
     assert run_training(cfg, NullContext(run_dir=tmp_path / "d"))["steps"] == 1
+
+
+def test_training_rejects_dataset_encoded_with_different_tokenizer():
+    from types import SimpleNamespace
+
+    ds = SimpleNamespace(infos=[{"tokenizer": "other/tokenizer", "tokenizer_hash": "blake3:other"}])
+    tok = SimpleNamespace(hash="blake3:configured", name="configured/tokenizer")
+    with pytest.raises(ConfigError, match="dataset tokenizer does not match"):
+        _check_dataset_tokenizers([ds], tok)
+
+
+@pytest.mark.parametrize("key", ["input_ids", "labels"])
+def test_invalid_training_token_ids_fail_on_cpu_with_vocab_diagnostic(key):
+    batch = {"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[2, 3]])}
+    batch[key][0, -1] = 32000
+    with pytest.raises(ConfigError, match="outside model vocabulary"):
+        _validate_batch_token_ids(batch, 32000)
+
+
+def test_ignored_label_sentinel_is_allowed_by_vocab_guard():
+    _validate_batch_token_ids({"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[-100, 2]])}, 3)
 
 
 def test_val_dataset_and_ingest_job_compose(tmp_path):

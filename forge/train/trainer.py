@@ -328,6 +328,25 @@ def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
 
+def _validate_batch_token_ids(batch: dict[str, Any], vocab_size: int | None) -> None:
+    """Catch corrupt/mismatched token ids on the host before an embedding triggers a CUDA device assert."""
+    if not vocab_size:
+        return
+    for key in ("input_ids", "labels"):
+        ids = batch.get(key)
+        if not isinstance(ids, torch.Tensor) or ids.numel() == 0 or ids.device.type != "cpu":
+            continue
+        checked = ids if key == "input_ids" else ids[ids >= 0]  # -100 is the standard ignored-label sentinel
+        if checked.numel() == 0:
+            continue
+        lo, hi = int(checked.min()), int(checked.max())
+        if lo < 0 or hi >= int(vocab_size):
+            raise ConfigError(
+                f"training batch {key} has token ids in [{lo}, {hi}], outside model vocabulary [0, {int(vocab_size) - 1}]; "
+                "check that the dataset was ingested with the model's tokenizer and that model.arch_overrides.vocab_size is large enough"
+            )
+
+
 def _rng_state() -> dict[str, Any]:
     st: dict[str, Any] = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
     if torch.cuda.is_available():
@@ -688,6 +707,8 @@ class Trainer:
         n = len(batches)
         self.model.train()
         for i, b in enumerate(batches):
+            vocab_size = getattr(getattr(self.raw, "config", None), "vocab_size", None)
+            _validate_batch_token_ids(b, vocab_size)
             b = _to_device(b, self.device)
             sync_ctx = self.model.no_sync() if (i < n - 1 and hasattr(self.model, "no_sync")) else contextlib.nullcontext()
             with sync_ctx:

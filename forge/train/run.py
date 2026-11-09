@@ -54,6 +54,22 @@ def build_token_datasets(cfg: Any, data: Any, seed: int) -> tuple[ShardedTokenDa
     return train, val
 
 
+def _check_dataset_tokenizers(datasets: list[ShardedTokenDataset | None], tok: Any) -> None:
+    """Reject token shards produced by a different vocabulary before the first model step."""
+    for ds in datasets:
+        if ds is None:
+            continue
+        for info in ds.infos:
+            expected = info.get("tokenizer_hash")
+            if expected and expected != tok.hash:
+                recorded = info.get("tokenizer") or "unknown tokenizer"
+                raise ConfigError(
+                    f"dataset tokenizer does not match model tokenizer: dataset was encoded with {recorded!r} "
+                    f"(hash {expected}), but model.tokenizer is {tok.name!r} (hash {tok.hash}); "
+                    "re-ingest the dataset with the same tokenizer used by this model"
+                )
+
+
 def run_training(cfg: TrainConfig | dict, ctx: Any) -> dict[str, Any]:
     """Continued / small-scale pre-training (job type ``train``)."""
     cfg = coerce_cfg(cfg, TrainConfig)
@@ -64,6 +80,7 @@ def run_training(cfg: TrainConfig | dict, ctx: Any) -> dict[str, Any]:
     try:
         tok = load_tokenizer_for(cfg.model, ctx)
         train_ds, val_ds = build_token_datasets(cfg, cfg.data, cfg.seed)
+        _check_dataset_tokenizers([train_ds, val_ds], tok)
         ctx.log(f"data: {train_ds.describe()}")
         model, model_dir = build_model(cfg.model, device=dinfo.device, seed=cfg.seed, tok=tok, ctx=ctx)
         check_vocab(model, tok)
