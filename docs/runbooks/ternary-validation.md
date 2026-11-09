@@ -26,9 +26,17 @@ benchmark before trusting the `int8_tc_fast=False` rule.
 
 ## G1 - smoke run
 
-Single GPU: `bash scripts/ternary_validate.sh` runs `scripts/ternary_smoke.sh`. Pass: the job succeeds, `ternary/zero_frac` stays inside 0.35-0.52 for the tiny model, the
-exported artifact is labelled `Ternary 1.58b`. N GPUs: needs the sharded trainer (phase P5); parity criterion there: loss agrees with the 1-GPU run within noise and the
-NCCL collectives check passes.
+Single GPU: `bash scripts/ternary_validate.sh` runs `scripts/ternary_smoke.sh`. Record the job result, zero fraction and exported artifact label. The zero-density band is a target, not evidence of model quality.
+
+For multi-GPU G1, P5 provides the sharded trainer and a parity harness. On a host with at least two usable GPUs, run:
+
+```bash
+FORGE_TERNARY_MULTI_GPU=1 bash scripts/ternary_validate.sh
+# Or run the parity test directly:
+python -m pytest tests_gpu/test_zero_ternary.py -v -rs
+```
+
+Archive the report and inspect the parity output and NCCL collectives result. A skipped test is not a pass. See `docs/ZERO_TERNARY.md` for the trainer's memory and checkpoint limits.
 
 ## G2 - conversion of a small pretrained model
 

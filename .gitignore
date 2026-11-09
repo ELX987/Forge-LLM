@@ -22,6 +22,7 @@ node_modules/
 /models/
 /checkpoints/
 *.safetensors
+!/tests/data/ternary_golden.safetensors
 *.gguf
 *.pt
 *.pth

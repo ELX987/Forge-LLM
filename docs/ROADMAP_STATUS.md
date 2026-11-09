@@ -1,8 +1,9 @@
 # Roadmap status: Plan checklist vs. this repository
 
 Maps the Plan's work items (Plan section 12, C-001 .. C-124) to what the repository actually contains. Written from a
-reading of the code and tests at the time of the first complete build; **nothing here has been run on an NVIDIA GPU**
-and no real 8B/70B model has been processed by this code.
+reading of the code and tests at the time of the first complete build. Much of the table is historical: later runs include
+GPU reports from an RTX PRO 6000 Blackwell and a Qwen3-14B W4A16 compression job. See `docs/KERNELS.md` for measured
+kernel results; real-model evaluation and most hardware gates remain open.
 
 Status legend
 
@@ -154,14 +155,14 @@ unmet even when the machinery exists.
 ## Summary
 
 Done on CPU: foundations (schemas, store, recipe engine, determinism), evaluation machinery, PTQ/pruning/distillation
-algorithms on tiny models, planner/cost model, job system, API, CLI, web UI scaffolding. **Everything that depends on
-real hardware or real models** - kernel validation and performance, serving throughput, FP4 native paths, 8B/70B
-results, gates G1-G5 - is open. The next actions are in `docs/VAST_AI.md` section 7 (run the GPU suite and the quick
-bench), then C-020/C-022/C-036 on one 24 GB card.
+algorithms on tiny models, planner/cost model, job system, API, CLI, web UI scaffolding. Some non-ternary kernels and a
+Qwen3-14B W4A16 compression run have since been exercised on hardware; their results do not close the full model-quality,
+serving-throughput, multi-GPU or G1-G5 requirements. For ternary the next step is the G0/G1 validation ladder in
+`docs/runbooks/ternary-validation.md`, followed by a real-model conversion and measured baseline.
 
 ## Ternary (1.58-bit) integration - ADR 0007 / docs/TERNARY.md
 
-Not a Plan work item; tracked here because it adds a method family. Everything is **CPU-validated only** (kernels: interpreter + offline PTX compile); no GPU has run any of it through Forge.
+Not a Plan work item; tracked here because it adds a method family. Ternary-specific paths are **CPU-validated only** (kernels: interpreter + offline PTX compile); no GPU run of the ternary path through Forge is recorded. Other Forge kernels have GPU results documented in `docs/KERNELS.md`.
 
 | Phase | Item | Status | Notes |
 |-------|------|--------|-------|
@@ -170,6 +171,6 @@ Not a Plan work item; tracked here because it adds a method family. Everything i
 | P2 | Quant-mode plug-in, ternary QAT, health metrics, `ternary_train` job, method catalog | done (CPU) | emulated fake-quant: no training speed-up; wd-to-zero schedule and bf16-SR optimizer state not done |
 | P3 | `ternarize` stage, ptq format, g-t158 gate, recipes, train simulator, t158 scheme, chip table | partial | planner rule R-Q7-TERNARY, T158 claims, HF conversion with SubLN, simulator panel on New Job not done |
 | P4 | Triton GEMM + quantiser, dispatcher, chip int8 flags, bench, native tier | GPU-unvalidated | interpreter + PTX only; native tier not wired |
-| P5 | Sharded multi-GPU trainer (`zero_ternary`) | in progress elsewhere | not part of this status |
+| P5 | Sharded multi-GPU trainer (`zero_ternary`) | partial | Merged; CPU/gloo tests cover training and checkpoint resharding. Full latent weights remain replicated; NCCL/GPU G1 validation is outstanding (`docs/ZERO_TERNARY.md`) |
 | P6 | Methods page, Ternary Lab, sim panel | done (CPU) | checked visually in demo mode only |
 | P7 | Smoke script, hardware validation ladder, docs | partial | ladder written (`docs/runbooks/ternary-validation.md`); every hardware cell is "no" |

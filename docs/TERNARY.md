@@ -52,7 +52,7 @@ factors and memory is over-estimated by ~38%. One data point cannot calibrate a 
 
 ## Not implemented (by design or deferred)
 
-- Sharded multi-GPU ternary trainer (`zero_ternary`: row-sharded latents, packed-code all-gather): developed separately; not described or tested here.
+- Fully sharded latent weights: `zero_ternary` currently shards optimizer state and updates, while keeping a full latent tensor per rank; see `docs/ZERO_TERNARY.md`.
 - bf16 stochastic-rounded optimizer state and the weight-decay-to-zero cooldown tern158 used; ternary-specific schedules.
 - Planner rule `R-Q7-TERNARY` and `T158` claims-ledger entries (the seed tests tie every claim to a rule); see `docs/CLAIMS.md`.
 - Converting an arbitrary pretrained HF model with SubLN (needs a ModelConfig switch); `ternary-convert` runs QAT + distillation on the loaded Forge model.

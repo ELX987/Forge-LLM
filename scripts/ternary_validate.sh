@@ -6,7 +6,7 @@
 #
 # Output: ./gpu_report/ (override REPORT_DIR) with per-step logs, junit_ternary.xml, ternary_bench.json and report.md.  Paste report.md back when something fails.
 # G2 (TinyLlama conversion SQNR) and G3 (125M-token run vs the simulator, bf16 baseline) need models and data: see docs/runbooks/ternary-validation.md.
-# Multi-GPU parity (G1 on N GPUs) belongs to the sharded trainer (phase P5) and is NOT covered here.
+# Set FORGE_TERNARY_MULTI_GPU=1 to include the P5 multi-GPU NCCL parity and collectives tests.
 set -euo pipefail
 
 # shellcheck source=scripts/_common.sh
@@ -29,7 +29,7 @@ if ! "$PY" "$HELPER" cuda-health "$REPORT_DIR"; then
     fi
 fi
 
-# ---- G0: kernels vs the torch oracle (all sm that this host has), tern158 golden vectors, bit-exact quantiser -----------------------------------------
+# ---- G0: kernels vs the torch oracle on the test device, tern158 golden vectors, bit-exact quantiser -----------------------------------------
 step ternary_gpu_tests --allow-fail --timeout 1800 -- "$PY" -m pytest tests_gpu/test_kernels_ternary.py -q -rs "--junitxml=$REPORT_DIR/junit_ternary.xml"
 step ternary_cpu_ref_tests --allow-fail --timeout 900 -- "$PY" -m pytest tests/test_ternary_format.py tests/test_ternary_artifact.py tests/test_ternary_compress.py -q
 # timing method: CUDA graphs over a weight ring larger than L2 (eager launch overhead hides small-M kernels); prints tern158's sm_120 numbers as targets
@@ -42,6 +42,10 @@ fi
 
 # ---- G1 (single GPU): ingest -> ternary QAT -> ternarize + pack -> labelled artifact -------------------------------------------------------------------
 step ternary_smoke --allow-fail --timeout 1800 -- env GPUS=auto FORGE_PYTHON="$PY" bash scripts/ternary_smoke.sh
+
+if [ "${FORGE_TERNARY_MULTI_GPU:-0}" = "1" ]; then
+    step ternary_multi_gpu --allow-fail --timeout 1800 -- "$PY" -m pytest tests_gpu/test_zero_ternary.py -v -rs "--junitxml=$REPORT_DIR/junit_zero_ternary.xml"
+fi
 
 "$PY" "$HELPER" finalize "$REPORT_DIR"
 echo "Done. Fill the results table in docs/runbooks/ternary-validation.md from $REPORT_DIR/report.md and $REPORT_DIR/ternary_bench.json."
