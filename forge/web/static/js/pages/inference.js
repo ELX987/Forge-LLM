@@ -6,6 +6,7 @@ import { pageHead, card, tabs, dataTable, statusBadge, badge, provBadge, loadInt
 import { SchemaForm } from '../forms.js';
 import { XYChart, BarChart, sparkline } from '../charts.js';
 import { fetchJobTypes } from './newjob.js';
+import { navigate } from '../router.js';
 
 const pick = (o, names, def = null) => { if (!o) return def; for (const n of names) if (o[n] !== undefined && o[n] !== null) return o[n]; return def; };
 function pctl(o, base, p) { return pick(o, [`${base}_${p}`, `${base}_${p}_ms`, `${base}_ms_${p}`]) ?? (o && o[base] && typeof o[base] === 'object' ? o[base][p] : (o && o[`${base}_ms`] && typeof o[`${base}_ms`] === 'object' ? o[`${base}_ms`][p] : null)); }
@@ -60,7 +61,9 @@ export default async function render(ctx) {
   function loadedModelCell(d) {
     const lm = d.loaded_model; const ex = d.expected_model;
     if (!lm) return h('div', h('code', String(d.artifact_ref || '-').slice(0, 40)), ex && ex.label ? h('div', { class: 'small' }, badge(ex.label, 'info'), ' requested') : null, d.status === 'starting' ? h('div', { class: 'small muted' }, 'loading...') : null);
-    return h('div', h('b', lm.name || '-'), h('div', { class: 'small row tight' }, badge(lm.quantized ? (lm.label || 'quantised') : `dense ${lm.dtype || ''}`.trim(), lm.quantized ? 'ok' : 'dim'), badge(`${fmtNum(lm.weight_gb, 3)} GB weights`, 'dim')),
+    const t158 = Number(lm.layer_kinds && lm.layer_kinds.t158) > 0 || /ternary 1\.58/i.test(lm.label || '');
+    return h('div', h('b', lm.name || '-'), h('div', { class: 'small row tight' }, badge(lm.quantized ? (lm.label || 'quantised') : `dense ${lm.dtype || ''}`.trim(), lm.quantized ? 'ok' : 'dim'), badge(`${fmtNum(lm.weight_gb, 3)} GB weights`, 'dim'), t158 ? badge('T158 inference', 'ok') : null),
+      t158 ? h('div', { class: 'small muted' }, 'Packed ternary linears loaded. Embeddings and excluded output layers may remain dense.') : null,
       d.identity_warning ? h('div', { class: 'small' }, badge('wrong model?', 'bad'), ' ', d.identity_warning) : null,
       ...(d.warnings || []).map((w) => h('div', { class: 'small' }, badge('warning', 'warn'), ' ', w)));
   }
@@ -99,6 +102,10 @@ export default async function render(ctx) {
     const refTxt = h('input', { type: 'text', placeholder: 'or type a model id / name, a directory path, or an artifact digest (blake3:...)', style: 'width:100%', 'aria-label': 'Model reference' });
     const importMsg = h('div', { class: 'small muted', role: 'status' });
     const overrideMsg = h('div', { class: 'small', role: 'status', 'aria-live': 'polite' });
+    const t158Msg = h('div', { class: 'small muted', role: 'status', 'aria-live': 'polite' });
+    const t158Group = h('select', { 'aria-label': 'Ternary scale group' }, [32, 64, 128, 256].map((g) => h('option', { value: String(g), selected: g === 128 }, `Group ${g}`)));
+    const t158Rule = h('select', { 'aria-label': 'Ternary quantizer rule' }, [['lloyd', 'Lloyd'], ['absmean', 'Absolute mean'], ['twn', 'TWN']].map(([v, label]) => h('option', { value: v, selected: v === 'lloyd' }, label)));
+    const prepareT158 = h('button', { class: 'btn sm', type: 'button' }, 'Prepare T158 model');
     // typed text always wins over the dropdown: say so, and grey the dropdown out while it is overridden
     function syncOverride() {
       const t = refTxt.value.trim(); clear(overrideMsg);
@@ -131,6 +138,50 @@ export default async function render(ctx) {
     const estHost = h('div', { class: 'small', role: 'status', 'aria-live': 'polite' });
     let estTimer = null; let estSeq = 0;
     const currentRef = () => refTxt.value.trim() || refSel.value;
+    const currentOption = () => [...pick0.quant, ...pick0.base, ...pick0.loose].find((o) => o.value === currentRef());
+    const currentT158 = () => {
+      const m = currentOption()?.m;
+      return Number(m?.quant_summary?.layer_kinds?.t158) > 0 || /ternary 1\.58/i.test(m?.quantization || '');
+    };
+    const compressionSource = () => {
+      const typed = refTxt.value.trim();
+      if (typed) return typed;
+      const m = currentOption()?.m;
+      return m ? (m.local_path || m.path_or_repo || m.hash || refSel.value) : refSel.value;
+    };
+    function updateT158() {
+      const selected = currentOption(); const t158 = currentT158();
+      prepareT158.disabled = !currentRef() || !!(selected && selected.m && selected.m.kind === 'quantized');
+      clear(t158Msg);
+      if (t158) t158Msg.append(badge('already packed', 'ok'), ' This model has T158 layers; select it and start deployment.');
+      else if (selected && selected.m && selected.m.kind === 'quantized') t158Msg.append('This is already a packed non-T158 artifact. Choose a dense ternary-QAT export to prepare T158.');
+      else t158Msg.append('For best results choose the dense model exported by a successful ternary QAT job. Converting an ordinary model is lossy. This submits a compression job; GPU kernel speed is not yet validated.');
+    }
+    async function submitT158() {
+      const source = compressionSource();
+      if (!source) { err.textContent = 'Choose or enter the dense QAT model first.'; return; }
+      if (currentT158()) { err.textContent = 'This model is already T158 packed; start its deployment directly.'; return; }
+      const ok = await confirmDialog({ title: 'Prepare packed ternary model?', message: 'This submits a GPU compression job. Use a dense model exported by ternary QAT for the intended path; one-shot ternarisation of an ordinary model can cause substantial quality loss.', confirmLabel: 'Prepare T158' });
+      if (!ok) return;
+      prepareT158.disabled = true; t158Msg.textContent = 'Submitting T158 packaging job...';
+      const gs = Number(t158Group.value);
+      const recipe = { name: 'ternary-inference-ui', stages: [
+        { name: 'ternarize', params: { group_size: gs, rule: t158Rule.value, iters: 1, exclude: ['lm_head', '(^|\\.)gate$', 'router', 'shared_expert_gate', 'embed'] } },
+        { name: 'pack', params: { layout: 'auto', target: null, executor: 'triton', validate_roundtrip: true } },
+      ] };
+      try {
+        const job = await api.post('/jobs', { type: 'compress', name: `ternary-inference-${Date.now() % 100000}`, params: {
+          name: 'ternary-inference', model: source, model_source: 'auto', recipe, dtype: 'bfloat16', device: 'auto',
+          use_store: true, register_model: true, fail_on_gate: false,
+        }, gpus: null, tags: ['ternary', 'inference'] });
+        toast('T158 packaging job submitted', 'ok');
+        navigate(`/jobs/${encodeURIComponent(job.id)}`);
+      } catch (e) {
+        prepareT158.disabled = false;
+        t158Msg.textContent = `Could not submit T158 job: ${e.message}`;
+      }
+    }
+    prepareT158.addEventListener('click', submitT158);
     const currentCfg = () => { try { return form ? form.getValue() : (rawEl && rawEl.value.trim() ? JSON.parse(rawEl.value) : {}); } catch (e) { return null; } };
     async function estimate() {
       const ref = currentRef(); const cfg = currentCfg(); const my = ++estSeq;
@@ -153,7 +204,8 @@ export default async function render(ctx) {
       } catch (e) { if (my === estSeq) { clear(estHost); estHost.append(h('span', { class: 'muted' }, 'Estimate unavailable: ' + e.message)); } }
     }
     function scheduleEstimate() { clearTimeout(estTimer); estTimer = setTimeout(estimate, 350); }
-    refSel.addEventListener('change', () => { if (refTxt.value.trim()) refTxt.value = ''; syncOverride(); scheduleEstimate(); }); refTxt.addEventListener('input', () => { syncOverride(); scheduleEstimate(); });
+    refSel.addEventListener('change', () => { if (refTxt.value.trim()) refTxt.value = ''; syncOverride(); updateT158(); scheduleEstimate(); }); refTxt.addEventListener('input', () => { syncOverride(); updateT158(); scheduleEstimate(); });
+    updateT158();
     if (serve) {
       // the model is chosen above (single source of truth): do not offer a second, conflicting `model` field in the generated form
       const schema = deepClone(serve.schema); const defaults = deepClone(serve.defaults || {});
@@ -174,7 +226,9 @@ export default async function render(ctx) {
     } }, 'Start');
     const m = modal({ title: 'Start deployment', wide: true, body: h('div', { class: 'stack' },
       h('div', { class: 'grid cols-2' }, h('div', h('label', { class: 'small muted' }, 'Name'), nameEl),
-        h('div', h('div', { class: 'row' }, h('label', { class: 'small muted' }, 'Model / artifact'), h('span', { class: 'grow' }), importBtn), refSel, refTxt, overrideMsg, importMsg)),
+        h('div', h('div', { class: 'row' }, h('label', { class: 'small muted' }, 'Model / artifact'), h('span', { class: 'grow' }), importBtn), refSel, refTxt, overrideMsg, importMsg,
+          h('div', { class: 'card mt', style: 'box-shadow:none' }, h('h3', 'Ternary inference (T158)'), h('p', { class: 'small muted' }, 'Package a dense QAT export as packed ternary weights, then return here and select the registered artifact.'),
+            h('div', { class: 'row tight' }, h('label', { class: 'small muted' }, 'Scale group'), t158Group, h('label', { class: 'small muted' }, 'Quantizer'), t158Rule, prepareT158), t158Msg))),
       h('h3', 'Memory plan'), estHost,
       h('h3', 'Serve configuration'), h('p', { class: 'small muted' }, 'GPU memory use is set by gpu_mem_util (share of the whole card), max_model_len and max_num_seqs (KV pool size) - see the KV cache and Scheduler groups.'), formHost, err), footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), go] });
     scheduleEstimate();
