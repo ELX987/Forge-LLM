@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,3 +47,6 @@ def test_cli_pipeline_ingest_ternary_train_ternarize(tmp_path):
     assert s["is_quantized"] and s["label"] == "Ternary 1.58b" and s["layout_id"].startswith("ternary2.row.v1-")
     m, _ = load_model(art, dtype="float32", device="cpu", with_tokenizer=False)
     assert {x.kind for x in m.modules() if getattr(x, "kind", "") == "t158"} == {"t158"}
+    prompt = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    generated = m.generate(prompt, max_new_tokens=2)
+    assert generated.shape == (1, 5) and int(generated.min()) >= 0 and int(generated.max()) < m.config.vocab_size

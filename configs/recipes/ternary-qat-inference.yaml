@@ -1,0 +1,17 @@
+# Package a completed Forge ternary-QAT export as a loadable, packed T158 inference artifact.
+# This is intended for the dense model directory exported by a successful ternary_train job.
+# The group's Lloyd quantisation reproduces the QAT forward codes; the high-precision exclusions
+# match the standard ternary QAT policy (embeddings / lm_head / router and gates stay dense).
+# No evaluation gate is included: the current G-T158 thresholds and GPU path are not validated.
+recipe: ternary-qat-inference
+stages:
+  - ternarize:
+      group_size: 128
+      rule: lloyd
+      iters: 1
+      exclude: ["lm_head", "(^|\\.)gate$", "router", "shared_expert_gate", "embed"]
+  - pack:
+      layout: auto
+      target: null
+      executor: triton
+      validate_roundtrip: true
