@@ -14,7 +14,7 @@ trust it today, and which experiments would settle it, so that:
 | Field | Meaning |
 |-------|---------|
 | `id` | Stable id, e.g. `P1-F4` |
-| `source_paper` | `P1`..`P7` (Quantization, Pruning, KV/attention compression, Distillation/low-rank/lossless, NVFP4, Sparse attention, Speculative decoding) |
+| `source_paper` | `P1`..`P7` (Quantization, Pruning, KV/attention compression, Distillation/low-rank/lossless, NVFP4, Sparse attention, Speculative decoding) or `T158` (the tern158 report, ADR 0007) |
 | `location` | Section / table / finding in the paper |
 | `statement` | The claim, phrased so it can be tested |
 | `status` | `untested` -> `reproduced` / `contradicted` / `partial` |
@@ -58,9 +58,23 @@ except those that a test in this repository reproduces with synthetic data** (fo
 as KV bytes per token or the E2M1 grid). A claim checked on synthetic tensors is not a claim about real models;
 say so in `notes`.
 
-## Ternary (tern158) numbers are not in the ledger yet
+## Ternary (tern158) claims
 
-The tern158 report's claims (never learn the scale; one Lloyd step recovers ~86% of the absmean gap; equilibrium flip rate 0.59*sqrt(2*lr*wd); zero density 40-52% healthy; INT8 pipe ~1/30 of
-FP8 on sm_103; 8x less traffic from gathering packed codes) and tern158's own sm_120 measurements (mma 346-411 TOPS, 125M run ppl 141 at step 500) are **not seeded** as ledger claims: the
-seed tests tie every claim to a planner rule and no ternary rule exists yet. Until then they appear only as labelled TARGET values (health thresholds, gate `g-t158`, simulator caption) and in
-`docs/TERNARY.md`; none of them has been reproduced through Forge.
+The tern158 report merged under ADR 0007 supplies a second source, `T158` (not one of P1-P7). Its claims are seeded like
+the others and every one is `untested` until a Forge experiment links a result:
+
+| Claim | Statement (short) | Prior | Rule |
+|-------|-------------------|-------|------|
+| `T158-FMT-01` | 2-bit codes + fp32 scale per 128 weights = 2.25 bits/weight (7.1x less than bf16) | trusted (byte arithmetic) | `R-Q7-TERNARY` |
+| `T158-SCALE-01` | the per-group scale is never learned (detached STE) | untrusted | `R-Q7-TERNARY` |
+| `T158-LLOYD-01` | one Lloyd step after absmean recovers ~86% of the SQNR gap | untrusted | `R-Q7-TERNARY` |
+| `T158-FLIP-01` | equilibrium flip rate 0.59*sqrt(2*lr*wd) | trusted (derivation) | `R-Q7-TERNARY` |
+| `T158-ZERO-01` | zero density 40-52% healthy, 60% warn, 80% collapse | untrusted (TARGET band) | `R-Q7-TERNARY` |
+| `T158-INT8-01` | INT8 pipe ~1/30 of FP8 on sm_103 (B300/GB300) | untrusted (datasheet) | `R-Q7-TERNARY` |
+| `T158-SM120-01` | 346-411 INT8 TOPS at M=4096 on sm_120, vs 332-359 bf16/cuBLAS | untrusted (one machine) | `R-Q7-TERNARY` |
+| `T158-TRAIN-01` | 125M run: ppl 141 at step 500, ~170k tok/s, 9.0 GB on one sm_120 card | untrusted (one run, no baseline) | `R-Q7-TERNARY` |
+| `T158-QAT-01` | quality recovers only through QAT + distillation on billions of tokens; one-shot ternarisation is lossy | untrusted | `R-Q7-TERNARY` |
+
+These numbers are TARGETs or single-project reports, never Forge measurements: the health thresholds, the `g-t158` gate
+thresholds and the training-simulator caption stay labelled accordingly. Resolve a claim only by linking an archived
+report (the ladder in `docs/runbooks/ternary-validation.md` produces the candidates).

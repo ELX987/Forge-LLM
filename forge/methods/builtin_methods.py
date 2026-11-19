@@ -46,12 +46,14 @@ reg(M(id="bitdelta", title="BitDelta (1-bit delta)", family="compression", statu
 # --- ternary (this merge; see docs/TERNARY.md) ---------------------------------------------------------------------------------
 reg(M(id="ternary-train", title="Ternary (1.58-bit) QAT from scratch", family="ternary", status="experimental", job_type="ternary_train",
       template="ternary/scratch-125m.yaml", summary="Latent-weight QAT with {-1,0,+1} weights and int8 activations; health metrics ternary/*. "
-      "CPU-validated only; no ternary kernel yet.", needs=["dataset"], diagnostics_prefix="ternary", planner_scheme="t158", docs="docs/TERNARY.md"))
-reg(M(id="ternary-ptq", title="Ternary post-training quantisation", family="ternary", status="planned",
-      summary="Absmean/Lloyd ternarisation of a pretrained model (recipe stage `ternarize`). Phase P3.", produces="quantized",
+      "CPU-validated only; the Triton kernel is written but has not run on a GPU.", needs=["dataset"], diagnostics_prefix="ternary", planner_scheme="t158", docs="docs/TERNARY.md"))
+reg(M(id="ternary-ptq", title="Ternary post-training quantisation", family="ternary", status="experimental", job_type="compress",
+      template="recipes/ternary-ptq.yaml", summary="Data-free absmean/Lloyd ternarisation of a pretrained model to packed t158 layers plus the g-t158 gate. "
+      "One-shot and lossy: use it to size the artifact and measure SQNR, not as a quality route.", produces="quantized",
       diagnostics_prefix="ternary", planner_scheme="t158", docs="docs/TERNARY.md"))
-reg(M(id="ternary-convert", title="Convert a pretrained model to ternary", family="ternary", status="planned",
-      summary="HF -> ternary with warm-up, SubLN and KD recovery. Phase P3.", produces="quantized", needs=["teacher model", "dataset"],
+reg(M(id="ternary-convert", title="Convert a pretrained model to ternary", family="ternary", status="experimental", job_type="compress",
+      template="recipes/ternary-convert.yaml", summary="Pretrained -> ternary with QAT warm-up and KD recovery (emulated fake-quant compute), then ternarize and pack. "
+      "Fill the recipe's data section before running; not validated on hardware.", produces="quantized", needs=["teacher model", "dataset"],
       diagnostics_prefix="ternary", planner_scheme="t158", docs="docs/TERNARY.md"))
 reg(M(id="ternary-lora", title="LoRA on a ternary base", family="ternary", status="planned", summary="Adapters on a packed ternary model. Phase P3.",
       produces="adapter", docs="docs/TERNARY.md"))

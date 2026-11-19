@@ -72,6 +72,7 @@ class EvalParams(BaseModel):
     gate: str | None = Field(None, description="Optional forge.eval gate id (g-w4, g-fp8, g-lossless, g-struct, ...) evaluated together with the suites.")
     seeds: list[int] = Field([0], description="Evaluation seeds (first = main run).")
     n_bootstrap: int = Field(1000, ge=100, description="Bootstrap resamples for confidence intervals.")
+    noise_repeats: int | None = Field(None, ge=0, le=50, description="Parent repeats used to estimate the noise floor (None = the gate's value, 0 = disabled).")
     context: dict[str, Any] = Field(default_factory=dict, description="Extra facts for gate rules (params_b, ...).")
     persist: bool = Field(True, description="Store the EvalReport in the database.")
     builtin: bool = Field(False, description="Skip forge.eval and use the minimal built-in comparison (KL / flip / perplexity). Used automatically if forge.eval is unavailable.")

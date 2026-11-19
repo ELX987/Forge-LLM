@@ -85,7 +85,7 @@ def _compile_group(name, dtype, native_fp8=False):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("group", ["decode", "mla", "prefill", "sparse_spec", "moe", "util"])
+@pytest.mark.parametrize("group", ["decode", "mla", "prefill", "sparse_spec", "moe", "util", "mixed"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_kernels_compile_offline(group, dtype):
     n = _compile_group(group, dtype)

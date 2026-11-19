@@ -40,6 +40,7 @@ Hardware: fp16 kernels sm_70+, bf16 kernels sm_80+, FP8 *stores* sm_89+ (FP8 KV/
 | Plan item | Public API (`forge.kernels.ops_*`) | Triton | Oracle |
 |---|---|---|---|
 | **KR-4 / K4** paged decode, GQA-grouped, split-KV + LSE merge, FP8/INT8/INT4 KV, residual window, sliding window, ragged lengths | `ops_attn.paged_decode_attention` | `triton/attn_decode.py` (`run_paged_attention`), `attn_common.py` | `ref/attn_decode.py`, `attn_kv.py` |
+| **K4b** mixed-precision block-scaled decode: **NVFP4 / MXFP4 / ternary (1.58-bit)** KV + softcap + attention sink, one path for every KV dtype | `ops_attn.mixed_attention` | `triton/attn_mixed.py` | `ref/attn_mixed.py` (oracle), `attn_kv.py` (format numerics) |
 | K4 MLA latent decode (+ sparse/window) | `ops_attn.mla_decode_attention` | `triton/attn_mla.py` | `ref/attn_decode.mla_decode_attention_ref` |
 | prefill / chunked prefill, paged KV write | `ops_attn.prefill_attention`, `chunked_prefill_attention`, `paged_kv_write` | `triton/attn_prefill.py` (torch SDPA fallback on CUDA) | `ref/attn_prefill.py` |
 | **KR-5 / K5** lightning indexer scan, top-k, token/block gather attention, cross-layer sharing, selector-bytes accounting | `lightning_indexer_scores`, `select_sparse_indices`, `sparse_topk_attention`, `sparse_decode_step`, `SharedSelector`, `selector_bytes`, `ops_util.topk_select` | `triton/attn_sparse.py` (+ `topk_idx` mode of decode/MLA kernels) | `ref/attn_sparse.py` |

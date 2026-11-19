@@ -235,6 +235,11 @@ def quality_prior(c: Candidate, model: ModelSpec, budget: Budget | None = None) 
         base = _weight_prior(s, model)
     elif c.kind in ("sub35", "sub35_qat"):
         base = QualityPrior(0.93 if c.kind == "sub35_qat" else 0.88, 0.06, Provenance.untested, "P1 F5: usable at 2 bits for large models only")
+    elif c.kind in ("ternary_ptq", "ternary_qat"):
+        if c.kind == "ternary_ptq":
+            base = QualityPrior(0.70, 0.15, Provenance.untested, "one-shot ternarisation is lossy (expected to fail g-t158); artifact sizing / SQNR probe only")
+        else:
+            base = QualityPrior(0.90, 0.10, Provenance.untested, "ternary QAT + distillation: literature claims near-parity at scale after long training; nothing measured in Forge")
     elif c.kind == "prune_distill":
         base = QualityPrior(max(0.5, 0.78 + 0.22 * c.footprint_ratio - 0.08), 0.06, Provenance.untested, "Plan G5 target: student meets the gate at <=25% of parent footprint; no measurements")
     elif c.kind == "expert_prune":
@@ -708,6 +713,10 @@ def plan(
             dropped.append(sc)
         elif sc.candidate.requires_training and not bd.allow_training:
             sc.status, sc.reasons = "not_run", ["needs training compute; budget.allow_training is false"]
+            dropped.append(sc)
+        elif bd.max_bits_per_weight is not None and sc.candidate.scheme.weight_bits_eff > bd.max_bits_per_weight:
+            eff = sc.candidate.scheme.weight_bits_eff
+            sc.status, sc.reasons = "over_budget", [f"{sc.candidate.scheme.name} stores {eff:.3g} bits/weight > budget.max_bits_per_weight={bd.max_bits_per_weight:g}"]
             dropped.append(sc)
         else:
             live.append(sc)

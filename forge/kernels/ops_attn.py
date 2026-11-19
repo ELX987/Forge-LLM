@@ -19,13 +19,17 @@ import torch
 
 from forge.kernels.ops_util import topk_select  # noqa: F401  (re-export)
 from forge.kernels.ref import attn_decode as _dec
+from forge.kernels.ref import attn_mixed as _mix
 from forge.kernels.ref import attn_prefill as _pre
 from forge.kernels.ref import attn_sparse as _sp
 from forge.kernels.ref import attn_spec as _spec
 from forge.kernels.ref.attn_kv import (  # noqa: F401  (public re-exports)
+    BLOCK_KV_DTYPES,
     build_paged_pools,
+    is_block_quantised,
     normalize_kv_dtype,
     quantize_kv_page,
+    quantize_kv_page_block,
 )
 from forge.kernels.ref.attn_sparse import (  # noqa: F401
     SharedSelector,
@@ -59,6 +63,9 @@ KERNELS: dict[str, dict[str, Any]] = {
                           "ref": "attn_sparse.indexer_scores_ref"},
     "tree_attention": {"family": "spec", "min_sm": 70, "triton": "forge.kernels.triton.attn_spec",
                        "ref": "attn_spec.tree_attention_ref"},
+    "mixed_attention": {"family": "attention", "min_sm": 70, "triton": "forge.kernels.triton.attn_mixed",
+                        "ref": "attn_mixed.mixed_attention_ref", "experimental": False,
+                        "description": "mixed-precision paged decode: bf16/fp16/fp32/fp8/int8/int4/nvfp4/mxfp4/ternary KV"},
 }
 
 _FLOATS = (torch.float16, torch.bfloat16)
@@ -139,6 +146,74 @@ def paged_decode_attention(
         q, k_pool, v_pool, block_tables, seq_lens, softmax_scale=softmax_scale, kv_dtype=kv, k_scale=k_scale,
         v_scale=v_scale, k_zero=k_zero, v_zero=v_zero, window=window, k_res=k_res, v_res=v_res, res_lens=res_lens,
         topk_idx=topk_idx, return_lse=return_lse)
+
+
+def mixed_attention(
+    q: torch.Tensor,
+    k_pool: torch.Tensor,
+    v_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    kv_dtype: str = "bf16",
+    k_scale=None,
+    v_scale=None,
+    k_zero=None,
+    v_zero=None,
+    k_block_scale: torch.Tensor | None = None,
+    v_block_scale: torch.Tensor | None = None,
+    tensor_scale: torch.Tensor | None = None,
+    window: int | None = None,
+    softcap: float | None = None,
+    sink: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
+    num_splits: int | None = None,
+    return_lse: bool = False,
+):
+    """Unified mixed-precision paged decode attention for **every** KV format Forge supports.
+
+    One call for BF16/FP16/FP32, FP8-E4M3, INT8, INT4, NVFP4, MXFP4 and ternary (1.58-bit) KV caches - the Forge
+    counterpart of FlashAttention's decode path, extended to the block-scaled / 1.58-bit formats FA does not cover.
+    Block-scaled formats (``nvfp4`` / ``mxfp4`` / ``ternary``) run the dedicated two-pass kernel
+    (:mod:`forge.kernels.triton.attn_mixed`); the fp8/int8/int4 family and the plain float dtypes reuse the K4 paged
+    kernel (:func:`paged_decode_attention`).  Everything falls back to :func:`forge.kernels.ref.attn_mixed.mixed_attention_ref`.
+
+    Arguments match :func:`paged_decode_attention` (``q [B, Hq, D]``, head-major pools ``[P, Hkv, ps, D']``, the decode
+    query at position ``seq_len - 1``) plus the block-scale tensors and ``softcap`` / ``sink``.  See the oracle for the
+    exact semantics of every KV format.  Returns ``out [B, Hq, D]`` (+ natural-log ``lse [B, Hq]`` if ``return_lse``).
+    """
+    kv = normalize_kv_dtype(kv_dtype)
+    if kv not in _mix.MIXED_KV_DTYPES:
+        raise ValueError(f"unsupported kv_dtype {kv_dtype!r}; expected one of {_mix.MIXED_KV_DTYPES}")
+    block = is_block_quantised(kv)
+    # plain float and fp8/int8/int4 KV: delegate to the existing K4 paged kernel (same maths, its own formats)
+    if not block and kv in ("bf16", "fp16", "fp32", "fp8_e4m3", "int8", "int4") and softcap is None and sink is None:
+        _d.note_path("mixed_attention", "paged_decode_attention" if _tri(q, op="mixed_attention") else "reference")
+        return paged_decode_attention(
+            q, k_pool, v_pool, block_tables, seq_lens, softmax_scale=softmax_scale, kv_dtype=kv, k_scale=k_scale,
+            v_scale=v_scale, k_zero=k_zero, v_zero=v_zero, window=window, max_seq_len=max_seq_len,
+            num_splits=num_splits, return_lse=return_lse)
+    if block and (k_block_scale is None or v_block_scale is None):
+        raise ValueError(f"{kv} KV needs k_block_scale and v_block_scale")
+    if kv == "nvfp4" and tensor_scale is None:
+        raise ValueError("nvfp4 KV requires its tensor_scale (the pool stores block scales pre-divided by it)")
+    common = dict(softmax_scale=softmax_scale, kv_dtype=kv, k_scale=k_scale, v_scale=v_scale, k_zero=k_zero,
+                  v_zero=v_zero, k_block_scale=k_block_scale, v_block_scale=v_block_scale, tensor_scale=tensor_scale,
+                  window=window, softcap=softcap, sink=sink, return_lse=return_lse)
+    if block:
+        can_tri = (_q_ok(q) and q.shape[-1] % (32 if kv != "nvfp4" else 16) == 0 and q.shape[1] % k_pool.shape[1] == 0
+                   and 16 <= q.shape[-1] <= 256)
+        if can_tri and _tri(q, k_pool, v_pool, block_tables, seq_lens, op="mixed_attention"):
+            from forge.kernels.triton.attn_mixed import mixed_attention_triton
+
+            return mixed_attention_triton(q, k_pool, v_pool, block_tables, seq_lens, max_seq_len=max_seq_len,
+                                          num_splits=num_splits, **common)
+        _d.note_path("mixed_attention", "reference")
+        return _mix.mixed_attention_ref(q, k_pool, v_pool, block_tables, seq_lens, **common)
+    # non-block format with softcap/sink: the paged kernel has no softcap/sink, so use the oracle (honest fallback)
+    _d.note_path("mixed_attention", "reference")
+    return _mix.mixed_attention_ref(q, k_pool, v_pool, block_tables, seq_lens, **common)
 
 
 def mla_decode_attention(q_nope: torch.Tensor, q_rope: torch.Tensor, c_pool: torch.Tensor, r_pool: torch.Tensor,

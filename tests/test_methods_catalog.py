@@ -38,7 +38,9 @@ def test_nothing_claims_gpu_validation_yet():
 def test_ternary_train_is_experimental_and_in_ternary_family():
     m = get_method("ternary-train")
     assert m.status == "experimental" and m.family == "ternary" and m.diagnostics_prefix == "ternary" and m.job_type == "ternary_train"
-    assert {x.id for x in list_methods(family="ternary", status="experimental")} == {"ternary-train"}
+    assert {x.id for x in list_methods(family="ternary", status="experimental")} == {"ternary-train", "ternary-ptq", "ternary-convert"}
+    for mid in ("ternary-ptq", "ternary-convert"):
+        assert get_method(mid).planner_scheme == "t158"
 
 
 def test_register_and_lookup_errors():

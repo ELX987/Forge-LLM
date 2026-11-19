@@ -19,9 +19,9 @@ def kinds(cands):
 
 # ------------------------------------------------------------------ the rulebase is data and is consistent with the ledger
 def test_flow_and_table_cover_the_plan():
-    assert [n["id"] for n in rb.FLOW] == ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6"]
+    assert [n["id"] for n in rb.FLOW] == ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"]
     assert len([r for r in rb.RULES if r["table"].startswith("Table 5.1")]) == 11
-    assert len([r for r in rb.RULES if r["table"] == "Fig 5.3"]) == 6
+    assert len([r for r in rb.RULES if r["table"] == "Fig 5.3"]) == 7
     assert len({r["id"] for r in rb.RULES}) == len(rb.RULES)
     for r in rb.RULES:
         assert r["claims"], f"{r['id']} points at no ledger entry (G1: every default points at a ledger entry)"
@@ -147,6 +147,45 @@ def test_sub35_and_training_precision_and_budget_flags():
     assert d.count("delta") == 2
 
 
+def test_ternary_rule_is_experimental_gated_and_needs_a_bit_cap():
+    wl = Workload(batch_sizes=[1])
+    tight = rb.Budget(max_bits_per_weight=2.5)
+    assert not {"ternary_ptq", "ternary_qat"} & set(kinds(rb.propose(L70, "capacity", H100, tight, wl)))  # Tier 3 / gated
+    b = rb.Budget(max_bits_per_weight=2.5, allow_experimental=True, allow_training=True)
+    c = rb.propose(L70, "capacity", H100, b, wl)
+    assert {"ternary_ptq", "ternary_qat"} <= set(kinds(c))
+    ptq = next(x for x in c if x.kind == "ternary_ptq")
+    assert ptq.gate == "g-t158" and ptq.recipe.stage_names() == ["ternarize", "pack", "eval", "gate"]
+    assert ptq.scheme.family == "t158" and ptq.scheme.weight_bits_eff == pytest.approx(2.25)
+    assert ptq.rule_ids == ["R-Q7-TERNARY"] and "T158-FMT-01" in ptq.claim_ids
+    assert any("expected to fail G-T158" in n for n in ptq.notes)
+    qat = next(x for x in c if x.kind == "ternary_qat")
+    assert qat.requires_training and qat.recipe.stage_names()[:3] == ["distill", "ternarize", "pack"]
+    assert qat.recipe.stages[0].params["config"]["precision"]["quant_aware"] == "ternary"
+    assert any("fill the delegate distill config" in n for n in qat.notes)
+    # the planner's ternary stages are valid for the stage param models (a recipe that cannot be run is not a candidate)
+    from forge.compress.config import STAGE_PARAM_MODELS
+
+    for cand in (ptq, qat):
+        for stage in cand.recipe.stages:
+            if stage.name in STAGE_PARAM_MODELS:
+                STAGE_PARAM_MODELS[stage.name].model_validate(stage.params)
+    # no training budget: only the one-shot arm; no bit cap at all: the rule stays silent
+    c2 = rb.propose(L70, "capacity", H100, rb.Budget(max_bits_per_weight=2.5, allow_experimental=True), wl)
+    assert "ternary_ptq" in kinds(c2) and "ternary_qat" not in kinds(c2)
+    assert "ternary_ptq" not in kinds(rb.propose(L70, "capacity", H100, rb.Budget(allow_experimental=True, allow_training=True), wl))
+
+
+def test_ternary_rule_requires_an_unthrottled_int8_pipe():
+    wl = Workload(batch_sizes=[1])
+    assert not CHIP_PRESETS["b300"].supports("int8")  # sm_103: INT8 pipe throttled, no usable rate in the table
+    trace = rb.propose_with_trace(L70, "capacity", CHIP_PRESETS["b300"], rb.Budget(max_bits_per_weight=2.5, allow_experimental=True), wl)[1]
+    rec = next(t for t in trace if t["rule"] == "R-Q7-TERNARY")
+    assert not rec["fired"] and "int8_fast" in rec["reason"]
+    fired = rb.propose(L70, "capacity", CHIP_PRESETS["rtx-pro-6000-blackwell"], rb.Budget(max_bits_per_weight=2.5, allow_experimental=True), wl)
+    assert "ternary_ptq" in kinds(fired)
+
+
 def test_tight_accuracy_adds_g64_and_candidates_are_deduplicated():
     wl = Workload(batch_sizes=[1])
     loose = [c for c in rb.propose(L70, "capacity", H100, rb.Budget(max_quality_loss_pct=4), wl) if c.kind == "w4a16"]
@@ -182,7 +221,7 @@ def test_seed_claims_are_real_and_complete():
     ids = [c["id"] for c in SEED_CLAIMS]
     assert len(ids) == len(set(ids))
     papers = {c["source_paper"] for c in SEED_CLAIMS}
-    assert papers == {"P1", "P2", "P3", "P4", "P5", "P6", "P7"}
+    assert papers == {"P1", "P2", "P3", "P4", "P5", "P6", "P7", "T158"}
     for c in SEED_CLAIMS:
         assert c["statement"].endswith(".") and len(c["statement"]) > 40 and c["location"]
         assert c["prior"] in ("trusted", "untrusted") and c["id"].startswith(c["source_paper"] + "-")
@@ -197,6 +236,23 @@ def test_seed_claims_are_real_and_complete():
         e = c["expectation"]
         if e:
             assert e["direction"] in ("approx", "at_least", "at_most") and {"metric", "expected", "tolerance"} <= set(e)
+
+
+def test_t158_claims_are_seeded_and_linked_to_the_ternary_rule(tmp_path):
+    from forge.core.db import Database
+
+    db = Database(tmp_path / "t158.db")
+    db.migrate()
+    ledger.seed_claims(db=db)
+    c = ledger.get_claim("T158-SM120-01", db=db)
+    assert c.source_paper == "T158" and c.depends_rules == ["R-Q7-TERNARY"] and c.status == "untested" and c.prior == "untrusted"
+    assert {x.id for x in ledger.list_claims(rule="R-Q7-TERNARY", db=db)} >= {"T158-FMT-01", "T158-SM120-01", "T158-TRAIN-01"}
+    ev = ledger.rule_evidence("R-Q7-TERNARY", db=db)
+    assert ev["untested"] == len(rb.RULES_BY_ID["R-Q7-TERNARY"]["claims"]) and not ev["ready"] and ev["reproduced"] == 0
+    # the ternary claims are real ledger entries: search risk looks them up without falling back to placeholders
+    ranked = {t["id"]: t for t in ledger.claims_needing_attention(100, db=db)}
+    t158 = {cid: r for cid, r in ranked.items() if cid.startswith("T158-")}
+    assert t158 and all(r["n_rules"] == 1 and "R-Q7-TERNARY" in r["depends_rules"] for r in t158.values())
 
 
 def test_seed_and_crud(tmp_path):

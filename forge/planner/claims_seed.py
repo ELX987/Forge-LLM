@@ -1,5 +1,8 @@
 """Seed data for the claims ledger (Plan 5.5): testable claims drawn from the Plan and the seven source papers P1-P7.
 
+The ``T158-*`` rows come from the tern158 report merged under ADR 0007, not from P1-P7: they are single-project evidence
+(one sm_120 machine, one 125M run) and stay ``untrusted`` until a Forge experiment reproduces them.
+
 Rules of the ledger (Plan 5.5 and 1.4):
 
 * every claim starts ``status="untested"`` - the papers are a map, not ground truth;
@@ -218,4 +221,40 @@ SEED_CLAIMS: list[dict[str, Any]] = [
     _c("P7-SSD-01", "P7", "Abstract",
        "Speculative speculative decoding (Saguaro) reports about 30% average gain over strong speculative-decoding baselines and up to 5x over autoregressive decoding at batch size 1 on four H100s plus a fifth for the drafter.",
        U, "Needs additional hardware; author-reported.", None),
+    # ---------------------------------------------------------------- T158 ternary (tern158 report; not one of P1-P7)
+    _c("T158-FMT-01", "T158", "Report Ch. 4 (format); docs/TERNARY.md",
+       "Ternary weights {-1,0,+1} packed as 2-bit codes with one fp32 scale per 128 weights store 2.25 bits per weight, a 7.1x reduction against bf16 before dense exclusions.",
+       T, "Byte arithmetic (reproduced in the round-trip tests); the tern158 report's 8x traffic figure assumes 16-bit scales and no dense layers.",
+       {"metric": "t158_bits_per_weight_g128", "expected": 2.25, "tolerance": 0.001, "direction": "approx"}),
+    _c("T158-SCALE-01", "T158", "Report Ch. 5 (QAT)",
+       "The per-group scale is never learned: it is detached from the gradient and updated only by the quantiser, so ternary QAT cannot drift the scales away from the absmean solution.",
+       U, "Design claim from the source project; the Forge implementation follows it but has not been measured against a learned-scale variant.", None),
+    _c("T158-LLOYD-01", "T158", "Report Ch. 6 (conversion)",
+       "One Lloyd refinement step after an absmean initialisation recovers about 86% of the SQNR gap between absmean and the optimal per-group ternary codebook.",
+       U, "Single-source simulation; Forge reproduces the machinery and the per-layer SQNR report, not this number.",
+       {"metric": "t158_lloyd_gap_recovered", "expected": 0.86, "tolerance": 0.05, "direction": "at_least"}),
+    _c("T158-FLIP-01", "T158", "Report Ch. 5 (health metrics)",
+       "Ternary QAT settles at an equilibrium per-step flip rate of 0.59*sqrt(2*lr*wd); a rate far above it indicates an unstable learning rate or weight decay.",
+       T, "Closed-form derivation quoted by the report; Forge records flip rate as a TARGET band, not a measurement.",
+       {"metric": "t158_flip_rate_coeff", "expected": 0.59, "tolerance": 0.02, "direction": "approx"}),
+    _c("T158-ZERO-01", "T158", "Report Ch. 5 (health metrics)",
+       "A healthy ternary model keeps a zero-code density of 40-52%; above 60% the model warns and above 80% it has collapsed.",
+       U, "TARGET band from the source project's runs; not re-measured here.",
+       {"metric": "t158_zero_density_healthy_hi", "expected": 0.52, "tolerance": 0.02, "direction": "approx"}),
+    _c("T158-INT8-01", "T158", "Report Ch. 8 (hardware)",
+       "The INT8 tensor-core pipe on sm_103 (B300/GB300) runs at roughly 1/30 of the FP8 rate, so ternary kernels must fall back to bf16 compute on those parts.",
+       U, "Datasheet-derived; unconfirmed on hardware (the chip table's int8_tc_fast flag encodes it).",
+       {"metric": "t158_sm103_int8_vs_fp8_ratio", "expected": 0.033, "tolerance": 0.02, "direction": "approx"}),
+    _c("T158-SM120-01", "T158", "Report Ch. 8 (measured)",
+       "tern158's hand-written ternary kernel measured 346-411 INT8 TOPS at M=4096 on an RTX PRO 6000 Blackwell (sm_120), versus 332-359 TOPS for the bf16/cuBLAS route.",
+       U, "Single-machine measurement from the source project; not reproduced through Forge.",
+       {"metric": "t158_sm120_tops_m4096", "expected": 346.0, "tolerance": 65.0, "direction": "at_least"}),
+    _c("T158-TRAIN-01", "T158", "Report Ch. 7 (measured)",
+       "A 125M-parameter ternary run on 200M tokens reached validation perplexity 141 (loss 4.949) at step 500 of 763 on one RTX PRO 6000 Blackwell, at about 170k tokens/s and 9.0 GB.",
+       U, "Single run with no bf16 baseline; method quality and schedule effects are confounded.",
+       {"metric": "t158_125m_val_ppl_step500", "expected": 141.0, "tolerance": 10.0, "direction": "approx"}),
+    _c("T158-QAT-01", "T158", "Report Ch. 5 and Ch. 7; docs/TERNARY.md",
+       "A pretrained model converted to ternary recovers its quality only through QAT plus distillation on billions of tokens (1-10B recovers commonsense, not knowledge); one-shot ternarisation is lossy.",
+       U, "Qualitative, from one project; no Forge conversion of a real model has been evaluated.",
+       None),
 ]

@@ -151,6 +151,20 @@ def test_plan_without_fp8_or_fp4_hardware_emulates_with_notes():
     assert w4.pred.step_ms_b1 > 0
 
 
+def test_plan_enforces_the_bits_per_weight_cap():
+    wl = Workload(batch_sizes=[1], context_lengths=[4096])
+    p = sr.plan(L8, H100, wl, Budget(max_bits_per_weight=2.5, allow_experimental=True, allow_training=True))
+    assert [s.candidate.kind for s in p.ranked] == ["ternary_qat"]
+    assert p.ranked[0].candidate.scheme.weight_bits_eff == pytest.approx(2.25)
+    assert all(s.candidate.scheme.weight_bits_eff <= 2.5 for s in p.ranked)
+    over = [s for s in p.dropped if s.status == "over_budget"]
+    assert {"w4a16", "fp8", "nvfp4"} & {s.candidate.kind for s in over} and any("max_bits_per_weight" in " ".join(s.reasons) for s in over)
+    # sub-3.5-bit methods are Tier 3: without allow_experimental nothing meets a 2.5-bit cap, and the planner says so
+    strict = sr.plan(L8, H100, wl, Budget(max_bits_per_weight=2.5))
+    assert not strict.ranked and any("no candidate survived" in n for n in strict.notes)
+    assert all(s.candidate.scheme.weight_bits_eff > 2.5 for s in strict.dropped if s.status == "over_budget")
+
+
 def test_plan_blackwell_compute_bound_proposes_fp4():
     p = sr.plan(L8, B200, {"batch_sizes": [512], "context_lengths": [128]}, {"allow_experimental": True})
     assert p.binding.binding == "compute"

@@ -169,7 +169,7 @@ Not a Plan work item; tracked here because it adds a method family. Ternary-spec
 | P0 | ADR 0007, TERNARY.md, branch hygiene | done (CPU) | |
 | P1 | Format, layout, oracle, `t158` / `fq_t158`, artifact round trip, `.t158` interchange | done (CPU) | golden vectors from tern158; serves on CPU through the engine |
 | P2 | Quant-mode plug-in, ternary QAT, health metrics, `ternary_train` job, method catalog | done (CPU) | emulated fake-quant: no training speed-up; wd-to-zero schedule and bf16-SR optimizer state not done |
-| P3 | `ternarize` stage, ptq format, g-t158 gate, recipes, train simulator, t158 scheme, chip table | partial | planner rule R-Q7-TERNARY, T158 claims, HF conversion with SubLN, simulator panel on New Job not done |
+| P3 | `ternarize` stage, ptq format, g-t158 gate, recipes, train simulator, t158 scheme, chip table, planner rule `R-Q7-TERNARY` + T158 claims | partial | HF conversion with SubLN, simulator panel on New Job, per-layer health heatmap and Hardware-page probe rows not done |
 | P4 | Triton GEMM + quantiser, dispatcher, chip int8 flags, bench, native tier | GPU-unvalidated | interpreter + PTX only; native tier not wired |
 | P5 | Sharded multi-GPU trainer (`zero_ternary`) | partial | Merged; CPU/gloo tests cover training and checkpoint resharding. Full latent weights remain replicated; NCCL/GPU G1 validation is outstanding (`docs/ZERO_TERNARY.md`) |
 | P6 | Methods page, Ternary Lab, sim panel | done (CPU) | checked visually in demo mode only |

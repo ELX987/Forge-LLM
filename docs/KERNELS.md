@@ -33,6 +33,7 @@ ops_gemm.w4a16_linear(x, packed)           (forge/kernels/ops_*.py)
 | K3 | FP8 GEMM (per-tensor / per-block), INT8 W8A8 | `fp8_linear`, `quantize_act_fp8` | `fp8_gemm_ref` | prefill and batched decode | FP8: sm_89+; INT8: sm_75+ | Wraps the vendor FP8 GEMM where possible (C-044). Scaling granularity is a parameter. |
 | K10 | Ternary (1.58-bit) W1.58A8 GEMM + per-token act quantiser (EXPERIMENTAL, ADR 0007) | `ternary_linear`, `quantize_act_ternary` | `ternary_gemm_ref` | prefill and batched decode | sm_75+ (int8 tensor cores), not sm_103 (throttled INT8) | 2-bit codes (layout `ternary2_row`) decoded in-kernel, int8 `tl.dot` with int32 accumulation, fp32 group scales; groups -1/0/32/64/128k, K % 16 == 0. Triton planes + gather kernels; optional native CUDA tier in `forge/native/ternary` (not wired). |
 | K4 | Decode attention: paged, GQA-grouped, split-KV, quantised KV, MLA | `paged_decode_attention`, `prefill_attention`, `mla_decode_attention` | `paged_decode_attention_ref` | decode, bandwidth-bound | sm_70+ | All query heads of a GQA group share one KV read. KV dtypes: bf16/fp16/fp8_e4m3/int8/int4. Prefill falls back to torch SDPA. |
+| K4b | Mixed-precision block-scaled decode: **NVFP4 / MXFP4 / ternary (1.58-bit)** KV in one path, plus softcap + attention sink | `mixed_attention` | `attn_mixed.mixed_attention_ref` | decode, bandwidth-bound | sm_70+ (fp16), sm_80+ (bf16) | Two-pass flash (pass 1 statistics without V, pass 2 against the exact final LSE), block payload dequantised once per tile and fused into the score / probability matmuls (FA3 block-quantisation trick). KV: bf16/fp16/fp32/fp8/int8/int4/nvfp4/mxfp4/ternary. Binary-compatible with FlashAttention's decode path for the formats FA covers, and the **only** path for 1.58-bit KV. See §6b. |
 | K5 | Sparse attention: indexer, top-k, gather-attention | `sparse_topk_attention` | `sparse_attention_ref` | long context | sm_70+ | Experimental (single-source evidence, Plan C-066). |
 | K6 | Speculative-decoding kernels | `tree_attention`, `rejection_verify`, `kv_compact` | `tree_attention_ref`, rejection oracle | decode | sm_70+ | Verification must be distribution-exact; tested statistically. |
 | K7 | MoE kernels | `moe_route`, `moe_permute`/`unpermute`, `grouped_gemm` | `moe_route_ref`, `moe_grouped_gemm_ref` | decode + prefill | sm_70+ | Variable per-expert M including 0. |
@@ -120,6 +121,7 @@ Three levels, in increasing strength:
 | K2 NVFP4 / MXFP4 dequant GEMM, fused quantiser (`gemm_fp4.py`) | yes | yes (quantiser bit exact vs oracle) | **no** | **no** | none |
 | K2 native block-scaled MMA (`tl.dot_scaled`) | oracle | partly | **no (experimental, API changes between Triton releases)** | **no** | none |
 | K4 paged / split-KV / quantised-KV decode attention, prefill (`attn_decode.py`, `attn_prefill.py`) | yes | yes | **no** | **no** | none |
+| K4b mixed-precision block-scaled decode: NVFP4 / MXFP4 / ternary KV, softcap, sink (`attn_mixed.py`) | yes (oracle vs dense softmax for every format; format codecs; dispatch) | yes (`tests/interp_attn_mixed_cases.py`: all 3 block formats × GQA × page sizes × head dims × windows × softcap × sink × splits, tile-exact vs the oracle) | **no** (offline-compiled for sm_70/75/80/89/90/100/120, bf16 + fp16; `tests_gpu/test_kernels_attn_mixed.py` not run) | **no** | none |
 | K4 MLA decode (`attn_mla.py`) | yes | see `tests/test_kernels_attn_triton_interp.py` | **no** | **no** | none |
 | K5 sparse attention (`attn_sparse.py`) | yes | see interp suite | **no** | **no** | none |
 | K6 tree attention / speculation kernels (`attn_spec.py`) | yes (+ statistical exactness tests in `tests/test_serve_spec.py`) | see interp suite | **no** | **no** | none |
@@ -363,6 +365,50 @@ sm_120 behaviour of Triton 3.8 (the user's version) vs the 3.9 used offline, and
 expectation "approaches 3-4x at small M" is the Plan target (spec KPI 3.2x), not a result; with CUDA-graph timing the ceiling is
 roughly the traffic ratio (16 / 4.19 bits per weight incl. scales and zeros, i.e. ~3.8x for the user's artifact) times
 the achieved-bandwidth ratio of the two kernels.
+
+## 7c. Mixed-precision block-scaled attention (K4b): the fast, honest Forge decode kernel
+
+`ops_attn.mixed_attention` is one decode-attention path for **every** KV precision Forge supports, including the
+1.58-bit (ternary) cache that FlashAttention does not cover. It is the Forge answer to "we are up against
+FlashAttention": it borrows FA's proven design and extends it to the low-bit formats.
+
+**What it borrows from FlashAttention (and why it transfers to portable Triton).**
+
+* **FA2 work partitioning / GQA** - one program per (sequence, KV head, split); the `g = Hq/Hkv` query heads of a KV
+  head fill the `tl.dot` M rows so every KV byte feeds `g` heads. Paged KV via block tables (`pos -> page_table[pos//ps]`),
+  `BLOCK_N` independent of the page size (FA2 2.5).
+* **FA2 split-KV (flash-decoding)** - each split writes a normalised partial `O` + natural-log LSE; a stable LSE merge
+  combines them, empty splits carry `-inf`. Deterministic for a fixed split count (no atomics).
+* **FA3 block quantisation** - the per-block scale is applied to the **score** tile (`S * k_scale`) and to the
+  **value** tile (`(P) @ (V * v_scale)`), never to the stored payload, so the 4-bit / 2-bit payload is expanded exactly
+  once per tile. `sum_c p * (v_c s_c) == sum_c (p s_c) * v_c` is what makes the fold exact.
+* **FA4 `frexp` E8M0 exponent** - `ref.attn_kv.e8m0_exponent` derives the MXFP4 power-of-two scale with `frexp`, so a
+  block maximum just above a power of two is never rounded *down* onto it (a `log2`-based rule can be off by one).
+* **FA4 rescale threshold** - relevant to a *single-pass* accumulator that rescales `acc` on every tile; the two-pass design
+  here fixes the LSE after pass 1, so pass 2 needs no per-tile rescale at all (the threshold would only matter for the
+  future fused single-pass variant). The kernel keeps a `RESCALE_THRESHOLD` constexpr slot for that variant; it is 0 today.
+* **FA4 `track_unquantized_sum`** - the LSE / normaliser come from the float32 probabilities even when `P` is cast to a
+  lower dtype for the PV dot (`p_dtype` in the oracle), so a quantised P does not bias the softmax denominator.
+* **FA4 attention sink + Gemma-2 softcap** - an optional per-head sink logit enlarges the denominator (and LSE) without a
+  value vector, folded into the *merged* statistics once (so split-KV does not count it per split); softcap squashes the
+  logits on the natural-logit scale before the log2 conversion.
+
+**What is Forge's own.** The ternary (1.58-bit) path: keys/values in `{-1,0,+1}` with per-32-channel fp32 block scales,
+decoded in registers and fed to the same recurrence. FlashAttention has no 1.58-bit KV path, and its Blackwell decode
+kernel (`flash_fwd_decode_sm100.py`) is CuTeDSL/tcgen05-specific and cannot be ported to portable Triton; the *design*
+(swap-AB split decode, K-ahead-of-V ring, named-barrier warp roles) is what informed the tile/split layout here.
+
+**Status (HONEST).** Implemented; the kernel *logic* is tile-exact against the oracle in the Triton CPU interpreter
+(`tests/interp_attn_mixed_cases.py`). **Not compiled or run on a GPU** - `tests_gpu/test_kernels_attn_mixed.py` is the
+gate. Native block-scaled MMA (`tl.dot_scaled`) is deliberately **not** used: payloads are expanded to the activation
+dtype in registers, which is what lets ternary work and keeps one code path across sm_70…sm_121. The two-pass form reads
+the (packed) KV twice; a fused single-pass variant that keeps the tile's V in registers is the obvious next optimisation
+and is not implemented.
+
+**Why this matters for speed.** For bf16 the KV traffic is 16 bits/element; for NVFP4 it is 4.5, MXFP4 4.25, ternary
+3.0 (`ref.attn_kv.kv_bytes_per_element`). Decode attention is bandwidth-bound, so the ceiling is roughly the traffic
+ratio: `16 / 4.5 ≈ 3.6x` (NVFP4), `16 / 3.0 ≈ 5.3x` (ternary) of the *achieved-bandwidth* ratio of the two kernels -
+a target, not a measurement, until the GPU bench runs.
 
 ## 8. Adding a kernel
 

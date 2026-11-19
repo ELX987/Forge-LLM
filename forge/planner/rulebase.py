@@ -44,8 +44,13 @@ FLOW: list[dict[str, Any]] = [
      "yes": {"action": "FP8 KV -> 4-bit KV; sparse/latent attention; test at full length", "rule": "R-Q5-KV"}, "no": {"next": "Q6"},
      "source": "Plan Fig 5.3", "claims": ["P1-KV-01", "P3-KV-01", "P3-EVICT-01"]},
     {"id": "Q6", "question": "Must the model fit under 3.5 bits per weight?",
-     "yes": {"action": "Vector / trellis PTQ or QAT / distillation; budget the evaluation effort", "rule": "R-Q6-SUB35"}, "no": {"action": "done", "next": None},
+     "yes": {"action": "Vector / trellis PTQ or QAT / distillation; budget the evaluation effort", "rule": "R-Q6-SUB35", "next": "Q7"},
+     "no": {"action": "done", "next": None},
      "source": "Plan Fig 5.3", "claims": ["P1-SUB4-01", "P1-EVAL-01"]},
+    {"id": "Q7", "question": "Under 3.5 bits: is a {-1,0,+1} weight code acceptable (2.25 bit/weight with g128 scales) and does the chip have an unthrottled INT8 tensor-core pipe?",
+     "yes": {"action": "Ternary t158: one-shot ternarisation probe, or QAT + distillation recovery for the artifact", "rule": "R-Q7-TERNARY"},
+     "no": {"action": "stay with R-Q6 (vector/trellis) or fall back one precision level", "next": None},
+     "source": "tern158 report (see docs/TERNARY.md)", "claims": ["T158-FMT-01", "T158-INT8-01", "T158-QAT-01"]},
 ]
 FLOW_FOOTER = "Every outcome: validate the deployed artifact (KL, flip rate, task suite incl. long-context + safety, free-form generation) vs the 16-bit parent; iterate or fall back one level."
 
@@ -82,6 +87,14 @@ RULES: list[dict[str, Any]] = [
      "paper_refs": ["P1 F5"],
      "proposals": [{"kind": "sub35", "gate": "g-w4", "experimental": True}, {"kind": "sub35_qat", "gate": "g-w4", "experimental": True, "training": True}],
      "note": "Tier 3 (Plan 1.3): scalar grids waste capacity at 2-3 bits; budget extra evaluation effort."},
+    {"id": "R-Q7-TERNARY", "node": "Q7", "table": "Fig 5.3", "title": "Ternary {-1,0,+1} weights (t158) + int8 activations", "forms": ["dense", "moe"], "order": 6,
+     "when": "max_bits_per_weight is not None and max_bits_per_weight < 3.5", "claims": ["T158-FMT-01", "T158-QAT-01", "T158-LLOYD-01", "T158-FLIP-01", "T158-ZERO-01",
+                                                                                            "T158-INT8-01", "T158-SM120-01", "T158-TRAIN-01"],
+     "training": False, "experimental": True, "requires": ["int8_fast"], "paper_refs": ["tern158 report Ch. 4-8", "P1 F5"],
+     "proposals": [{"kind": "ternary_ptq", "gate": "g-t158", "experimental": True},
+                   {"kind": "ternary_qat", "gate": "g-t158", "experimental": True, "training": True}],
+     "note": "2.25 bits/weight stored (2-bit codes + fp32 scale per 128) with int8 activations. One-shot ternarisation is lossy and expected to fail G-T158; the QAT + "
+             "distillation arm is the intended route. EXPERIMENTAL: nothing has run on a GPU through Forge and G-T158 thresholds are TARGETs."},
     # ---- Table 5.1 -----------------------------------------------------------------------------
     {"id": "T-PRUNE-DISTILL", "node": None, "table": "Table 5.1 row 1", "title": "Structured width pruning (GQA-aware) + distillation", "forms": ["dense"], "order": 10,
      "when": "binding in ('capacity', 'bandwidth', 'kv')", "claims": ["P2-PD-01", "P2-DEPTH-01", "P4-BASE-01", "P2-SCALE-01", "P4-OPD-01"], "training": True,
@@ -273,6 +286,29 @@ def build_candidate(model: ModelSpec, kind: str, prop: dict[str, Any], rule: dic
         if kind == "sub35_qat":
             stages.append(StageSpec(name="distill", params={"teacher": "$parent", "mode": "logit", "tokens_b": budget.distill_tokens_b}))
             training = True
+    elif kind in ("ternary_ptq", "ternary_qat"):
+        scheme = parse_scheme("t158").model_copy(update={"method": "qat" if kind == "ternary_qat" else "rtn"})
+        name = "Ternary 1.58b QAT + distillation (t158)" if kind == "ternary_qat" else "Ternary 1.58b one-shot ternarisation (no recovery)"
+        if kind == "ternary_qat":
+            stages.append(StageSpec(name="distill", params={
+                "mode": "delegate",
+                "config": {
+                    "optim": {"lr": 5e-5, "weight_decay": 0.0, "grad_clip": 1.0},
+                    "precision": {"quant_aware": "ternary", "ternary": {"group_size": 128, "rule": "lloyd", "warmup_steps": 500}},
+                    "budget": {"max_steps": 2000},
+                },
+                "licence_check": True,
+            }))
+            training = True
+            notes.append("fill the delegate distill config's data section (dataset ids from dataset_ingest) before running")
+        stages += [StageSpec(name="ternarize", params={"group_size": 128, "rule": "lloyd", "iters": 1}),
+                   StageSpec(name="pack", params={"layout": "auto", "target": None})]
+        notes.append("2.25 bits/weight stored (2-bit codes, 32-bit scale per 128); embeddings / lm_head / router stay dense unless the exclude list changes")
+        if kind == "ternary_ptq":
+            notes.append("data-free one-shot ternarisation is lossy and expected to fail G-T158: use it to size the artifact and measure reconstruction SQNR")
+        else:
+            notes.append("QAT runs as emulated fake-quant bf16 compute: no training speed-up, the product is the 2-bit model")
+        notes.append("EXPERIMENTAL: no ternary GPU run through Forge yet; g-t158 thresholds are TARGET placeholders")
     elif kind == "prune_distill":
         keep = float(prop.get("keep", 0.75))
         footprint = keep
@@ -358,8 +394,10 @@ def build_candidate(model: ModelSpec, kind: str, prop: dict[str, Any], rule: dic
 def planning_context(model: ModelSpec, binding: str, chip: ChipSpec, budget: Budget, workload: Workload | None = None, *, bf16_fits: bool = True,
                      kv_dominates: bool = False) -> dict[str, Any]:
     wl = workload or Workload()
+    has_int8, int8_fast = chip.supports("int8"), bool(chip.supports("int8") and chip.int8_tc_fast)
     return {
         "form": model.form, "binding": binding, "fp8": chip.supports("fp8"), "fp4": chip.supports("fp4"), "two_four": chip.two_four_sparse,
+        "int8": has_int8, "int8_fast": int8_fast,
         "bf16_fits": bf16_fits, "kv_dominates": kv_dominates, "params_b": model.params_b, "allow_training": budget.allow_training,
         "allow_experimental": budget.allow_experimental, "allow_custom_kernels": budget.allow_custom_kernels, "max_batch": max(wl.batch_sizes or [1]),
         "max_bits_per_weight": budget.max_bits_per_weight, "optimise_storage": budget.optimise_storage, "many_finetunes": budget.many_finetunes or model.form == "fleet",
@@ -458,7 +496,7 @@ def propose_with_trace(
             rec["reason"] = f"condition not met: {rule['when']}"
             continue
         # base scheme for rules that stack on a weight scheme
-        base_cand = _best_weight_candidate(cands)
+        base_cand = _best_weight_candidate(cands, max_bits=budget.max_bits_per_weight)
         stack_base = base_cand.scheme.name.split("+")[0] if base_cand else "bf16"
         rctx = dict(ctx, base_scheme=stack_base)
         n_before = len(cands)
@@ -496,11 +534,15 @@ def propose(model: ModelSpec, binding: str, chip: ChipSpec, budget: Budget | Non
 STACKING_KINDS = ("kv", "act_sparsity", "delta", "serving_lossless", "kv_evict", "speculation")
 
 
-def _best_weight_candidate(cands: list[Candidate]) -> Candidate | None:
-    """The first-try weight-quantisation candidate that serving-level rules (KV, speculation, activation sparsity ...) build on."""
-    for kind in ("w4a16", "fp8", "w4a8", "nvfp4", "mxfp4"):
+def _best_weight_candidate(cands: list[Candidate], *, max_bits: float | None = None) -> Candidate | None:
+    """The first-try weight-quantisation candidate that serving-level rules (KV, speculation, activation sparsity ...) build on.
+    ``max_bits`` (``budget.max_bits_per_weight``) keeps the stack base inside the bit cap, so a stacked KV/speculation arm is
+    not billed at 16 or 4 bits when the plan asked for sub-3.5-bit weights."""
+    for kind in ("w4a16", "fp8", "w4a8", "nvfp4", "mxfp4", "ternary_qat", "ternary_ptq"):
         for c in cands:
             if c.kind == kind and c.scheme.kv_bits == 16.0 and not c.scheme.activation_sparsity:
+                if max_bits is not None and c.scheme.weight_bits_eff > max_bits:
+                    continue
                 return c
     return None
 

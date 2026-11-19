@@ -480,7 +480,7 @@ def _eval_report_dict(rep: Any) -> dict[str, Any]:
     return d
 
 
-def _run_forge_eval(inputs, ctx, lm, parent_lm, *, suites, suite_params, gate, overrides, seeds, n_boot, context, persist) -> Any:
+def _run_forge_eval(inputs, ctx, lm, parent_lm, *, suites, suite_params, gate, overrides, seeds, n_boot, context, persist, noise_repeats=None) -> Any:
     from forge.eval.config import EvalConfig, ModelSource, SuiteSelection
     from forge.eval.run import run_eval
 
@@ -491,7 +491,7 @@ def _run_forge_eval(inputs, ctx, lm, parent_lm, *, suites, suite_params, gate, o
         name=f"{_meta(inputs).get('name', 'recipe')}-eval", candidate=ModelSource(kind="none", label="candidate", params_b=pb),
         parent=ModelSource(kind="none", label="parent") if parent_lm is not None else None,
         suites=[SuiteSelection(name=s, params=dict(suite_params.get(s, {}))) for s in suites], gate=gate, gate_overrides=overrides, seeds=list(seeds),
-        n_bootstrap=n_boot, context=ctxd, save_generations=False,
+        n_bootstrap=n_boot, context=ctxd, save_generations=False, noise_repeats=noise_repeats,
     )
     providers = {"candidate": lm.model}
     if parent_lm is not None:
@@ -523,7 +523,7 @@ def stage_eval(inputs: dict[str, Any], params: dict[str, Any], ctx: RunContext) 
     if p.builtin:
         return _builtin_eval(inputs, ctx, p, lm, parent_lm)
     rep = _run_forge_eval(inputs, ctx, lm, parent_lm, suites=p.suites, suite_params=p.suite_params, gate=p.gate, overrides={}, seeds=p.seeds, n_boot=p.n_bootstrap,
-                          context=p.context, persist=p.persist)
+                          context=p.context, persist=p.persist, noise_repeats=p.noise_repeats)
     d = _eval_report_dict(rep)
     h = _store_report(ctx, d)
     return {"eval_report": _jsonable(d), "eval_report_hash": h, "eval_report_id": d.get("id")}

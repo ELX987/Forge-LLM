@@ -35,5 +35,10 @@ def test_attention_kernels_in_triton_interpreter():
 
 
 @pytest.mark.slow
+def test_mixed_precision_attention_in_triton_interpreter():
+    _run(HERE / "interp_attn_mixed_cases.py")
+
+
+@pytest.mark.slow
 def test_moe_and_util_kernels_in_triton_interpreter():
     _run(HERE / "interp_moe_util_cases.py")

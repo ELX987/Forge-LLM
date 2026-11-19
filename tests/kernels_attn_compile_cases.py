@@ -195,9 +195,35 @@ def util_cases(dtype: torch.dtype):
     ug.teal_gemv_triton(torch.randn(1, 128).to(dtype), torch.randn(128, 64).to(dtype), 0.3, bias=torch.randn(64).to(dtype))
 
 
+def mixed_cases(dtype: torch.dtype):
+    """Mixed-precision block-scaled decode (K4b): NVFP4 / MXFP4 / ternary, GQA, head dims, window, sink, splits."""
+    from forge.kernels.triton import attn_mixed as am
+
+    b, hkv, ps = 2, 2, 16
+    lens = [40, 21]
+    g = torch.Generator().manual_seed(0)
+    for fmt, d in (("nvfp4", 64), ("mxfp4", 64), ("ternary", 64)):
+        k = torch.randn(b, hkv, 40, d, generator=g)
+        v = torch.randn(b, hkv, 40, d, generator=g)
+        for gs in (1, 4):
+            q = torch.randn(b, hkv * gs, d, generator=g).to(dtype)
+            p = build_paged_pools(k, v, lens, ps, fmt, generator=g)
+            kw = dict(kv_dtype=fmt, k_block_scale=p["k_block_scale"], v_block_scale=p["v_block_scale"],
+                      tensor_scale=p["tensor_scale"])
+            am.mixed_attention_triton(q, p["k_pool"], p["v_pool"], p["block_tables"], p["seq_lens"], num_splits=2, **kw)
+    # production head dims + window + sink + lse
+    for fmt, d2, ps2, gs2 in (("nvfp4", 128, 32, 8), ("ternary", 128, 16, 8), ("mxfp4", 256, 64, 4)):
+        k2 = torch.randn(1, 2, 70, d2)
+        p2 = build_paged_pools(k2, k2, [70], ps2, fmt)
+        kw2 = dict(kv_dtype=fmt, k_block_scale=p2["k_block_scale"], v_block_scale=p2["v_block_scale"],
+                   tensor_scale=p2["tensor_scale"])
+        am.mixed_attention_triton(torch.randn(1, 2 * gs2, d2).to(dtype), p2["k_pool"], p2["v_pool"], p2["block_tables"],
+                                  p2["seq_lens"], window=8, sink=torch.zeros(2 * gs2), return_lse=True, num_splits=4, **kw2)
+
+
 def all_groups():
     """name -> callable(dtype) ; ``native_fp8`` is applied by the test for the groups that have FP8 decode paths."""
     return {
         "decode": decode_cases, "mla": mla_cases, "prefill": prefill_cases, "sparse_spec": sparse_spec_cases,
-        "moe": moe_cases, "util": util_cases,
+        "moe": moe_cases, "util": util_cases, "mixed": mixed_cases,
     }
